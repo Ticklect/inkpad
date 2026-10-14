@@ -1,0 +1,3 @@
+// Native Windows icon resource for the Inkpad GUI executable.
+// Resource ID 1 is the first icon Windows shell extracts for Explorer/taskbar.
+1 ICON "inkpad.ico"

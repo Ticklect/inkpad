@@ -1,0 +1,1688 @@
+import { LineEdit, ScrollView } from "std-widgets.slint";
+
+export struct NoteRow {
+    id: string,
+    title: string,
+    subtitle: string,
+    kind: string,
+    active: bool,
+    pinned: bool,
+}
+
+// A compact button that stays accessible to mouse, keyboard, and screen readers.
+component KeyboardTarget {
+    in property <bool> enabled: true;
+    out property <bool> has-hover <=> mouse-surface.has-hover;
+    out property <bool> has-focus <=> keyboard.has-focus;
+    callback clicked <=> mouse-surface.clicked;
+    callback focus-keyboard();
+    focus-keyboard => { keyboard.focus(); }
+    forward-focus: keyboard;
+    keyboard := FocusScope {
+        width: 0px;
+        height: 0px;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                mouse-surface.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    mouse-surface := TouchArea {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+    }
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> label: "";
+    in property <string> accessible-name: "";
+    in property <bool> selected: false;
+    in property <bool> prominent: false;
+    in property <bool> danger: false;
+    in property <bool> destructive: false;
+    in property <bool> enabled: true;
+    in property <bool> subtle: false;
+    callback clicked();
+    callback focus-button();
+    focus-button => { hit.focus-keyboard(); }
+    out property <bool> has-keyboard-focus <=> hit.has-focus;
+
+    height: 36px;
+    min-width: 30px;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: hit.has-focus ? #b18534 : root.destructive ? #aa473c : root.prominent ? #c8972a : root.selected ? #dfc576 : root.subtle ? #e9e5df : #dfddd8;
+    background: !root.enabled ? #f3f1ed : root.destructive ? (hit.has-hover ? #9f4138 : #b24c41) : root.prominent ? #e6b846 : root.selected ? #f9e8b2 : hit.has-hover ? (root.danger ? #f8e6e3 : #eeece6) : root.subtle ? transparent : #ffffff;
+    accessible-role: button;
+    accessible-label: root.accessible-name == "" ? root.label : root.accessible-name;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    forward-focus: hit;
+    Text {
+        x: 8px;
+        width: parent.width - 16px;
+        height: parent.height;
+        text: root.label;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+        font-family: "Segoe UI";
+        font-size: 12px;
+        font-weight: 600;
+        color: !root.enabled ? #a7a39b : root.destructive ? #ffffff : root.prominent ? #352b16 : root.danger ? #b25046 : root.selected ? #6e5219 : #494945;
+    }
+    hit := KeyboardTarget {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Geometry-based icons render in the same position at every font and DPI scale.
+component PencilMark inherits Rectangle {
+    in property <color> ink: #684d17;
+    background: transparent;
+    width: 22px;
+    height: 22px;
+    Path {
+        width: parent.width;
+        height: parent.height;
+        commands: "M 3 16 L 14.8 4.2 L 18 7.4 L 6.2 19.2 L 2.6 19.5 Z";
+        fill: root.ink;
+    }
+}
+
+component SearchMark inherits Rectangle {
+    background: transparent;
+    width: 20px;
+    height: 20px;
+    Rectangle {
+        x: 2px;
+        y: 2px;
+        width: 12px;
+        height: 12px;
+        border-width: 1.5px;
+        border-color: #89837a;
+        border-radius: 6px;
+        background: transparent;
+    }
+    Rectangle {
+        x: 11px;
+        y: 15px;
+        width: 8px;
+        height: 1.5px;
+        border-radius: 1px;
+        transform-rotation: 45deg;
+        background: #89837a;
+    }
+}
+
+component DocumentMark inherits Rectangle {
+    in property <color> ink: #94856c;
+    width: 22px;
+    height: 22px;
+    background: transparent;
+    Rectangle {
+        x: 4px;
+        y: 2px;
+        width: 14px;
+        height: 18px;
+        border-radius: 2px;
+        border-width: 1.5px;
+        border-color: root.ink;
+        background: transparent;
+    }
+    for y in [8px, 12px, 16px]: Rectangle {
+        x: 7px;
+        y: y;
+        width: 8px;
+        height: 1px;
+        background: root.ink;
+    }
+}
+
+component ToolLabel inherits Rectangle {
+    in property <string> label: "";
+    in property <color> ink: #6f6a60;
+    height: 34px;
+    background: transparent;
+    Text {
+        text: root.label;
+        width: parent.width;
+        height: parent.height;
+        color: root.ink;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.8px;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+    }
+}
+
+component StepButton inherits Rectangle {
+    in property <bool> add: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 32px;
+    height: 34px;
+    border-width: 1px;
+    border-color: hit.has-focus ? #aa7d29 : #dfddd8;
+    border-radius: 8px;
+    background: hit.has-hover && root.enabled ? #ede9e0 : #ffffff;
+    accessible-role: button;
+    accessible-label: root.add ? "Increase size" : "Decrease size";
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    forward-focus: hit;
+    Rectangle {
+        width: 10px;
+        height: 1.5px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 1px;
+        background: root.enabled ? #44413c : #aaa69f;
+    }
+    if root.add: Rectangle {
+        width: 1.5px;
+        height: 10px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 1px;
+        background: root.enabled ? #44413c : #aaa69f;
+    }
+    hit := KeyboardTarget {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component DeleteRowButton inherits Rectangle {
+    in property <string> note-name: "";
+    callback clicked();
+    width: 32px;
+    height: 34px;
+    border-radius: 7px;
+    background: hit.has-hover ? #f4dcd8 : transparent;
+    border-width: hit.has-focus ? 1px : 0px;
+    border-color: #b25046;
+    accessible-role: button;
+    accessible-label: "Delete " + root.note-name;
+    accessible-action-default => { root.clicked(); }
+    forward-focus: hit;
+    Rectangle {
+        width: 14px;
+        height: 1.5px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 1px;
+        transform-rotation: 45deg;
+        background: #ba5348;
+    }
+    Rectangle {
+        width: 14px;
+        height: 1.5px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 1px;
+        transform-rotation: -45deg;
+        background: #ba5348;
+    }
+    hit := KeyboardTarget {
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A geometry-based sidebar control; the entire 34px surface is keyboard actionable.
+component SidebarToggle inherits Rectangle {
+    in property <bool> collapsed: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 36px;
+    height: 36px;
+    border-radius: 9px;
+    background: root.enabled && hit.has-hover ? #e7e3dc : transparent;
+    border-width: hit.has-focus ? 1px : 0px;
+    border-color: #bb923f;
+    accessible-role: button;
+    accessible-label: root.collapsed ? "Expand sidebar" : "Collapse sidebar";
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    forward-focus: hit;
+    Rectangle {
+        x: (parent.width - 17px) / 2;
+        y: (parent.height - 15px) / 2;
+        width: 17px;
+        height: 15px;
+        border-width: 1px;
+        border-color: #827d72;
+        border-radius: 3px;
+        background: transparent;
+    }
+    Rectangle {
+        x: (parent.width - 17px) / 2 + (root.collapsed ? 5px : 10px);
+        y: (parent.height - 15px) / 2;
+        width: 1px;
+        height: 15px;
+        background: #827d72;
+    }
+    hit := KeyboardTarget {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+component ChromeButton inherits Rectangle {
+    in property <string> symbol: "";
+    in property <string> action-name: "";
+    in property <bool> close-button: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 44px;
+    height: 40px;
+    background: root.enabled && hit.has-hover ? (root.close-button ? #c8574e : #e8e5de) : transparent;
+    accessible-role: button;
+    accessible-label: root.action-name;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    forward-focus: hit;
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.symbol;
+        font-family: "Segoe UI";
+        font-size: 14px;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: !root.enabled ? #aaa59e : hit.has-hover && root.close-button ? #ffffff : #655e54;
+    }
+    hit := KeyboardTarget {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component NewPageButton inherits Rectangle {
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 42px;
+    background: hit.has-hover ? #fffefa : #f9f7f2;
+    border-width: 1px;
+    border-color: hit.has-focus ? #b98b37 : #e0d9cb;
+    border-radius: 10px;
+    accessible-role: button;
+    accessible-label: "New page";
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    forward-focus: hit;
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 12px;
+        spacing: 10px;
+        Rectangle {
+            width: 25px;
+            height: 25px;
+            border-radius: 7px;
+            background: #ebc875;
+            Rectangle {
+                width: 11px;
+                height: 1.5px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: #604d28;
+                border-radius: 1px;
+            }
+            Rectangle {
+                width: 1.5px;
+                height: 11px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: #604d28;
+                border-radius: 1px;
+            }
+        }
+        Text {
+            text: "New page";
+            font-size: 13px;
+            font-weight: 600;
+            color: #39342e;
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+        }
+    }
+    hit := KeyboardTarget {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+component ColorDot inherits Rectangle {
+    in property <color> paint: #242f32;
+    in property <string> value: "#242F32";
+    in property <string> label: "Black";
+    in property <bool> selected: false;
+    callback picked(string);
+    width: 29px;
+    height: 29px;
+    border-radius: 15px;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? #b18534 : #d8d5cd;
+    background: #ffffff;
+    accessible-role: button;
+    accessible-label: root.label + " brush";
+    accessible-action-default => { root.picked(root.value); }
+    forward-focus: hit;
+    Rectangle {
+        x: 4px;
+        y: 4px;
+        width: parent.width - 8px;
+        height: parent.height - 8px;
+        border-radius: 12px;
+        background: root.paint;
+    }
+    hit := KeyboardTarget {
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.picked(root.value); }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Inkpad Beta";
+    icon: @image-url("../assets/inkpad-icon-preview.png");
+    no-frame: true;
+    resize-border-width: 6px;
+    preferred-width: 1330px;
+    preferred-height: 830px;
+    min-width: 1010px;
+    min-height: 660px;
+    default-font-family: "Segoe UI";
+    background: #fffefa;
+
+    in property <[NoteRow]> rows: [];
+    in-out property <string> note-title: "";
+    in-out property <string> note-body: "";
+    in-out property <int> font-size: 17;
+    in-out property <string> font-choice: "Sans";
+    in-out property <string> active-kind: "note";
+    in-out property <string> edit-mode: "text";
+    in-out property <bool> has-note: false;
+    in-out property <image> canvas-image;
+    in-out property <string> search-query: "";
+    in-out property <string> filter-kind: "all";
+    in-out property <int> brush-size: 6;
+    in-out property <string> brush-color: "#263238";
+    in-out property <bool> eraser: false;
+    in-out property <string> save-status: "Ready";
+    in-out property <int> note-count: 0;
+    in-out property <bool> sidebar-collapsed: false;
+    in-out property <bool> delete-confirm-open: false;
+    in property <string> delete-confirm-title: "";
+    in property <string> delete-confirm-body: "";
+    in property <string> confirm-action-label: "Delete page";
+
+    callback new-note(string);
+    callback select-note(string);
+    callback delete-note();
+    callback delete-note-by-id(string);
+    callback rename-note(string);
+    callback edit-body(string);
+    callback set-edit-mode(string);
+    callback change-font-size(int);
+    callback change-font-choice(string);
+    callback toggle-pin();
+    callback draw-at(int, int, int);
+    callback set-brush-size(int);
+    callback set-brush-color(string);
+    callback set-eraser(bool);
+    callback undo-board();
+    callback clear-board();
+    callback export-current();
+    callback save-now();
+    callback set-filter(string);
+    callback search(string);
+    callback toggle-sidebar();
+    callback request-delete-note(string);
+    callback confirm-delete();
+    callback cancel-delete();
+    callback request-clear-board();
+    callback window-minimize();
+    callback window-toggle-maximize();
+    callback window-close();
+
+    private property <color> ink: #292927;
+    private property <color> muted: #6d6962;
+    private property <color> line: #e9e5dd;
+    private property <bool> renaming: false;
+    changed delete-confirm-open => {
+        if (root.delete-confirm-open) {
+            modal-cancel.focus-button();
+        }
+    }
+
+    forward-focus: shortcut-scope;
+    shortcut-scope := FocusScope {
+        // The main window must not accept focus or actions while a modal is open.
+        enabled: !root.delete-confirm-open;
+        KeyBinding {
+            keys: @keys(Control + B);
+            activated => {
+                if (!root.delete-confirm-open) { root.toggle-sidebar(); }
+            }
+        }
+        KeyBinding {
+            keys: @keys(Escape);
+            activated => {
+                if (root.delete-confirm-open) { root.cancel-delete(); }
+            }
+        }
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            height: 40px;
+            background: #f6f3ee;
+            WindowMoveArea {
+                HorizontalLayout {
+                    padding-left: 18px;
+                    spacing: 0px;
+                    Rectangle {
+                        width: 18px;
+                        height: 40px;
+                        background: transparent;
+                        PencilMark {
+                            width: 15px;
+                            height: 15px;
+                            x: 0px;
+                            y: (parent.height - self.height) / 2;
+                            ink: #9a813d;
+                        }
+                    }
+                    Rectangle {
+                        width: 124px;
+                        height: 40px;
+                        background: transparent;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: "Inkpad Beta";
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: #5f584e;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    ChromeButton {
+                        symbol: "−";
+                        action-name: "Minimize window";
+                        enabled: !root.delete-confirm-open;
+                        clicked => { if (!root.delete-confirm-open) { root.window-minimize(); } }
+                    }
+                    ChromeButton {
+                        symbol: "□";
+                        action-name: "Maximize or restore window";
+                        enabled: !root.delete-confirm-open;
+                        clicked => { if (!root.delete-confirm-open) { root.window-toggle-maximize(); } }
+                    }
+                    ChromeButton {
+                        symbol: "×";
+                        close-button: true;
+                        action-name: "Close window";
+                        enabled: !root.delete-confirm-open;
+                        clicked => { if (!root.delete-confirm-open) { root.window-close(); } }
+                    }
+                }
+            }
+            Rectangle {
+                y: parent.height - 1px;
+                width: parent.width;
+                height: 1px;
+                background: #e3ded5;
+            }
+        }
+        HorizontalLayout {
+        spacing: 0px;
+
+        // Persistent navigation; collapsed state is stored by the Rust host.
+        Rectangle {
+            width: root.sidebar-collapsed ? 60px : 278px;
+            background: #f4f1eb;
+            border-width: 0px;
+            if !root.sidebar-collapsed: VerticalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 17px;
+                padding-bottom: 15px;
+                spacing: 0px;
+
+                HorizontalLayout {
+                    height: 52px;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 174px;
+                        height: 52px;
+                        background: transparent;
+                        Text {
+                            y: 7px;
+                            width: parent.width;
+                            height: 25px;
+                            text: "Library";
+                            font-family: "Segoe UI";
+                            font-weight: 700;
+                            font-size: 17px;
+                            color: root.ink;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            y: 33px;
+                            width: parent.width;
+                            height: 14px;
+                            text: "YOUR PAGES";
+                            font-size: 10px;
+                            font-weight: 700;
+                            letter-spacing: 1.1px;
+                            color: #6f6a60;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    SidebarToggle {
+                        collapsed: root.sidebar-collapsed;
+                        enabled: !root.delete-confirm-open;
+                        clicked => { if (!root.delete-confirm-open) { root.toggle-sidebar(); } }
+                    }
+                }
+
+                Rectangle { height: 15px; background: transparent; }
+
+                HorizontalLayout {
+                    height: 42px;
+                    spacing: 8px;
+                    NewPageButton {
+                        horizontal-stretch: 1;
+                        height: 42px;
+                        enabled: !root.delete-confirm-open;
+                        clicked => { if (!root.delete-confirm-open) { root.new-note("note"); } }
+                    }
+                }
+
+                Rectangle { height: 18px; background: transparent; }
+
+                Rectangle {
+                    height: 41px;
+                    border-radius: 9px;
+                    border-width: 1px;
+                    border-color: #e4e0d8;
+                    background: #ffffff;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 9px;
+                        spacing: 6px;
+                        Rectangle {
+                            width: 20px;
+                            height: 41px;
+                            background: transparent;
+                            SearchMark {
+                                width: 20px;
+                                height: 20px;
+                                y: (parent.height - self.height) / 2;
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 41px;
+                            background: transparent;
+                            search-editor := LineEdit {
+                                width: parent.width;
+                                height: 33px;
+                                y: (parent.height - self.height) / 2;
+                                font-size: 13px;
+                                placeholder-text: "";
+                                text <=> root.search-query;
+                                edited(value) => { root.search(value); }
+                            }
+                            if root.search-query == "" && !search-editor.has-focus: Text {
+                                x: 13px;
+                                width: parent.width - 26px;
+                                height: parent.height;
+                                text: "Search pages";
+                                color: #807b72;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                accessible-role: none;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 25px; background: transparent; }
+
+                HorizontalLayout {
+                    height: 21px;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 51px;
+                        height: 21px;
+                        background: transparent;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: "PAGES";
+                            font-size: 10px;
+                            font-weight: 700;
+                            letter-spacing: 1.45px;
+                            color: #77736c;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Rectangle {
+                        width: 60px;
+                        height: 21px;
+                        background: transparent;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: root.note-count + " items";
+                            font-size: 11px;
+                            color: root.muted;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Rectangle { height: 9px; background: transparent; }
+                if root.filter-kind != "all": ActionButton {
+                    width: 106px;
+                    height: 28px;
+                    subtle: true;
+                    label: "Show all pages";
+                    clicked => { root.set-filter("all"); }
+                }
+                Rectangle { height: 8px; background: transparent; }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        spacing: 4px;
+                        for entry in root.rows: Rectangle {
+                            height: 67px;
+                            border-radius: 9px;
+                            background: entry.active ? #fbe9b9 : item-hit.has-hover ? #ece9e2 : transparent;
+                            border-width: item-hit.has-focus ? 1px : 0px;
+                            border-color: #c18b24;
+                            HorizontalLayout {
+                                padding-left: 6px;
+                                padding-right: 7px;
+                                padding-top: 7px;
+                                padding-bottom: 7px;
+                                spacing: 3px;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    background: transparent;
+                                    accessible-role: tab;
+                                    accessible-label: entry.title + ", page";
+                                    accessible-action-default => { root.select-note(entry.id); root.renaming = false; }
+                                    forward-focus: item-hit;
+                                    HorizontalLayout {
+                                        spacing: 9px;
+                                        padding-left: 6px;
+                                        padding-right: 3px;
+                                        Rectangle {
+                                            width: 30px;
+                                            height: 53px;
+                                            background: transparent;
+                                            DocumentMark {
+                                                x: (parent.width - self.width) / 2;
+                                                y: (parent.height - self.height) / 2;
+                                                ink: entry.active ? #9f7422 : #a29a8a;
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            spacing: 4px;
+                                            Text {
+                                                text: entry.title == "" ? "Untitled" : entry.title;
+                                                color: #37342e;
+                                                font-weight: entry.active ? 700 : 600;
+                                                font-size: 13px;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                            }
+                                            Text {
+                                                text: entry.subtitle == "" ? (entry.kind == "board" ? "Drawing" : "Empty page") : entry.subtitle;
+                                                color: #68635b;
+                                                font-size: 11px;
+                                                overflow: elide;
+                                            }
+                                        }
+                                        if entry.pinned: Rectangle {
+                                            width: 9px;
+                                            height: 53px;
+                                            background: transparent;
+                                            Rectangle {
+                                                width: 6px;
+                                                height: 6px;
+                                                y: (parent.height - self.height) / 2;
+                                                border-radius: 3px;
+                                                background: #a77e2c;
+                                            }
+                                        }
+                                    }
+                                    item-hit := KeyboardTarget {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        clicked => { root.select-note(entry.id); root.renaming = false; }
+                                    }
+                                }
+                                Rectangle {
+                                    width: 32px;
+                                    height: 53px;
+                                    background: transparent;
+                                    DeleteRowButton {
+                                        width: parent.width;
+                                        height: 34px;
+                                        y: (parent.height - self.height) / 2;
+                                        note-name: entry.title == "" ? "untitled page" : entry.title;
+                                        clicked => { root.request-delete-note(entry.id); }
+                                    }
+                                }
+                            }
+                        }
+                        if root.rows.length == 0: Rectangle {
+                            height: 115px;
+                            background: transparent;
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 8px;
+                                Text {
+                                    text: root.note-count == 0 ? "No pages yet" : "No matching pages";
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: #837a6a;
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: root.note-count == 0 ? "Create your first page to get started." : "Try another search, or create a page.";
+                                    font-size: 11px;
+                                    color: #a69f93;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 13px; background: transparent; }
+                Rectangle { height: 1px; background: #e2ded6; }
+                Rectangle { height: 14px; background: transparent; }
+                HorizontalLayout {
+                    height: 29px;
+                    spacing: 9px;
+                    Rectangle {
+                        width: 7px;
+                        height: 29px;
+                        background: transparent;
+                        Rectangle {
+                            width: 7px;
+                            height: 7px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 4px;
+                            background: #c9a54c;
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 29px;
+                        background: transparent;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: "Local workspace";
+                            color: #77736b;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle {
+                        width: 46px;
+                        height: 29px;
+                        background: transparent;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: "INKPAD";
+                            color: #8e887d;
+                            font-size: 9px;
+                            font-weight: 700;
+                            letter-spacing: 1px;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
+                        }
+                    }
+                }
+            }
+            if root.sidebar-collapsed: VerticalLayout {
+                padding-top: 22px;
+                padding-bottom: 16px;
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 12px;
+                Rectangle {
+                    height: 44px;
+                    background: transparent;
+                    Rectangle {
+                        width: 38px;
+                        height: 38px;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 10px;
+                        background: #e7b443;
+                        PencilMark {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            ink: #5d440d;
+                        }
+                    }
+                }
+                SidebarToggle {
+                    width: 44px;
+                    height: 42px;
+                    collapsed: true;
+                    enabled: !root.delete-confirm-open;
+                    clicked => { if (!root.delete-confirm-open) { root.toggle-sidebar(); } }
+                }
+                Rectangle { height: 8px; background: transparent; }
+                ActionButton {
+                    width: 44px;
+                    height: 42px;
+                    label: "+";
+                    accessible-name: "New page";
+                    prominent: true;
+                    enabled: !root.delete-confirm-open;
+                    clicked => { if (!root.delete-confirm-open) { root.new-note("note"); } }
+                }
+                Rectangle {
+                    width: 44px;
+                    height: 42px;
+                    border-radius: 9px;
+                    background: search-hit.has-hover ? #e7e3dc : transparent;
+                    accessible-role: button;
+                    accessible-label: "Expand sidebar to search pages";
+                    accessible-action-default => { root.toggle-sidebar(); }
+                    SearchMark {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                    }
+                    search-hit := KeyboardTarget {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.toggle-sidebar(); }
+                    }
+                }
+                Rectangle {
+                    width: 44px;
+                    height: 42px;
+                    background: transparent;
+                    accessible-role: button;
+                    accessible-label: "Expand pages";
+                    accessible-action-default => { root.toggle-sidebar(); }
+                    DocumentMark {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        ink: #8b805f;
+                    }
+                    pages-hit := KeyboardTarget {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.toggle-sidebar(); }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; background: transparent; }
+                Rectangle {
+                    width: 44px;
+                    height: 29px;
+                    background: transparent;
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: root.note-count + "";
+                        color: #6f6a60;
+                        font-size: 11px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        Rectangle { width: 1px; background: root.line; }
+
+        // Editor and canvas share the same document header and save affordances.
+        Rectangle {
+            horizontal-stretch: 1;
+            background: #fffefa;
+            VerticalLayout {
+                spacing: 0px;
+
+                Rectangle {
+                    height: 47px;
+                    background: #fbfaf8;
+                    HorizontalLayout {
+                        padding-left: 31px;
+                        padding-right: 29px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        spacing: 9px;
+                        Rectangle {
+                            width: 77px;
+                            height: 35px;
+                            background: transparent;
+                            Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: "ALL NOTES";
+                                color: #716c64;
+                                font-size: 10px;
+                                font-weight: 700;
+                                letter-spacing: 1.2px;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            width: 9px;
+                            height: 35px;
+                            background: transparent;
+                            Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: "›";
+                                font-size: 15px;
+                                color: #c2b9a9;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            width: 75px;
+                            height: 35px;
+                            background: transparent;
+                            Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: !root.has-note ? "Welcome" : "Page";
+                                color: root.ink;
+                                font-size: 13px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Rectangle {
+                            width: 202px;
+                            height: 35px;
+                            background: transparent;
+                            Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: root.save-status;
+                                font-size: 11px;
+                                color: root.muted;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        if root.has-note: Rectangle {
+                            width: 66px;
+                            height: 35px;
+                            background: transparent;
+                            ActionButton {
+                                width: parent.width;
+                                height: 34px;
+                                y: (parent.height - self.height) / 2;
+                                label: "Save";
+                                clicked => { root.save-now(); }
+                            }
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: root.line; }
+
+                if root.has-note: VerticalLayout {
+                    spacing: 0px;
+                    Rectangle {
+                        height: 106px;
+                        background: #ffffff;
+                        VerticalLayout {
+                            padding-left: 33px;
+                            padding-right: 29px;
+                            padding-top: 13px;
+                            padding-bottom: 11px;
+                            spacing: 7px;
+                            Text {
+                                text: "YOUR PAGE";
+                                color: #6f6a60;
+                                font-size: 10px;
+                                letter-spacing: 1.15px;
+                                font-weight: 700;
+                            }
+                            HorizontalLayout {
+                                height: 45px;
+                                spacing: 7px;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    background: transparent;
+                                    if !root.renaming: Text {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        text: root.note-title == "" ? "Untitled page" : root.note-title;
+                                        color: #27241e;
+                                        font-size: 26px;
+                                        font-weight: 700;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                    }
+                                    if root.renaming: LineEdit {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        font-family: "Segoe UI";
+                                        font-size: 20px;
+                                        placeholder-text: "Page title";
+                                        text <=> root.note-title;
+                                        edited(value) => { root.rename-note(value); }
+                                        accepted => { root.renaming = false; }
+                                    }
+                                }
+                                Rectangle {
+                                    width: 69px;
+                                    height: 45px;
+                                    background: transparent;
+                                    ActionButton {
+                                        width: parent.width;
+                                        height: 34px;
+                                        y: (parent.height - self.height) / 2;
+                                        label: root.renaming ? "Done" : "Rename";
+                                        clicked => { root.renaming = !root.renaming; }
+                                    }
+                                }
+                                Rectangle {
+                                    width: 54px;
+                                    height: 45px;
+                                    background: transparent;
+                                    ActionButton {
+                                        width: parent.width;
+                                        height: 34px;
+                                        y: (parent.height - self.height) / 2;
+                                        label: "Pin";
+                                        clicked => { root.toggle-pin(); }
+                                    }
+                                }
+                                Rectangle {
+                                    width: 71px;
+                                    height: 45px;
+                                    background: transparent;
+                                    ActionButton {
+                                        width: parent.width;
+                                        height: 34px;
+                                        y: (parent.height - self.height) / 2;
+                                        label: "Export";
+                                        clicked => { root.export-current(); }
+                                    }
+                                }
+                                Rectangle {
+                                    width: 66px;
+                                    height: 45px;
+                                    background: transparent;
+                                    ActionButton {
+                                        width: parent.width;
+                                        height: 34px;
+                                        y: (parent.height - self.height) / 2;
+                                        label: "Delete";
+                                        danger: true;
+                                    clicked => { root.request-delete-note(""); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { height: 1px; background: root.line; }
+                    Rectangle {
+                        height: 49px;
+                        background: #ffffff;
+                        HorizontalLayout {
+                            padding-left: 33px;
+                            padding-right: 29px;
+                            spacing: 7px;
+                            ActionButton {
+                                width: 85px;
+                                height: 33px;
+                                selected: root.edit-mode == "text";
+                                label: "Text";
+                                clicked => { root.edit-mode = "text"; root.set-edit-mode("text"); }
+                            }
+                            ActionButton {
+                                width: 85px;
+                                height: 33px;
+                                selected: root.edit-mode == "draw";
+                                label: "Draw";
+                                clicked => { root.edit-mode = "draw"; root.set-edit-mode("draw"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Rectangle {
+                                width: 148px;
+                                height: 33px;
+                                background: transparent;
+                                Text {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    text: root.edit-mode == "draw" ? "Sketch on this page" : "Write on this page";
+                                    font-size: 11px;
+                                    color: root.muted;
+                                    horizontal-alignment: right;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { height: 1px; background: root.line; }
+
+                    if root.edit-mode == "text": VerticalLayout {
+                        spacing: 0px;
+                        Rectangle {
+                            height: 54px;
+                            background: #fbfaf8;
+                            HorizontalLayout {
+                                padding-left: 24px;
+                                padding-right: 24px;
+                                spacing: 5px;
+                                ToolLabel {
+                                    width: 43px;
+                                    label: "FONT";
+                                    ink: root.muted;
+                                }
+                                ActionButton {
+                                    width: 60px;
+                                    height: 34px;
+                                    subtle: true;
+                                    selected: root.font-choice == "Sans" || root.font-choice == "Segoe UI";
+                                    label: "Sans";
+                                    clicked => { root.change-font-choice("Sans"); }
+                                }
+                                ActionButton {
+                                    width: 60px;
+                                    height: 34px;
+                                    subtle: true;
+                                    selected: root.font-choice == "Serif" || root.font-choice == "Georgia";
+                                    label: "Serif";
+                                    clicked => { root.change-font-choice("Serif"); }
+                                }
+                                ActionButton {
+                                    width: 60px;
+                                    height: 34px;
+                                    subtle: true;
+                                    selected: root.font-choice == "Mono" || root.font-choice == "Consolas";
+                                    label: "Mono";
+                                    clicked => { root.change-font-choice("Mono"); }
+                                }
+                                Rectangle { width: 8px; height: 34px; background: transparent; }
+                                Rectangle {
+                                    width: 1px;
+                                    height: 34px;
+                                    background: transparent;
+                                    Rectangle {
+                                        y: 5px;
+                                        width: 1px;
+                                        height: 24px;
+                                        background: root.line;
+                                    }
+                                }
+                                Rectangle { width: 6px; height: 34px; background: transparent; }
+                                ToolLabel {
+                                    width: 32px;
+                                    label: "SIZE";
+                                    ink: root.muted;
+                                }
+                                StepButton {
+                                    width: 32px;
+                                    height: 34px;
+                                    enabled: root.font-size > 12;
+                                    clicked => { root.change-font-size(max(12, root.font-size - 1)); }
+                                }
+                                Rectangle {
+                                    width: 30px;
+                                    height: 34px;
+                                    background: transparent;
+                                    Text {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        text: root.font-size + "";
+                                        color: root.ink;
+                                        font-size: 13px;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                StepButton {
+                                    width: 32px;
+                                    height: 34px;
+                                    add: true;
+                                    enabled: root.font-size < 40;
+                                    clicked => { root.change-font-size(min(40, root.font-size + 1)); }
+                                }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                ToolLabel {
+                                    width: 77px;
+                                    label: "PLAIN TEXT";
+                                    ink: #6f6a60;
+                                }
+                            }
+                        }
+                        Rectangle { height: 1px; background: root.line; }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #ffffff;
+                            Rectangle {
+                                x: (parent.width - self.width) / 2;
+                                y: 0px;
+                                width: min(parent.width - 32px, 900px);
+                                height: parent.height;
+                                background: #ffffff;
+                                // Direct TextInput avoids the styled TextEdit's implicit sizing:
+                                // its geometry and ink colour are fixed relative to this page.
+                                body-scroll := ScrollView {
+                                    x: 36px;
+                                    y: 25px;
+                                    width: parent.width - 72px;
+                                    height: parent.height - 50px;
+                                    content-width: self.visible-width;
+                                    content-height: max(self.visible-height, body-input.preferred-height + 12px);
+
+                                    body-input := TextInput {
+                                        width: body-scroll.visible-width;
+                                        height: max(body-scroll.visible-height, self.preferred-height + 12px);
+                                        text <=> root.note-body;
+                                        single-line: false;
+                                        wrap: word-wrap;
+                                        font-size: root.font-size * 1px;
+                                        font-family: root.font-choice == "Serif" || root.font-choice == "Georgia" ? "Georgia" : root.font-choice == "Mono" || root.font-choice == "Consolas" ? "Consolas" : "Segoe UI";
+                                        color: #242424;
+                                        selection-background-color: #f2d889;
+                                        selection-foreground-color: #242424;
+                                        vertical-alignment: top;
+                                        edited => { root.edit-body(self.text); }
+                                    }
+                                }
+                                if root.note-body == "": Text {
+                                    x: body-scroll.x;
+                                    y: body-scroll.y;
+                                    width: body-scroll.width;
+                                    text: "Start writing something...";
+                                    color: #9c998f;
+                                    font-size: root.font-size * 1px;
+                                    vertical-alignment: top;
+                                    accessible-role: none;
+                                }
+                            }
+                        }
+                    }
+
+                    if root.edit-mode == "draw": VerticalLayout {
+                        spacing: 0px;
+                        Rectangle {
+                            height: 59px;
+                            background: #fbfaf8;
+                            HorizontalLayout {
+                                padding-left: 23px;
+                                padding-right: 23px;
+                                spacing: 4px;
+                                ActionButton {
+                                    width: 62px;
+                                    height: 34px;
+                                    selected: !root.eraser;
+                                    label: "Pen";
+                                    clicked => { root.set-eraser(false); }
+                                }
+                                ActionButton {
+                                    width: 64px;
+                                    height: 34px;
+                                    selected: root.eraser;
+                                    label: "Eraser";
+                                    clicked => { root.set-eraser(true); }
+                                }
+                                Rectangle {
+                                    width: 1px;
+                                    height: 34px;
+                                    background: transparent;
+                                    Rectangle { y: 5px; width: 1px; height: 24px; background: root.line; }
+                                }
+                                StepButton {
+                                    width: 29px;
+                                    height: 34px;
+                                    enabled: root.brush-size > 1;
+                                    clicked => { root.set-brush-size(max(1, root.brush-size - 1)); }
+                                }
+                                Rectangle {
+                                    width: 35px;
+                                    height: 34px;
+                                    background: transparent;
+                                    Text {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        text: root.brush-size + " px";
+                                        color: root.ink;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                StepButton {
+                                    width: 29px;
+                                    height: 34px;
+                                    add: true;
+                                    enabled: root.brush-size < 40;
+                                    clicked => { root.set-brush-size(min(40, root.brush-size + 1)); }
+                                }
+                                Rectangle {
+                                    width: 1px;
+                                    height: 34px;
+                                    background: transparent;
+                                    Rectangle { y: 5px; width: 1px; height: 24px; background: root.line; }
+                                }
+                                for color in [
+                                    {name: "Ink", code: "#263238", paint: #263238},
+                                    {name: "Blue", code: "#386CC5", paint: #386cc5},
+                                    {name: "Teal", code: "#158E89", paint: #158e89},
+                                    {name: "Green", code: "#61A366", paint: #61a366},
+                                    {name: "Coral", code: "#E76E60", paint: #e76e60},
+                                    {name: "Orange", code: "#D99B4A", paint: #d99b4a},
+                                    {name: "Violet", code: "#8B6AB8", paint: #8b6ab8}
+                                ]: Rectangle {
+                                    width: 29px;
+                                    height: 34px;
+                                    background: transparent;
+                                    ColorDot {
+                                        y: (parent.height - self.height) / 2;
+                                        label: color.name;
+                                        value: color.code;
+                                        paint: color.paint;
+                                        selected: !root.eraser && root.brush-color == color.code;
+                                        picked(value) => { root.set-eraser(false); root.set-brush-color(value); }
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                ActionButton {
+                                    width: 55px;
+                                    height: 34px;
+                                    label: "Undo";
+                                    clicked => { root.undo-board(); }
+                                }
+                                ActionButton {
+                                    width: 58px;
+                                    height: 34px;
+                                    danger: true;
+                                    label: "Clear";
+                                    clicked => { root.request-clear-board(); }
+                                }
+                            }
+                        }
+                        Rectangle { height: 1px; background: root.line; }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #f5f3ef;
+                            board-sheet := Rectangle {
+                                width: min(parent.width - 72px, (parent.height - 62px) * 11 / 7);
+                                height: self.width * 7 / 11;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                background: #ffffff;
+                                border-color: #e1ddd3;
+                                border-width: 1px;
+                                clip: true;
+                                Image {
+                                    source: root.canvas-image;
+                                    image-fit: fill;
+                                    width: parent.width;
+                                    height: parent.height;
+                                }
+                                board-hit := TouchArea {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    mouse-cursor: crosshair;
+                                    pointer-event(event) => {
+                                        if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                                            root.draw-at(Math.round((self.mouse-x / self.width) * 1100), Math.round((self.mouse-y / self.height) * 700), 0);
+                                        }
+                                        if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                                            root.draw-at(Math.round((self.mouse-x / self.width) * 1100), Math.round((self.mouse-y / self.height) * 700), 2);
+                                        }
+                                        if (event.kind == PointerEventKind.cancel) {
+                                            root.draw-at(Math.round((self.mouse-x / self.width) * 1100), Math.round((self.mouse-y / self.height) * 700), 2);
+                                        }
+                                    }
+                                    moved => {
+                                        root.draw-at(Math.round((self.mouse-x / self.width) * 1100), Math.round((self.mouse-y / self.height) * 700), 1);
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            height: 40px;
+                            background: #fbfaf8;
+                            HorizontalLayout {
+                                padding-left: 32px;
+                                padding-right: 32px;
+                                Text {
+                                    text: "1100 × 700 CANVAS";
+                                    color: #948d80;
+                                    font-weight: 700;
+                                    font-size: 10px;
+                                    letter-spacing: 0.8px;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                Text {
+                                    text: root.eraser ? "Erase on canvas" : "Drag on canvas to draw";
+                                    font-size: 11px;
+                                    color: #948d80;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !root.has-note: Rectangle {
+                    vertical-stretch: 1;
+                    background: #fffefa;
+                    Rectangle {
+                        width: min(parent.width - 64px, 420px);
+                        height: 325px;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        VerticalLayout {
+                            spacing: 12px;
+                            Rectangle {
+                                height: 74px;
+                                background: transparent;
+                                    Rectangle {
+                                        width: 60px;
+                                        height: 60px;
+                                        x: (parent.width - self.width) / 2;
+                                        y: 6px;
+                                        border-radius: 14px;
+                                        background: #f2e8d2;
+                                        DocumentMark {
+                                            width: 25px;
+                                            height: 25px;
+                                            x: (parent.width - self.width) / 2;
+                                            y: (parent.height - self.height) / 2;
+                                            ink: #8f784e;
+                                        }
+                                }
+                            }
+                            Text {
+                                text: "Start a new page";
+                                font-family: "Segoe UI";
+                                color: #38332c;
+                                font-size: 25px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: "A space for notes and sketches. Everything stays on this device.";
+                                color: #79736a;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                                horizontal-alignment: center;
+                            }
+                            Rectangle { height: 7px; background: transparent; }
+                            HorizontalLayout {
+                                spacing: 11px;
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                ActionButton {
+                                    width: 156px;
+                                    height: 40px;
+                                    prominent: true;
+                                    label: "New page";
+                                    enabled: !root.delete-confirm-open;
+                                    clicked => { if (!root.delete-confirm-open) { root.new-note("note"); } }
+                                }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    }
+    }
+    modal-screen := Rectangle {
+        visible: root.delete-confirm-open;
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        background: #17130e88;
+        accessible-role: none;
+        // Own the focused controls and consume traversal before Slint can move
+        // focus into window chrome, the sidebar, or the underlying editor.
+        modal-keys := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.delete-confirm-open;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.cancel-delete();
+                return accept;
+            }
+            if (event.text == Key.Tab) {
+                if (modal-cancel.has-keyboard-focus) {
+                    modal-confirm.focus-button();
+                } else {
+                    modal-cancel.focus-button();
+                }
+                return accept;
+            }
+            return reject;
+        }
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.cancel-delete();
+                return accept;
+            }
+            if (event.text == Key.Tab) {
+                if (modal-cancel.has-keyboard-focus) {
+                    modal-confirm.focus-button();
+                } else {
+                    modal-cancel.focus-button();
+                }
+                return accept;
+            }
+            return reject;
+        }
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.cancel-delete(); }
+        }
+        Rectangle {
+            width: 438px;
+            height: 211px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #fffdfa;
+            border-radius: 16px;
+            border-width: 1px;
+            border-color: #e2dbcf;
+            TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { }
+            }
+            VerticalLayout {
+                padding-top: 25px;
+                padding-bottom: 24px;
+                padding-left: 28px;
+                padding-right: 28px;
+                spacing: 10px;
+                Text {
+                    text: root.delete-confirm-title == "" ? "Delete this page?" : root.delete-confirm-title;
+                    font-size: 21px;
+                    font-weight: 700;
+                    color: #302c27;
+                }
+                Text {
+                    text: root.delete-confirm-body == "" ? "This page will be permanently deleted." : root.delete-confirm-body;
+                    font-size: 13px;
+                    color: #6f6a60;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; background: transparent; }
+                HorizontalLayout {
+                    height: 38px;
+                    spacing: 9px;
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    modal-cancel := ActionButton {
+                        width: 100px;
+                        height: 38px;
+                        label: "Cancel";
+                        clicked => { root.cancel-delete(); }
+                    }
+                    modal-confirm := ActionButton {
+                        width: 128px;
+                        height: 38px;
+                        label: root.confirm-action-label;
+                        destructive: true;
+                        clicked => { root.confirm-delete(); }
+                    }
+                }
+            }
+        }
+        }
+    }
+}

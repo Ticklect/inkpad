@@ -1,0 +1,18 @@
+/target/
+/dist/
+*.tmp
+# Local data and machine-specific settings never belong in source control.
+.env
+.env.*
+!.env.example
+InkpadData/
+workspace.json
+workspace.json.*
+ui-settings.json
+ui-settings.json.*
+*.log
+# Editor and operating system scratch files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
