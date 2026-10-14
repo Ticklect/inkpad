@@ -1188,6 +1188,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return; // Changes may be transient while the OS IME is composing text.
             };
             state.selection = selection;
+            // The selection caption displays Unicode *characters*, not UTF-8
+            // bytes. Keep the advanced manual range untouched while its input
+            // fields are open so selecting text cannot silently overwrite a
+            // deliberate fallback offset.
+            if !ui.get_advanced_text_range() {
+                let (start, end) = selection.range();
+                if let (Ok(start), Ok(end)) = (i32::try_from(start), i32::try_from(end)) {
+                    ui.set_format_start(start);
+                    ui.set_format_end(end);
+                }
+            }
             let note = state.active().expect("note selected above");
             sync_format_toolbar(&ui, note, selection, state.typing_style.as_ref());
         });

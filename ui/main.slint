@@ -47,7 +47,9 @@ global InkTheme {
     out property <color> line: dark ? #3c4552 : #e9e5dd;
     out property <color> ink: dark ? #eef1f6 : #292927;
     out property <color> muted: dark ? #b5bfcd : #6d6962;
-    out property <color> subtle: dark ? #8995a5 : #948d80;
+    // Secondary copy must remain readable against both paper and toolbar.
+    // The previous light grey was only ~3.2:1 on white at normal text sizes.
+    out property <color> subtle: dark ? #a7b0bd : #68645c;
     out property <color> accent: dark ? #eec36b : #b98b37;
 }
 
@@ -201,7 +203,7 @@ component DocumentMark inherits Rectangle {
 
 component ToolLabel inherits Rectangle {
     in property <string> label: "";
-    in property <color> ink: #6f6a60;
+    in property <color> ink: InkTheme.muted;
     height: 34px;
     background: transparent;
     Text {
@@ -222,6 +224,7 @@ component StepButton inherits Rectangle {
     in property <bool> add: false;
     in property <bool> enabled: true;
     in property <bool> hold-mode: false;
+    in property <string> target-name: "text";
     private property <bool> held: false;
     private property <bool> repeating: false;
     private property <bool> focus-active: hit.has-focus;
@@ -247,7 +250,7 @@ component StepButton inherits Rectangle {
     border-radius: 8px;
     background: hit.has-hover && root.enabled ? (root.dark ? #39414e : #ede9e0) : root.dark ? #282f39 : #ffffff;
     accessible-role: button;
-    accessible-label: root.add ? "Increase size" : "Decrease size";
+    accessible-label: root.add ? "Increase " + root.target-name + " size" : "Decrease " + root.target-name + " size";
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.clicked(); } }
     forward-focus: hit;
@@ -427,50 +430,54 @@ component ChromeButton inherits Rectangle {
 component NewPageButton inherits Rectangle {
     in property <bool> enabled: true;
     callback clicked();
-    height: 42px;
-    background: hit.has-hover ? InkTheme.paper : InkTheme.toolbar;
+    height: 44px;
+    background: root.enabled && hit.has-hover ? (InkTheme.dark ? #343d4a : #fffdf8) : (InkTheme.dark ? #29323e : #f9f6ef);
     border-width: 1px;
     border-color: hit.has-focus ? #b98b37 : InkTheme.line;
-    border-radius: 10px;
+    border-radius: 11px;
     accessible-role: button;
     accessible-label: "New page";
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.clicked(); } }
     forward-focus: hit;
-    HorizontalLayout {
-        padding-left: 11px;
-        padding-right: 12px;
-        spacing: 10px;
+    // Fixed icon/text anchors avoid the layout cross-axis drift at 1010px and
+    // when Windows scales the font. The entire background is the click target.
+    Rectangle {
+        x: 12px;
+        y: (parent.height - self.height) / 2;
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        background: #edc46a;
         Rectangle {
-            width: 25px;
-            height: 25px;
-            border-radius: 7px;
-            background: #ebc875;
-            Rectangle {
-                width: 11px;
-                height: 1.5px;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                background: #604d28;
-                border-radius: 1px;
-            }
-            Rectangle {
-                width: 1.5px;
-                height: 11px;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                background: #604d28;
-                border-radius: 1px;
-            }
+            width: 12px;
+            height: 2px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 1px;
+            background: #523e1a;
         }
-        Text {
-            text: "New page";
-            font-size: 13px;
-            font-weight: 600;
-            color: InkTheme.ink;
-            horizontal-stretch: 1;
-            vertical-alignment: center;
+        Rectangle {
+            width: 2px;
+            height: 12px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 1px;
+            background: #523e1a;
         }
+    }
+    Text {
+        x: 50px;
+        y: 0px;
+        width: parent.width - 60px;
+        height: parent.height;
+        text: "New page";
+        font-family: "Segoe UI";
+        font-size: 13px;
+        font-weight: 650;
+        color: InkTheme.ink;
+        vertical-alignment: center;
+        horizontal-alignment: left;
     }
     hit := KeyboardTarget {
         width: parent.width;
@@ -821,100 +828,110 @@ export component MainWindow inherits Window {
         Rectangle {
             height: 40px;
             background: InkTheme.chrome;
-            WindowMoveArea {
-                HorizontalLayout {
-                    padding-left: 18px;
-                    spacing: 0px;
-                    Rectangle {
-                        width: 18px;
-                        height: 40px;
-                        background: transparent;
-                        PencilMark {
-                            width: 15px;
-                            height: 15px;
-                            x: 0px;
-                            y: (parent.height - self.height) / 2;
-                            ink: #9a813d;
-                        }
-                    }
-                    Rectangle {
-                        width: 124px;
-                        height: 40px;
-                        background: transparent;
-                        Text {
-                            width: parent.width;
-                            height: parent.height;
-                            text: "Inkpad Beta";
-                            font-size: 12px;
-                            font-weight: 600;
-                            color: InkTheme.muted;
-                            vertical-alignment: center;
-                        }
-                    }
-                    Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Rectangle {
-                        width: 171px;
-                        height: 40px;
-                        background: transparent;
-                        HorizontalLayout {
-                            spacing: 4px;
-                            padding-top: 6px;
-                            padding-bottom: 6px;
-                            ActionButton {
-                                width: 52px;
-                                height: 28px;
-                                label: "Light";
-                                selected: root.appearance-theme == "light";
-                                accessible-name: "Use light appearance";
-                                enabled: !root.delete-confirm-open;
-                                clicked => { root.appearance-theme = "light"; root.change-appearance-theme("light"); }
-                            }
-                            ActionButton {
-                                width: 52px;
-                                height: 28px;
-                                label: "Dark";
-                                selected: root.appearance-theme == "dark";
-                                accessible-name: "Use dark appearance";
-                                enabled: !root.delete-confirm-open;
-                                clicked => { root.appearance-theme = "dark"; root.change-appearance-theme("dark"); }
-                            }
-                            ActionButton {
-                                width: 52px;
-                                height: 28px;
-                                label: "Auto";
-                                selected: root.appearance-theme == "system";
-                                accessible-name: "Follow system appearance";
-                                enabled: !root.delete-confirm-open;
-                                clicked => { root.appearance-theme = "system"; root.change-appearance-theme("system"); }
+            HorizontalLayout {
+                spacing: 0px;
+                // Only the brand and unused titlebar space can move the window.
+                // Wrapping the theme and chrome buttons in WindowMoveArea made
+                // pointer presses compete with a window drag on Windows.
+                WindowMoveArea {
+                    horizontal-stretch: 1;
+                    height: 40px;
+                    HorizontalLayout {
+                        padding-left: 18px;
+                        spacing: 0px;
+                        Rectangle {
+                            width: 18px;
+                            height: 40px;
+                            background: transparent;
+                            PencilMark {
+                                width: 15px;
+                                height: 15px;
+                                x: 0px;
+                                y: (parent.height - self.height) / 2;
+                                ink: #9a813d;
                             }
                         }
+                        Rectangle {
+                            width: 124px;
+                            height: 40px;
+                            background: transparent;
+                            Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: "Inkpad Beta";
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: InkTheme.muted;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
                     }
-                    ChromeButton {
-                        symbol: "−";
-                        action-name: "Minimize window";
-                        enabled: !root.delete-confirm-open;
-                        clicked => { if (!root.delete-confirm-open) { root.window-minimize(); } }
+                }
+                Rectangle {
+                    width: 185px;
+                    height: 40px;
+                    background: transparent;
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        padding-top: 5px;
+                        padding-bottom: 5px;
+                        spacing: 4px;
+                        ActionButton {
+                            width: 53px;
+                            height: 30px;
+                            label: "Light";
+                            selected: root.appearance-theme == "light";
+                            accessible-name: "Use light appearance";
+                            enabled: !root.delete-confirm-open;
+                            clicked => { root.appearance-theme = "light"; root.change-appearance-theme("light"); }
+                        }
+                        ActionButton {
+                            width: 53px;
+                            height: 30px;
+                            label: "Dark";
+                            selected: root.appearance-theme == "dark";
+                            accessible-name: "Use dark appearance";
+                            enabled: !root.delete-confirm-open;
+                            clicked => { root.appearance-theme = "dark"; root.change-appearance-theme("dark"); }
+                        }
+                        ActionButton {
+                            width: 53px;
+                            height: 30px;
+                            label: "Auto";
+                            selected: root.appearance-theme == "system";
+                            accessible-name: "Follow system appearance";
+                            enabled: !root.delete-confirm-open;
+                            clicked => { root.appearance-theme = "system"; root.change-appearance-theme("system"); }
+                        }
                     }
-                    ChromeButton {
-                        symbol: "□";
-                        action-name: "Maximize or restore window";
-                        enabled: !root.delete-confirm-open;
-                        clicked => { if (!root.delete-confirm-open) { root.window-toggle-maximize(); } }
-                    }
-                    ChromeButton {
-                        symbol: "×";
-                        close-button: true;
-                        action-name: "Close window";
-                        enabled: !root.delete-confirm-open;
-                        clicked => { if (!root.delete-confirm-open) { root.window-close(); } }
-                    }
+                }
+                ChromeButton {
+                    symbol: "−";
+                    action-name: "Minimize window";
+                    enabled: !root.delete-confirm-open;
+                    clicked => { if (!root.delete-confirm-open) { root.window-minimize(); } }
+                }
+                ChromeButton {
+                    symbol: "□";
+                    action-name: "Maximize or restore window";
+                    enabled: !root.delete-confirm-open;
+                    clicked => { if (!root.delete-confirm-open) { root.window-toggle-maximize(); } }
+                }
+                ChromeButton {
+                    symbol: "×";
+                    close-button: true;
+                    action-name: "Close window";
+                    enabled: !root.delete-confirm-open;
+                    clicked => { if (!root.delete-confirm-open) { root.window-close(); } }
                 }
             }
             Rectangle {
                 y: parent.height - 1px;
                 width: parent.width;
                 height: 1px;
-                background: #e3ded5;
+                background: root.line;
             }
         }
         HorizontalLayout {
@@ -973,11 +990,11 @@ export component MainWindow inherits Window {
                 Rectangle { height: 15px; background: transparent; }
 
                 HorizontalLayout {
-                    height: 42px;
+                    height: 44px;
                     spacing: 8px;
                     NewPageButton {
                         horizontal-stretch: 1;
-                        height: 42px;
+                        height: 44px;
                         enabled: !root.delete-confirm-open;
                         clicked => { if (!root.delete-confirm-open) { root.new-note("note"); } }
                     }
@@ -1023,7 +1040,7 @@ export component MainWindow inherits Window {
                                 width: parent.width - 26px;
                                 height: parent.height;
                                 text: "Search pages";
-                                color: #807b72;
+                                color: InkTheme.muted;
                                 font-size: 13px;
                                 vertical-alignment: center;
                                 overflow: elide;
@@ -1184,7 +1201,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     text: root.note-count == 0 ? "Create your first page to get started." : "Try another search, or create a page.";
                                     font-size: 11px;
-                                    color: #a69f93;
+                                    color: InkTheme.subtle;
                                     horizontal-alignment: center;
                                 }
                             }
@@ -1218,7 +1235,7 @@ export component MainWindow inherits Window {
                             width: parent.width;
                             height: parent.height;
                             text: "Local workspace";
-                            color: #77736b;
+                            color: InkTheme.muted;
                             font-size: 12px;
                             vertical-alignment: center;
                         }
@@ -1231,7 +1248,7 @@ export component MainWindow inherits Window {
                             width: parent.width;
                             height: parent.height;
                             text: "INKPAD";
-                            color: #8e887d;
+                            color: InkTheme.muted;
                             font-size: 9px;
                             font-weight: 700;
                             letter-spacing: 1px;
@@ -1349,8 +1366,8 @@ export component MainWindow inherits Window {
                     height: 47px;
                     background: InkTheme.toolbar;
                     HorizontalLayout {
-                        padding-left: 31px;
-                        padding-right: 29px;
+                        padding-left: 24px;
+                        padding-right: 24px;
                         padding-top: 6px;
                         padding-bottom: 6px;
                         spacing: 9px;
@@ -1378,7 +1395,7 @@ export component MainWindow inherits Window {
                                 height: parent.height;
                                 text: "›";
                                 font-size: 15px;
-                                color: #c2b9a9;
+                                color: InkTheme.subtle;
                                 vertical-alignment: center;
                                 horizontal-alignment: center;
                             }
@@ -1436,8 +1453,8 @@ export component MainWindow inherits Window {
                         height: 106px;
                         background: InkTheme.paper;
                         VerticalLayout {
-                            padding-left: 33px;
-                            padding-right: 29px;
+                            padding-left: 24px;
+                            padding-right: 24px;
                             padding-top: 13px;
                             padding-bottom: 11px;
                             spacing: 7px;
@@ -1529,22 +1546,24 @@ export component MainWindow inherits Window {
                     }
                     Rectangle { height: 1px; background: root.line; }
                     Rectangle {
-                        height: 49px;
+                        height: 50px;
                         background: InkTheme.paper;
                         HorizontalLayout {
-                            padding-left: 33px;
-                            padding-right: 29px;
-                            spacing: 7px;
+                            padding-left: 24px;
+                            padding-right: 24px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 8px;
                             ActionButton {
                                 width: 85px;
-                                height: 33px;
+                                height: 34px;
                                 selected: root.edit-mode == "text";
                                 label: "Text";
                                 clicked => { root.edit-mode = "text"; root.set-edit-mode("text"); }
                             }
                             ActionButton {
                                 width: 85px;
-                                height: 33px;
+                                height: 34px;
                                 selected: root.edit-mode == "draw";
                                 label: "Draw";
                                 clicked => { root.edit-mode = "draw"; root.set-edit-mode("draw"); }
@@ -1552,7 +1571,7 @@ export component MainWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Rectangle {
                                 width: 148px;
-                                height: 33px;
+                                height: 34px;
                                 background: transparent;
                                 Text {
                                     width: parent.width;
@@ -1576,7 +1595,9 @@ export component MainWindow inherits Window {
                             HorizontalLayout {
                                 padding-left: 24px;
                                 padding-right: 24px;
-                                spacing: 5px;
+                                padding-top: 10px;
+                                padding-bottom: 10px;
+                                spacing: 6px;
                                 ToolLabel {
                                     width: 43px;
                                     label: "FONT";
@@ -1658,13 +1679,13 @@ export component MainWindow inherits Window {
                                 }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 ToolLabel {
-                                    width: 83px;
-                                    label: root.formatted-preview ? "FORMATTED" : "EDIT SOURCE";
+                                    width: 72px;
+                                    label: root.formatted-preview ? "PREVIEWING" : "EDITING";
                                     ink: root.muted;
                                 }
                                 ActionButton {
                                     width: 76px;
-                                    height: 33px;
+                                    height: 34px;
                                     label: root.formatted-preview ? "Edit text" : "Preview";
                                     selected: root.formatted-preview;
                                     accessible-name: root.formatted-preview ? "Return to text editing" : "Preview formatted note";
@@ -1679,117 +1700,158 @@ export component MainWindow inherits Window {
                         }
                         Rectangle { height: 1px; background: root.line; }
                         if !root.formatted-preview: Rectangle {
-                            height: 48px;
+                            // Two deliberate 34px baselines prevent the colour swatches
+                            // and editing actions from compressing one another at 1010px.
+                            height: 90px;
                             background: InkTheme.toolbar;
-                            HorizontalLayout {
-                                padding-left: 23px;
-                                padding-right: 23px;
-                                spacing: 7px;
-                                ToolLabel { width: 39px; label: "STYLE"; ink: root.muted; }
-                                ActionButton {
-                                    width: 38px;
-                                    height: 31px;
-                                    label: "B";
-                                    accessible-name: "Bold selected text or typing style, Control Alt B";
-                                    selected: root.selection-bold;
-                                    clicked => { root.apply-text-format("bold"); root.restore-text-selection(); }
+                            VerticalLayout {
+                                padding-left: 24px;
+                                padding-right: 24px;
+                                padding-top: 8px;
+                                padding-bottom: 8px;
+                                spacing: 6px;
+                                HorizontalLayout {
+                                    height: 34px;
+                                    spacing: 8px;
+                                    ActionButton {
+                                        width: 70px;
+                                        height: 34px;
+                                        label: "Bold";
+                                        accessible-name: "Bold selected text or typing style, Control Alt B";
+                                        selected: root.selection-bold;
+                                        clicked => { root.apply-text-format("bold"); root.restore-text-selection(); }
+                                    }
+                                    ActionButton {
+                                        width: 56px;
+                                        height: 34px;
+                                        subtle: true;
+                                        label: "Undo";
+                                        accessible-name: "Undo text change, Control Z";
+                                        clicked => { root.undo-rich-edit(); }
+                                    }
+                                    ActionButton {
+                                        width: 56px;
+                                        height: 34px;
+                                        subtle: true;
+                                        label: "Redo";
+                                        accessible-name: "Redo text change, Control Y";
+                                        clicked => { root.redo-rich-edit(); }
+                                    }
+                                    Rectangle { width: 1px; height: 25px; background: root.line; }
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: root.selection-anchor-byte == root.selection-caret-byte ?
+                                            "Choose formatting to continue typing" :
+                                            "Selected " + (max(root.format-start, root.format-end) - min(root.format-start, root.format-end)) + " characters";
+                                        overflow: elide;
+                                        font-size: 11px;
+                                        color: root.selection-anchor-byte == root.selection-caret-byte ? InkTheme.muted : InkTheme.accent;
+                                        vertical-alignment: center;
+                                    }
+                                    ActionButton {
+                                        width: 91px;
+                                        height: 34px;
+                                        subtle: true;
+                                        selected: root.advanced-text-range;
+                                        label: "Advanced";
+                                        accessible-name: root.advanced-text-range ? "Hide advanced text options" : "Show advanced text options";
+                                        clicked => { root.advanced-text-range = !root.advanced-text-range; }
+                                    }
                                 }
-                                ActionButton {
-                                    width: 32px;
-                                    height: 31px;
-                                    subtle: true;
-                                    label: "↶";
-                                    accessible-name: "Undo text change, Control Z";
-                                    clicked => { root.undo-rich-edit(); }
-                                }
-                                ActionButton {
-                                    width: 32px;
-                                    height: 31px;
-                                    subtle: true;
-                                    label: "↷";
-                                    accessible-name: "Redo text change, Control Y";
-                                    clicked => { root.redo-rich-edit(); }
-                                }
-                                Rectangle { width: 1px; height: 26px; background: root.line; }
-                                Text {
-                                    horizontal-stretch: 1;
-                                    text: root.selection-anchor-byte == root.selection-caret-byte ?
-                                        "Place caret, then choose a style" :
-                                        "Selected " + (max(root.format-start, root.format-end) - min(root.format-start, root.format-end)) + " characters";
-                                    overflow: elide;
-                                    font-size: 11px;
-                                    color: root.selection-anchor-byte == root.selection-caret-byte ? InkTheme.muted : InkTheme.accent;
-                                    vertical-alignment: center;
-                                }
-                                ActionButton {
-                                    width: 71px;
-                                    height: 31px;
-                                    subtle: true;
-                                    selected: root.advanced-text-range;
-                                    label: "Range…";
-                                    accessible-name: root.advanced-text-range ? "Hide advanced manual character range" : "Show advanced manual character range";
-                                    clicked => { root.advanced-text-range = !root.advanced-text-range; }
-                                }
-                                ToolLabel { width: 32px; label: "INK"; ink: root.muted; }
-                                for tone in [
-                                    {name: "Ink", code: "#292927", paint: #292927},
-                                    {name: "Red", code: "#D74453", paint: #d74453},
-                                    {name: "Orange", code: "#EF8E42", paint: #ef8e42},
-                                    {name: "Green", code: "#158E89", paint: #158e89},
-                                    {name: "Blue", code: "#386CC5", paint: #386cc5},
-                                    {name: "Violet", code: "#8B6AB8", paint: #8b6ab8}
-                                ]: ColorDot {
-                                    category: "text colour";
-                                    width: 27px;
-                                    height: 27px;
-                                    label: tone.name;
-                                    value: tone.code;
-                                    paint: tone.paint;
-                                    selected: root.text-color == tone.code;
-                                    picked(value) => { root.apply-text-color(value); root.restore-text-selection(); }
+                                HorizontalLayout {
+                                    height: 34px;
+                                    spacing: 8px;
+                                    ToolLabel {
+                                        width: 88px;
+                                        height: 34px;
+                                        label: "TEXT COLOUR";
+                                        ink: root.muted;
+                                    }
+                                    for tone in [
+                                        {name: "Default", code: "#292927", paint: #292927},
+                                        {name: "Red", code: "#D74453", paint: #d74453},
+                                        {name: "Orange", code: "#EF8E42", paint: #ef8e42},
+                                        {name: "Green", code: "#158E89", paint: #158e89},
+                                        {name: "Blue", code: "#386CC5", paint: #386cc5},
+                                        {name: "Violet", code: "#8B6AB8", paint: #8b6ab8}
+                                    ]: Rectangle {
+                                        width: 32px;
+                                        height: 34px;
+                                        background: transparent;
+                                        ColorDot {
+                                            width: 28px;
+                                            height: 28px;
+                                            x: (parent.width - self.width) / 2;
+                                            y: (parent.height - self.height) / 2;
+                                            category: "text colour";
+                                            label: tone.name;
+                                            value: tone.code;
+                                            paint: tone.paint;
+                                            selected: root.text-color == tone.code;
+                                            picked(value) => { root.apply-text-color(value); root.restore-text-selection(); }
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    Text {
+                                        width: 170px;
+                                        text: "Select text to change its colour";
+                                        color: root.muted;
+                                        font-size: 11px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
                                 }
                             }
                         }
                         if !root.formatted-preview && root.advanced-text-range: Rectangle {
-                            height: 45px;
+                            height: 80px;
                             background: InkTheme.secondary;
-                            HorizontalLayout {
-                                padding-left: 23px;
-                                padding-right: 23px;
-                                spacing: 9px;
-                                ToolLabel { width: 101px; label: "MANUAL RANGE"; ink: root.muted; }
-                                SpinBox {
-                                    width: 78px;
-                                    height: 31px;
-                                    minimum: 0;
-                                    maximum: 1000000;
-                                    value <=> root.format-start;
-                                    accessible-label: "Unicode character offset for start of formatting range";
-                                }
-                                Text { width: 16px; text: "–"; color: root.muted; horizontal-alignment: center; vertical-alignment: center; }
-                                SpinBox {
-                                    width: 78px;
-                                    height: 31px;
-                                    minimum: 0;
-                                    maximum: 1000000;
-                                    value <=> root.format-end;
-                                    accessible-label: "Exclusive Unicode character offset for end of formatting range";
-                                }
+                            VerticalLayout {
+                                padding-left: 24px;
+                                padding-right: 24px;
+                                padding-top: 8px;
+                                padding-bottom: 8px;
+                                spacing: 5px;
                                 Text {
-                                    horizontal-stretch: 1;
-                                    text: "Advanced fallback · character positions, end exclusive";
+                                    height: 19px;
+                                    text: "Normally, select text directly. Only use character positions below if selection is unavailable.";
                                     color: root.muted;
                                     font-size: 11px;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
-                                LineEdit {
-                                    width: 96px;
-                                    height: 30px;
-                                    text <=> root.custom-text-color;
-                                    placeholder-text: "#RRGGBB";
-                                    accessible-label: "Custom text colour hex, press Enter to apply";
-                                    accepted => { root.apply-text-color(self.text); }
+                                HorizontalLayout {
+                                    height: 32px;
+                                    spacing: 9px;
+                                    ToolLabel { width: 42px; label: "START"; ink: root.muted; }
+                                    SpinBox {
+                                        width: 77px;
+                                        height: 31px;
+                                        minimum: 0;
+                                        maximum: 1000000;
+                                        value <=> root.format-start;
+                                        accessible-label: "Start Unicode character position";
+                                    }
+                                    ToolLabel { width: 39px; label: "END"; ink: root.muted; }
+                                    SpinBox {
+                                        width: 77px;
+                                        height: 31px;
+                                        minimum: 0;
+                                        maximum: 1000000;
+                                        value <=> root.format-end;
+                                        accessible-label: "End character position, exclusive";
+                                    }
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    ToolLabel { width: 104px; label: "CUSTOM COLOUR"; ink: root.muted; }
+                                    LineEdit {
+                                        width: 103px;
+                                        height: 31px;
+                                        text <=> root.custom-text-color;
+                                        placeholder-text: "#RRGGBB";
+                                        accessible-label: "Custom text colour hex, press Enter to apply";
+                                        accepted => { root.apply-text-color(self.text); }
+                                    }
                                 }
                             }
                         }
@@ -1950,13 +2012,13 @@ export component MainWindow inherits Window {
                             height: 54px;
                             background: InkTheme.toolbar;
                             HorizontalLayout {
-                                padding-left: 26px;
-                                padding-right: 26px;
+                                padding-left: 24px;
+                                padding-right: 24px;
                                 spacing: 8px;
                                 ToolLabel {
                                     width: 93px;
                                     label: "PICTURES";
-                                    ink: #686159;
+                                    ink: InkTheme.muted;
                                 }
                                 Text {
                                     text: root.media-rows.length + " on page";
@@ -2059,6 +2121,7 @@ export component MainWindow inherits Window {
                                 StepButton {
                                     width: 29px;
                                     height: 34px;
+                                    target-name: "brush";
                                     hold-mode: true;
                                     enabled: root.brush-size > 1;
                                     clicked => { root.set-brush-size(max(1, root.brush-size - 1)); }
@@ -2082,6 +2145,7 @@ export component MainWindow inherits Window {
                                     width: 29px;
                                     height: 34px;
                                     add: true;
+                                    target-name: "brush";
                                     hold-mode: true;
                                     enabled: root.brush-size < 40;
                                     clicked => { root.set-brush-size(min(40, root.brush-size + 1)); }
@@ -2113,7 +2177,7 @@ export component MainWindow inherits Window {
                                 padding-left: 23px;
                                 padding-right: 23px;
                                 spacing: 4px;
-                                ToolLabel { width: 66px; label: "COLOURS"; ink: #70685c; }
+                                ToolLabel { width: 66px; label: "COLOURS"; ink: InkTheme.muted; }
                                 for color in [
                                     {name: "Ink", code: "#263238", paint: #263238},
                                     {name: "Black", code: "#111111", paint: #111111},

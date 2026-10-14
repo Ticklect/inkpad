@@ -15,8 +15,9 @@
 //! });
 //! ```
 //! Keep the native `WindowMoveArea` for platforms other than Windows. The
-//! current layout uses a 40 logical-pixel header, 6px resize border, and three
-//! 44px chrome buttons on the right. This filter respects those hit regions.
+//! current layout uses a 40 logical-pixel header, 6px resize border, a 185px
+//! appearance selector and three 44px chrome buttons on the right. All of
+//! those buttons must receive their clicks without the native drag filter.
 
 #![cfg(target_os = "windows")]
 
@@ -35,6 +36,9 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 const HEADER_HEIGHT: f64 = 40.0;
 const RESIZE_EDGE: f64 = 6.0;
 const RIGHT_CHROME_BUTTONS: f64 = 3.0 * 44.0;
+/// Light/Dark/Auto are interactive, not draggable titlebar. Kept equal to the
+/// selector Rectangle's width in ui/main.slint; tests guard this contract.
+const RIGHT_APPEARANCE_SELECTOR: f64 = 185.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScreenPoint { x: i32, y: i32 }
@@ -165,11 +169,14 @@ fn cursor_position() -> Option<ScreenPoint> {
     } else { None }
 }
 
-/// Explicitly excludes resize edges and all three control buttons.
+/// Excludes resize edges, three window buttons AND the Light/Dark/Auto group.
+/// Previously this only excluded the window buttons, so the native event
+/// filter swallowed theme clicks before Slint could dispatch them.
 fn titlebar_hit(x: i32, y: i32, physical_width: u32, scale: f64) -> bool {
     if !scale.is_finite() || scale <= 0.0 { return false; }
     let edge = (RESIZE_EDGE * scale).ceil();
-    let max_x = physical_width as f64 - (RIGHT_CHROME_BUTTONS + RESIZE_EDGE) * scale;
+    let max_x = physical_width as f64 -
+        (RIGHT_APPEARANCE_SELECTOR + RIGHT_CHROME_BUTTONS + RESIZE_EDGE) * scale;
     let xx = x as f64;
     let yy = y as f64;
     xx >= edge && xx < max_x && yy >= edge && yy < HEADER_HEIGHT * scale
@@ -234,6 +241,27 @@ mod tests {
         assert!(!titlebar_hit(300, 40, 1920, 1.0));
         assert!(titlebar_hit(375, 25, 2400, 1.25));
         assert!(!titlebar_hit(2300, 25, 2400, 1.25));
+    }
+
+    #[test]
+    fn theme_selector_is_clickable_at_compact_normal_maximized_and_hi_dpi() {
+        // The appearance selector occupies the 185 logical pixels immediately
+        // before the rightmost 132 logical pixels of window chrome.
+        for (logical_width, scale) in [(1010.0_f64, 1.0_f64),
+            (1330.0, 1.0), (1920.0, 1.0), (1010.0, 1.25),
+            (1330.0, 1.5), (1920.0, 2.0)] {
+            let physical = (logical_width * scale).round() as u32;
+            let y = (20.0 * scale).round() as i32;
+            let theme_left = logical_width - RIGHT_CHROME_BUTTONS - RIGHT_APPEARANCE_SELECTOR;
+            for middle_x in [theme_left + 6.0 + 53.0 / 2.0,
+                theme_left + 6.0 + 53.0 + 4.0 + 53.0 / 2.0,
+                theme_left + 6.0 + 2.0 * (53.0 + 4.0) + 53.0 / 2.0] {
+                assert!(!titlebar_hit((middle_x * scale).round() as i32, y, physical, scale),
+                    "Theme click at logical {middle_x} intercepted at width {logical_width}, DPI {scale}");
+            }
+            assert!(titlebar_hit((300.0 * scale).round() as i32, y, physical, scale),
+                "Brand/titlebar must still drag at width {logical_width}, DPI {scale}");
+        }
     }
 
     #[test]
