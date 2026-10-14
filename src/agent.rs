@@ -3,10 +3,11 @@
 
 use crate::canvas::{Board, HEIGHT, WIDTH};
 use crate::store::{Note, Store, Stroke, Workspace};
+use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -16,6 +17,177 @@ const MAX_RESULTS: usize = 200;
 const MAX_STROKE_POINTS: usize = 512;
 const MAX_STROKES_PER_NOTE: usize = 2_000;
 const MAX_STROKE_JSON_BYTES: usize = 128 * 1024;
+const MAX_IMAGE_FILE_BYTES: u64 = 12 * 1024 * 1024;
+const MAX_IMAGE_BASE64_BYTES: usize = 1024 * 1024;
+const MAX_IMAGE_CAPTION_CHARS: usize = 500;
+
+/// Local image paths are access to files outside Inkpad; the MCP client must
+/// attest that the user explicitly selected the file. This is not a technical
+/// verification of user consent, so the calling assistant must never invent it.
+fn image_approval(args: &Map<String, Value>, action: &str) -> Result<(), String> {
+    if args.get("user_approved") == Some(&Value::Bool(true)) { Ok(()) }
+    else { Err(format!("{action} requires explicit user approval and user_approved:true")) }
+}
+
+fn image_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        matches!(ext.to_str().map(str::to_ascii_lowercase).as_deref(), Some("png"|"jpg"|"jpeg"|"gif"|"webp"))
+    })
+}
+
+/// Strictly allow only a file explicitly supplied by the user: reject relative
+/// paths, parent traversal, special files and the notebook's managed data dir.
+fn approved_image_path(store: &Store, supplied: &str) -> Result<PathBuf, String> {
+    if supplied.is_empty() || supplied.len() > 4096 || supplied.chars().any(char::is_control) {
+        return Err(invalid("Image path must be an explicit local path (max 4096 chars)"));
+    }
+    let path = Path::new(supplied);
+    if !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+        return Err(invalid("Image source must be an absolute path without '..' traversal"));
+    }
+    if !image_extension(path) {
+        return Err(invalid("Image source must be .png, .jpg, .jpeg, .gif or .webp"));
+    }
+    let canonical = path.canonicalize().map_err(|e| format!("Image file cannot be opened: {e}"))?;
+    if !canonical.is_file() || !image_extension(&canonical) {
+        return Err(invalid("Image source must be a regular image file"));
+    }
+    let private_dir = store.data_path().parent()
+        .ok_or_else(|| invalid("Inkpad storage folder unavailable"))?.canonicalize()
+        .map_err(|e| format!("Inkpad storage folder unavailable: {e}"))?;
+    if canonical.starts_with(private_dir) {
+        return Err(invalid("Do not import from Inkpad's private workspace/media directory"));
+    }
+    let size = canonical.metadata().map_err(|e| format!("Cannot inspect image size: {e}"))?.len();
+    if size == 0 || size > MAX_IMAGE_FILE_BYTES {
+        return Err(format!("Image must be between 1 byte and {} MiB", MAX_IMAGE_FILE_BYTES / 1024 / 1024));
+    }
+    // Cheap magic-number check before Store's strict full decode/re-encode.
+    let mut reader = OpenOptions::new().read(true).open(&canonical).map_err(|e| e.to_string())?;
+    let mut header = [0u8; 16];
+    let count = reader.read(&mut header).map_err(|e| e.to_string())?;
+    if !recognised_image(&header[..count]) { return Err(invalid("File does not contain recognised PNG/JPEG/GIF/WebP image data")); }
+    Ok(canonical)
+}
+
+fn recognised_image(data: &[u8]) -> bool {
+    data.starts_with(b"\x89PNG\r\n\x1a\n")
+        || data.starts_with(&[0xFF, 0xD8, 0xFF])
+        || data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")
+        || (data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP")
+}
+
+/// Bounded, strict RFC 4648 base64 parser. This avoids another Rust crate and
+/// prevents agent-supplied data from allocating unbounded decoded buffers.
+fn decode_image_base64(encoded: &str) -> Result<Vec<u8>, String> {
+    if encoded.is_empty() || encoded.len() % 4 != 0 || encoded.len() > ((MAX_IMAGE_BASE64_BYTES + 2) / 3) * 4 {
+        return Err(invalid("Image base64 must be nonempty, correctly padded and decode to at most 1 MiB"));
+    }
+    let mut output = Vec::with_capacity(encoded.len() / 4 * 3);
+    let blocks = encoded.as_bytes().chunks_exact(4);
+    let count = blocks.len();
+    for (index, block) in blocks.enumerate() {
+        let mut value = [0u8; 4];
+        let mut padding = 0;
+        for (offset, byte) in block.iter().copied().enumerate() {
+            value[offset] = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' if index + 1 == count && offset >= 2 => { padding += 1; 0 },
+                _ => return Err(invalid("Invalid image base64 character or padding")),
+            };
+        }
+        if (block[2] == b'=' && block[3] != b'=') || padding > 2 {
+            return Err(invalid("Invalid image base64 padding"));
+        }
+        if (padding == 1 && (value[2] & 0x03) != 0) || (padding == 2 && (value[1] & 0x0f) != 0) {
+            return Err(invalid("Invalid nonzero base64 padding bits"));
+        }
+        output.push((value[0] << 2) | (value[1] >> 4));
+        if padding < 2 { output.push((value[1] << 4) | (value[2] >> 2)); }
+        if padding == 0 { output.push((value[2] << 6) | value[3]); }
+    }
+    if output.len() > MAX_IMAGE_BASE64_BYTES || !recognised_image(&output) {
+        return Err(invalid("Decoded data is too large or is not a PNG/JPEG/GIF/WebP image"));
+    }
+    Ok(output)
+}
+
+fn image_identity(args: &Map<String, Value>) -> Result<&str, String> {
+    let id = required_string(args, "image_id")?;
+    if id.is_empty() || id.len() > 160 || id.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_') {
+        return Err(invalid("image_id must be an Inkpad image ID, not a file path"));
+    }
+    Ok(id)
+}
+
+fn resolve_note_id(store: &Store, args: &Map<String, Value>) -> Result<String, String> {
+    let (by_title, key) = selector(args, "title")?;
+    let workspace = load(store)?;
+    let index = find_note_index(&workspace, by_title, &key)?;
+    Ok(workspace.notes[index].id.clone())
+}
+
+fn new_export_destination(store: &Store, supplied: &str, extension: &str) -> Result<PathBuf, String> {
+    if supplied.len() > 4096 || supplied.is_empty() || supplied.chars().any(char::is_control) {
+        return Err(invalid("Export destination must be a local absolute file path"));
+    }
+    let path = Path::new(supplied);
+    if !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) || path.file_name().is_none() {
+        return Err(invalid("Export requires an absolute destination without '..' traversal"));
+    }
+    if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case(extension)) {
+        return Err(format!("Export must use a .{extension} filename"));
+    }
+    if path.exists() { return Err(invalid("Export destination already exists; overwriting is not permitted")); }
+    let parent = path.parent().ok_or_else(|| invalid("No HTML destination parent"))?
+        .canonicalize().map_err(|e| format!("Export destination folder is unavailable: {e}"))?;
+    let private_dir = store.data_path().parent().ok_or_else(|| invalid("Private workspace path unavailable"))?
+        .canonicalize().map_err(|e| format!("Private workspace path unavailable: {e}"))?;
+    if parent.starts_with(private_dir) { return Err(invalid("Do not export inside Inkpad's managed data folder")); }
+    Ok(parent.join(path.file_name().unwrap()))
+}
+
+fn note_image(store: &Store, note_id: &str, image_id: &str) -> Result<crate::store::MediaBlock, String> {
+    store.list_media(note_id).map_err(|e| e.to_string())?.into_iter()
+        .find(|image| image.id == image_id).ok_or_else(|| invalid("Image was not found in the selected note"))
+}
+
+fn read_image_file_bounded(store: &Store, image: &crate::store::MediaBlock) -> Result<Vec<u8>, String> {
+    let path = store.media_path(image).map_err(|e| e.to_string())?;
+    let mut file = OpenOptions::new().read(true).open(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file).take((MAX_IMAGE_BASE64_BYTES + 1) as u64).read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_IMAGE_BASE64_BYTES {
+        return Err(invalid("This picture is over 1 MiB; use export_image to save it to an approved path instead"));
+    }
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(invalid("Stored image is not a valid PNG asset"));
+    }
+    Ok(bytes)
+}
+
+fn cli_base64_arg(value: &str) -> Result<String, String> {
+    if let Some(filepath) = value.strip_prefix('@') {
+        let path = Path::new(filepath);
+        if !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+            || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("b64") || ext.eq_ignore_ascii_case("txt")) {
+            return Err(invalid("Base64 CLI file must be an absolute .b64 or .txt path without traversal"));
+        }
+        let mut bytes = Vec::new();
+        OpenOptions::new().read(true).open(path).map_err(|e| e.to_string())?
+            .take(((MAX_IMAGE_BASE64_BYTES + 2) / 3 * 4 + 1) as u64)
+            .read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() > ((MAX_IMAGE_BASE64_BYTES + 2) / 3) * 4 {
+            return Err(invalid("Encoded image exceeds the 1 MiB decoded-input limit"));
+        }
+        String::from_utf8(bytes).map_err(|_| invalid("Encoded image must be UTF-8 base64 text"))
+    } else { Ok(value.to_string()) }
+}
 
 pub fn run() -> io::Result<()> {
     let store = Store::from_system()?;
@@ -99,7 +271,7 @@ fn handle_rpc(store: &Store, request: Value) -> Option<Value> {
                 "protocolVersion":version,
                 "capabilities":{"tools":{"listChanged":false}},
                 "serverInfo":{"name":"inkpad-agent","version":env!("CARGO_PKG_VERSION")},
-                "instructions":"Headless access to saved Inkpad text, formatting, pins, active-page preference and drawing strokes. Deletion, undo and clearing drawings require explicit user authorization and confirm=true. Text/Draw GUI view mode is not stored."
+                "instructions":"Headless access to saved Inkpad text, drawing strokes and inline images, including rename, image sizing, placement, captions and self-contained HTML export. Local image import or exporting notes must be explicitly user-approved; image deletion, note deletion, stroke removal and clearing require explicit user authorization plus confirm=true. GUI Text/Draw view mode is transient."
             }))
         }
         "ping" => Ok(json!({})),
@@ -128,6 +300,16 @@ fn handle_rpc(store: &Store, request: Value) -> Option<Value> {
 }
 
 fn tool_result(value: Value) -> Value {
+    if value.get("mime_type").and_then(Value::as_str) == Some("image/png") {
+        if let Some(encoded) = value.get("data_base64").and_then(Value::as_str) {
+            let mut metadata = value.clone();
+            metadata.as_object_mut().unwrap().remove("data_base64");
+            // Standard MCP image content: omit a duplicate ~1 MiB base64 text
+            // block, while keeping lightweight IDs/size in structuredContent.
+            return json!({"content":[{"type":"image","mimeType":"image/png","data":encoded}],
+                "structuredContent":metadata,"isError":false});
+        }
+    }
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".into());
     json!({"content":[{"type":"text","text":text}],"structuredContent":value,"isError":false})
 }
@@ -152,6 +334,16 @@ fn tool_definitions() -> Vec<Value> {
         json!({"name":"clear_strokes","description":"Remove ALL drawing strokes from one page, preserving body text. Requires explicit human authorization and confirm=true.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"confirm":{"type":"boolean","const":true}},"required":["confirm"],"additionalProperties":false}}),
         json!({"name":"delete_note","description":"PERMANENTLY delete a note and its drawing strokes. Call only after the human user explicitly authorizes deletion. Requires confirm:true plus note ID or exact, unique title.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"confirm":{"type":"boolean","const":true}},"required":["confirm"],"additionalProperties":false}}),
         json!({"name":"get_workspace_info","description":"Show local workspace version, note count, active page ID, and storage file location.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+        json!({"name":"image_insert_file","description":"Import PNG/JPEG/GIF/WebP into a note from a local user-selected absolute path. This reads the source file: only call if the human explicitly approved that file and set user_approved=true; never guess paths or access secrets. Maximum 12 MiB. Inkpad validates and copies the image into managed storage; original untouched. Use note id or unique exact title.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"path":{"type":"string"},"user_approved":{"type":"boolean","const":true}},"required":["path","user_approved"],"additionalProperties":false}}),
+        json!({"name":"image_insert_base64","description":"Import an explicitly user-provided base64-encoded PNG/JPEG/GIF/WebP image into a note (max 1 MiB decoded per MCP request). Data must be image bytes only, not a file path or URL. Require explicit user_approved=true. Does not fetch remote URLs.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"data_base64":{"type":"string"},"user_approved":{"type":"boolean","const":true}},"required":["data_base64","user_approved"],"additionalProperties":false}}),
+        json!({"name":"image_list","description":"List the ordered inline image IDs, captions, display width percentages and positions for a note. Returns metadata only, never raw image bytes or private absolute paths.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"}},"additionalProperties":false}}),
+        json!({"name":"image_resize","description":"Resize an existing inline note image. Set width_percent to 10–100. Image stays in the note and keeps its original pixels.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"width_percent":{"type":"integer","minimum":10,"maximum":100}},"required":["image_id","width_percent"],"additionalProperties":false}}),
+        json!({"name":"image_move","description":"Move an image to an integer zero-based position within the same note (0 means first). No files are modified; image order is saved.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"position":{"type":"integer","minimum":0}},"required":["image_id","position"],"additionalProperties":false}}),
+        json!({"name":"image_caption","description":"Change an image's caption (up to 500 characters). An empty caption removes the caption. Image bytes and size are preserved.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"caption":{"type":"string","maxLength":500}},"required":["image_id","caption"],"additionalProperties":false}}),
+        json!({"name":"image_delete","description":"Remove the selected image from the note. Only call when the human explicitly authorizes removal of that image; requires confirm:true. Text, strokes and other images remain. The private PNG may be retained for backup recovery rather than erased from disk.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"confirm":{"type":"boolean","const":true}},"required":["image_id","confirm"],"additionalProperties":false}}),
+        json!({"name":"image_export_html","description":"Export a complete self-contained note as HTML with escaped text and inline embedded images at a human-approved absolute .html path. Contains private note content; do not export without user_approved=true. Refuses overwrite and never opens a GUI dialog.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"path":{"type":"string"},"user_approved":{"type":"boolean","const":true}},"required":["path","user_approved"],"additionalProperties":false}}),
+        json!({"name":"read_image","description":"Read one selected private Inkpad picture for AI image understanding, returned as an MCP image block (PNG base64, max 1 MiB). Requires explicit user_approved=true from the user requesting picture inspection. For larger images use export_image instead. Never scans files or returns arbitrary paths.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"user_approved":{"type":"boolean","const":true}},"required":["image_id","user_approved"],"additionalProperties":false}}),
+        json!({"name":"export_image","description":"Export one stored picture to an explicit user-approved NEW absolute PNG file, without overwriting any existing file. Requires user_approved=true. Never exports a file that is not an attachment of the selected note; does not upload to any network service.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"path":{"type":"string"},"user_approved":{"type":"boolean","const":true}},"required":["image_id","path","user_approved"],"additionalProperties":false}}),
     ]
 }
 
@@ -230,7 +422,7 @@ fn note_summary(note: &Note) -> Value {
     json!({
         "id":note.id,"title":note.title,"kind":note.kind,
         "preview":preview(&note.body),"stroke_count":note.strokes.len(),
-        "has_drawing":!note.strokes.is_empty(),"pinned":note.pinned,
+        "has_drawing":!note.strokes.is_empty(),"image_count":note.images.len(),"pinned":note.pinned,
         "font_size":note.font_size,"font_choice":note.font_choice,"updated":note.updated
     })
 }
@@ -600,6 +792,108 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
                 Ok(json!({"deleted":true,"id":deleted.id,"title":deleted.title,"deleted_strokes":deleted.strokes.len()}))
             })
         }
+        "image_insert_file" => {
+            let args = object_args(args, &["id", "title", "path", "user_approved"])?;
+            image_approval(args, "Reading a local image file")?;
+            let note_id = resolve_note_id(store, args)?;
+            let path = approved_image_path(store, required_string(args, "path")?)?;
+            let image = store.insert_image_from_file(&note_id, &path).map_err(|e| e.to_string())?;
+            Ok(json!({"note_id":note_id,"image":image,"source_file_unchanged":true}))
+        }
+        "image_insert_base64" => {
+            let args = object_args(args, &["id", "title", "data_base64", "user_approved"])?;
+            image_approval(args, "Importing image bytes")?;
+            let note_id = resolve_note_id(store, args)?;
+            let bytes = decode_image_base64(required_string(args, "data_base64")?)?;
+            let image = store.insert_image_bytes(&note_id, &bytes).map_err(|e| e.to_string())?;
+            Ok(json!({"note_id":note_id,"image":image,"bytes_imported":bytes.len()}))
+        }
+        "image_list" => {
+            let args = object_args(args, &["id", "title"])?;
+            let note_id = resolve_note_id(store, args)?;
+            let images = store.list_media(&note_id).map_err(|e| e.to_string())?;
+            Ok(json!({"note_id":note_id,"total":images.len(),"images":images}))
+        }
+        "image_resize" => {
+            let args = object_args(args, &["id", "title", "image_id", "width_percent"])?;
+            let image_id = image_identity(args)?;
+            let width = required_i32(args, "width_percent", 10, 100)? as u8;
+            let note_id = resolve_note_id(store, args)?;
+            let image = store.update_image(&note_id, image_id, None, Some(width), None).map_err(|e| e.to_string())?;
+            Ok(json!({"note_id":note_id,"image":image}))
+        }
+        "image_move" => {
+            let args = object_args(args, &["id", "title", "image_id", "position"])?;
+            let image_id = image_identity(args)?;
+            let position = args.get("position").and_then(Value::as_u64)
+                .and_then(|number| usize::try_from(number).ok()).filter(|number| *number <= 4096)
+                .ok_or_else(|| invalid("position must be a zero-based integer (0..4096)"))?;
+            let note_id = resolve_note_id(store, args)?;
+            let image = store.update_image(&note_id, image_id, None, None, Some(position)).map_err(|e| e.to_string())?;
+            Ok(json!({"note_id":note_id,"image":image}))
+        }
+        "image_caption" => {
+            let args = object_args(args, &["id", "title", "image_id", "caption"])?;
+            let image_id = image_identity(args)?;
+            let caption = required_string(args, "caption")?;
+            if caption.chars().count() > MAX_IMAGE_CAPTION_CHARS || caption.contains('\0') {
+                return Err(invalid("Image caption cannot exceed 500 characters or contain NUL"));
+            }
+            let note_id = resolve_note_id(store, args)?;
+            let image = store.update_image(&note_id, image_id, Some(caption), None, None).map_err(|e| e.to_string())?;
+            Ok(json!({"note_id":note_id,"image":image}))
+        }
+        "image_delete" => {
+            let args = object_args(args, &["id", "title", "image_id", "confirm"])?;
+            require_confirmation(args, "Permanently removing this image")?;
+            let image_id = image_identity(args)?;
+            let note_id = resolve_note_id(store, args)?;
+            store.delete_image(&note_id, image_id).map_err(|e| e.to_string())?;
+            Ok(json!({"note_id":note_id,"image_id":image_id,"deleted":true}))
+        }
+        "image_export_html" => {
+            let args = object_args(args, &["id", "title", "path", "user_approved"])?;
+            image_approval(args, "Exporting private note content")?;
+            let note_id = resolve_note_id(store, args)?;
+            let path = new_export_destination(store, required_string(args, "path")?, "html")?;
+            store.export_note_html(&note_id, &path).map_err(|e| e.to_string())?;
+            let bytes = path.metadata().map_err(|e| e.to_string())?.len();
+            Ok(json!({"note_id":note_id,"path":path.display().to_string(),"format":"html","bytes":bytes,"self_contained":true}))
+        }
+        "read_image" => {
+            let args = object_args(args, &["id", "title", "image_id", "user_approved"])?;
+            image_approval(args, "Reading private picture content")?;
+            let image_id = image_identity(args)?;
+            let note_id = resolve_note_id(store, args)?;
+            let image = note_image(store, &note_id, image_id)?;
+            let bytes = read_image_file_bounded(store, &image)?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(json!({"note_id":note_id,"image_id":image_id,"mime_type":"image/png",
+                "bytes":bytes.len(),"data_base64":encoded}))
+        }
+        "export_image" => {
+            let args = object_args(args, &["id", "title", "image_id", "path", "user_approved"])?;
+            image_approval(args, "Exporting private picture content")?;
+            let image_id = image_identity(args)?;
+            let note_id = resolve_note_id(store, args)?;
+            let image = note_image(store, &note_id, image_id)?;
+            let destination = new_export_destination(store, required_string(args, "path")?, "png")?;
+            let input = store.media_path(&image).map_err(|e| e.to_string())?;
+            let mut reader = OpenOptions::new().read(true).open(input).map_err(|e| e.to_string())?;
+            let mut writer = OpenOptions::new().write(true).create_new(true).open(&destination)
+                .map_err(|e| format!("Cannot create new image export (no overwrite): {e}"))?;
+            let result = io::copy(&mut reader, &mut writer).and_then(|count| { writer.sync_all()?; Ok(count) });
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    drop(writer);
+                    let _ = std::fs::remove_file(&destination);
+                    return Err(format!("Could not finish PNG export: {error}"));
+                }
+            };
+            Ok(json!({"note_id":note_id,"image_id":image_id,"mime_type":"image/png",
+                "path":destination.display().to_string(),"bytes":bytes,"exported":true}))
+        }
         "get_workspace_info" => {
             object_args(args, &[])?;
             let workspace = load(store)?;
@@ -646,6 +940,25 @@ fn run_cli(store: &Store, args: &[String]) -> io::Result<()> {
         "activate" if args.len() == 2 => execute_tool(store, "set_active_note", &json!({"id":args[1]})),
         "export-text" if args.len() == 3 => execute_tool(store, "export_note", &json!({"id":args[1],"format":"txt","path":args[2]})),
         "export-png" if args.len() == 3 => execute_tool(store, "export_note", &json!({"id":args[1],"format":"png","path":args[2]})),
+        "add-image" if args.len() == 4 && args[3] == "--approved" =>
+            execute_tool(store, "image_insert_file", &json!({"id":args[1],"path":args[2],"user_approved":true})),
+        "add-image-base64" if args.len() == 4 && args[3] == "--approved" =>
+            cli_base64_arg(&args[2]).and_then(|encoded| execute_tool(store, "image_insert_base64",
+                &json!({"id":args[1],"data_base64":encoded,"user_approved":true}))),
+        "images" if args.len() == 2 => execute_tool(store, "image_list", &json!({"id":args[1]})),
+        "image-width" if args.len() == 4 => args[3].parse::<i32>().map_err(|_| invalid("Image width must be an integer"))
+            .and_then(|width| execute_tool(store, "image_resize", &json!({"id":args[1],"image_id":args[2],"width_percent":width}))),
+        "image-move" if args.len() == 4 => args[3].parse::<usize>().map_err(|_| invalid("Image position must be a nonnegative integer"))
+            .and_then(|position| execute_tool(store, "image_move", &json!({"id":args[1],"image_id":args[2],"position":position}))),
+        "image-caption" if args.len() >= 4 => execute_tool(store, "image_caption", &json!({"id":args[1],"image_id":args[2],"caption":args[3..].join(" ")})),
+        "image-delete" if args.len() == 4 && args[3] == "--confirm" =>
+            execute_tool(store, "image_delete", &json!({"id":args[1],"image_id":args[2],"confirm":true})),
+        "export-html" if args.len() == 4 && args[3] == "--approved" =>
+            execute_tool(store, "image_export_html", &json!({"id":args[1],"path":args[2],"user_approved":true})),
+        "read-image" if args.len() == 4 && args[3] == "--approved" =>
+            execute_tool(store, "read_image", &json!({"id":args[1],"image_id":args[2],"user_approved":true})),
+        "export-image" if args.len() == 5 && args[4] == "--approved" =>
+            execute_tool(store, "export_image", &json!({"id":args[1],"image_id":args[2],"path":args[3],"user_approved":true})),
         "add-stroke" if args.len() == 3 => cli_stroke_json(&args[2])
             .and_then(|stroke| {
                 let mut fields = object_args(&stroke, &["width","points","color","eraser"])?.clone();
@@ -659,7 +972,7 @@ fn run_cli(store: &Store, args: &[String]) -> io::Result<()> {
         "delete" if args.len() == 3 && args[2] == "--confirm" => get(1).and_then(|id| execute_tool(store, "delete_note", &json!({"id":id,"confirm":true}))),
         "info" if args.len() == 1 => execute_tool(store, "get_workspace_info", &json!({})),
         "--help" | "-h" | "help" => {
-            println!("Inkpad headless agent\n\nMCP stdio: inkpad-agent.exe [mcp]\nCLI:\n  list | search TEXT | get ID | info | active | activate ID\n  create [--title TITLE] [--body TEXT] | append ID TEXT | update ID [--title TITLE] [--body TEXT]\n  rename ID NEW_TITLE | pin ID | unpin ID | font-size ID 12..40 | font-choice ID Sans|Serif|Mono\n  export-text ID ABS_PATH.txt | export-png ID ABS_PATH.png\n  add-stroke ID WIDTH COLOR X,Y [X,Y ...] [--eraser]\n  add-stroke ID @ABS_PATH.json  (PowerShell-friendly file-backed JSON)\n  add-stroke ID STROKE_JSON (for correctly escaped inline JSON)\n  undo-stroke ID --confirm | clear-strokes ID --confirm | delete ID --confirm\n\nStorage: %LOCALAPPDATA%\\Inkpad\\workspace.json (override with INKPAD_DATA_DIR)\nNote: GUI Text/Draw view mode is transient, not a stored setting.");
+            println!("Inkpad headless agent\n\nMCP stdio: inkpad-agent.exe [mcp]\nCLI:\n  list | search TEXT | get ID | info | active | activate ID\n  create [--title TITLE] [--body TEXT] | append ID TEXT | update ID [--title TITLE] [--body TEXT]\n  rename ID NEW_TITLE | pin ID | unpin ID | font-size ID 12..40 | font-choice ID Sans|Serif|Mono\n  export-text ID ABS_PATH.txt | export-png ID ABS_PATH.png\n  add-stroke ID WIDTH COLOR X,Y [X,Y ...] [--eraser]\n  add-stroke ID @ABS_PATH.json  (PowerShell-friendly file-backed JSON)\n  undo-stroke ID --confirm | clear-strokes ID --confirm | delete ID --confirm\n  add-image ID ABS_IMAGE_PATH --approved\n  add-image-base64 ID @ABS_PATH.b64 --approved (max 1 MiB decoded)\n  images ID | image-width ID IMAGE_ID 10..100 | image-move ID IMAGE_ID POSITION\n  image-caption ID IMAGE_ID TEXT | image-delete ID IMAGE_ID --confirm\n  export-html ID ABS_PATH.html --approved (self-contained)\n  read-image ID IMAGE_ID --approved (max 1 MiB)\n  export-image ID IMAGE_ID ABS_PATH.png --approved\n\nSource files require explicit user approval; destructive actions require explicit user authorization.\nStorage: %LOCALAPPDATA%\\Inkpad\\workspace.json (override with INKPAD_DATA_DIR)\nGUI Text/Draw view mode is transient, not a stored setting.");
             return Ok(());
         }
         _ => Err(invalid("Invalid command; run inkpad-agent --help for usage")),
@@ -751,7 +1064,7 @@ mod tests {
         let responses: Vec<Value> = String::from_utf8(output).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(responses.len(), 4);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 18);
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 28);
         assert_eq!(responses[2]["result"]["structuredContent"]["title"], "From MCP");
         assert_eq!(responses[3]["result"]["isError"], true);
         std::fs::remove_dir_all(folder).unwrap();
@@ -1000,5 +1313,151 @@ mod tests {
         std::fs::write(&json_file, b"\xef\xbb\xbf{\"width\":6,\"color\":\"#001122\",\"points\":[[3,4]]}").unwrap();
         assert_eq!(cli_stroke_json(&format!("@{}", json_file.display())).unwrap()["width"], 6);
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&[24, 60, 180, 255]).unwrap();
+        }
+        png
+    }
+
+    #[test]
+    fn image_file_and_base64_roundtrip_order_caption_width_export_and_deletion_safety() {
+        use base64::Engine as _;
+        let (store, folder) = store();
+        let outside = std::env::temp_dir().join(format!("inkpad-agent-image-source-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("source.PNG");
+        std::fs::write(&source, tiny_png()).unwrap();
+        let note = tool(&store, "create_note", json!({"title":"Pictures","body":"Text <escape> & symbols"}));
+        let note_id = note["id"].as_str().unwrap();
+
+        let file = tool(&store, "image_insert_file", json!({"id":note_id,"path":source,"user_approved":true}));
+        let file_id = file["image"]["id"].as_str().unwrap();
+        let copied = store.media_path(&store.list_media(note_id).unwrap()[0]).unwrap();
+        assert!(copied.exists());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(tiny_png());
+        let inline = tool(&store, "image_insert_base64", json!({"id":note_id,"data_base64":encoded,"user_approved":true}));
+        let inline_id = inline["image"]["id"].as_str().unwrap();
+        assert_ne!(file_id, inline_id);
+        assert_eq!(tool(&store, "image_list", json!({"id":note_id}))["total"], 2);
+        assert_eq!(tool(&store, "read_note", json!({"id":note_id}))["images"].as_array().unwrap().len(), 2);
+        assert_eq!(tool(&store, "list_notes", json!({}))["notes"].as_array().unwrap()
+            .iter().find(|v| v["id"] == note_id).unwrap()["image_count"], 2);
+
+        let resized = tool(&store, "image_resize", json!({"id":note_id,"image_id":inline_id,"width_percent":42}));
+        assert_eq!(resized["image"]["width_percent"], 42);
+        let moved = tool(&store, "image_move", json!({"id":note_id,"image_id":inline_id,"position":0}));
+        assert_eq!(moved["image"]["position"], 0);
+        let captioned = tool(&store, "image_caption", json!({"id":note_id,"image_id":inline_id,"caption":"A <b> & quote"}));
+        assert_eq!(captioned["image"]["caption"], "A <b> & quote");
+        let ordered = tool(&store, "image_list", json!({"id":note_id}));
+        assert_eq!(ordered["images"][0]["id"], inline_id);
+        assert_eq!(ordered["images"][1]["id"], file_id);
+
+        let html_file = outside.join("export.html");
+        let html_export = tool(&store, "image_export_html", json!({"id":note_id,"path":html_file,"user_approved":true}));
+        assert_eq!(html_export["self_contained"], true);
+        let html = std::fs::read_to_string(&html_file).unwrap();
+        assert!(html.contains("Text &lt;escape&gt; &amp; symbols"));
+        assert!(html.contains("A &lt;b&gt; &amp; quote"));
+        assert!(html.contains("data:image/png;base64,"));
+        assert!(!html.contains("file://"));
+        assert!(execute_tool(&store, "image_export_html", &json!({"id":note_id,"path":html_file,"user_approved":true})).is_err());
+
+        assert!(execute_tool(&store, "image_delete", &json!({"id":note_id,"image_id":file_id})).is_err());
+        assert!(execute_tool(&store, "image_delete", &json!({"id":note_id,"image_id":file_id,"confirm":false})).is_err());
+        assert_eq!(tool(&store, "image_list", json!({"id":note_id}))["total"], 2);
+        assert_eq!(tool(&store, "image_delete", json!({"id":note_id,"image_id":file_id,"confirm":true}))["deleted"], true);
+        assert_eq!(tool(&store, "image_list", json!({"id":note_id}))["total"], 1);
+        assert_eq!(std::fs::read(&source).unwrap(), tiny_png());
+        std::fs::remove_dir_all(folder).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn images_reject_unapproved_paths_traversal_invalid_bytes_and_ranges() {
+        let (store, folder) = store();
+        let outside = std::env::temp_dir().join(format!("inkpad-agent-bad-media-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("safe.png");
+        let bad_source = outside.join("secret.png");
+        std::fs::write(&source, tiny_png()).unwrap();
+        std::fs::write(&bad_source, b"not an image").unwrap();
+        let note = tool(&store, "create_note", json!({"title":"Guarded"}));
+        let note_id = note["id"].as_str().unwrap();
+        for request in [
+            json!({"id":note_id,"path":source}),
+            json!({"id":note_id,"path":source,"user_approved":false}),
+            json!({"id":note_id,"path":"..\\secrets.png","user_approved":true}),
+            json!({"id":note_id,"path":bad_source,"user_approved":true}),
+            json!({"id":note_id,"path":store.data_path(),"user_approved":true}),
+        ] {
+            assert!(execute_tool(&store, "image_insert_file", &request).is_err(), "Unexpectedly accepted {request}");
+        }
+        assert!(execute_tool(&store, "image_insert_base64", &json!({"id":note_id,"data_base64":"AAAA"})).is_err());
+        for payload in ["AAAA", "A===", "AAA-", "AAAA====", "YWJj"] {
+            assert!(decode_image_base64(payload).is_err(), "Unexpectedly accepted {payload}");
+        }
+        let first = tool(&store, "image_insert_file", json!({"id":note_id,"path":source,"user_approved":true}));
+        let image_id = first["image"]["id"].as_str().unwrap();
+        for (name, args) in [
+            ("image_resize", json!({"id":note_id,"image_id":image_id,"width_percent":9})),
+            ("image_resize", json!({"id":note_id,"image_id":image_id,"width_percent":101})),
+            ("image_move", json!({"id":note_id,"image_id":image_id,"position":-1})),
+            ("image_caption", json!({"id":note_id,"image_id":image_id,"caption":"z".repeat(501)})),
+            ("image_delete", json!({"id":note_id,"image_id":"../other.png","confirm":true})),
+            ("image_export_html", json!({"id":note_id,"path":outside.join("a.html")})),
+            ("image_export_html", json!({"id":note_id,"path":outside.join("../escape.html"),"user_approved":true})),
+        ] {
+            assert!(execute_tool(&store, name, &args).is_err(), "Unexpectedly accepted {name} {args}");
+        }
+        assert_eq!(tool(&store, "image_list", json!({"id":note_id}))["total"], 1);
+        std::fs::remove_dir_all(folder).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn read_image_and_export_image_protect_private_data_and_avoid_duplicate_mcp_base64() {
+        let (store, folder) = store();
+        let outside = std::env::temp_dir().join(format!("inkpad-agent-read-picture-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let note = tool(&store, "create_note", json!({"title":"Read Picture"}));
+        let note_id = note["id"].as_str().unwrap();
+        let inserted = store.insert_image_bytes(note_id, &tiny_png()).unwrap();
+        let image_id = inserted.id.as_str();
+        let source = store.media_path(&inserted).unwrap();
+        let stored = std::fs::read(&source).unwrap();
+        assert!(execute_tool(&store, "read_image", &json!({"id":note_id,"image_id":image_id})).is_err());
+        assert!(execute_tool(&store, "export_image", &json!({"id":note_id,"image_id":image_id,"path":outside.join("photo.png")})).is_err());
+        let read = tool(&store, "read_image", json!({"id":note_id,"image_id":image_id,"user_approved":true}));
+        assert_eq!(read["bytes"], stored.len());
+        let decoded = base64::engine::general_purpose::STANDARD.decode(read["data_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, stored);
+        let response = tool_result(read);
+        assert_eq!(response["content"][0]["type"], "image");
+        assert_eq!(response["content"][0]["mimeType"], "image/png");
+        assert!(response["structuredContent"].get("data_base64").is_none());
+        let output = outside.join("photo.png");
+        let copied = tool(&store, "export_image", json!({"id":note_id,"image_id":image_id,"path":output,"user_approved":true}));
+        assert_eq!(copied["bytes"], stored.len());
+        assert_eq!(std::fs::read(&output).unwrap(), stored);
+        assert!(execute_tool(&store, "export_image", &json!({"id":note_id,"image_id":image_id,"path":output,"user_approved":true})).is_err());
+        assert!(execute_tool(&store, "export_image", &json!({"id":note_id,"image_id":image_id,"path":outside.join("bad.jpg"),"user_approved":true})).is_err());
+        // The 1 MiB tool cap must hold even if a private asset is unexpectedly
+        // replaced with an oversized file on disk (without returning its data).
+        std::fs::write(&source, vec![42u8; MAX_IMAGE_BASE64_BYTES + 1]).unwrap();
+        let large = execute_tool(&store, "read_image", &json!({"id":note_id,"image_id":image_id,"user_approved":true}));
+        assert!(large.unwrap_err().contains("export_image"));
+        std::fs::remove_dir_all(folder).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 }

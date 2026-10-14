@@ -1,4 +1,4 @@
-import { LineEdit, ScrollView } from "std-widgets.slint";
+import { LineEdit, ScrollView, Slider } from "std-widgets.slint";
 
 export struct NoteRow {
     id: string,
@@ -7,6 +7,15 @@ export struct NoteRow {
     kind: string,
     active: bool,
     pinned: bool,
+}
+
+// A saved picture belongs to a page, with its own order and display width.
+export struct MediaRow {
+    id: string,
+    caption: string,
+    width-percent: int,
+    position: int,
+    preview: image,
 }
 
 // A compact button that stays accessible to mouse, keyboard, and screen readers.
@@ -403,6 +412,155 @@ component ColorDot inherits Rectangle {
     }
 }
 
+component MediaCard inherits Rectangle {
+    in property <string> media-id: "";
+    in property <string> caption: "";
+    in property <int> width-percent: 100;
+    in property <int> position: 0;
+    in property <image> preview;
+    in property <bool> selected: false;
+    in property <bool> can-move-up: false;
+    in property <bool> can-move-down: false;
+    callback chosen(string);
+    callback resized(string, int);
+    callback moved(string, int);
+    callback removed(string);
+    callback caption-changed(string, string);
+
+    // Scaling a picture changes the page's vertical footprint as well as its width.
+    // Keep 192px for the header, resize controls, caption and spacing.
+    height: 272px + min(100, max(10, root.width-percent)) * 1.3px;
+    border-radius: 13px;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? #d6a645 : #e7e3db;
+    background: #fffefa;
+    VerticalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 8px;
+        HorizontalLayout {
+            height: 23px;
+            spacing: 7px;
+            Text {
+                text: "PHOTO " + (root.position + 1);
+                color: #706858;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            Text {
+                text: root.width-percent + "% OF PAGE";
+                color: #8a8172;
+                font-size: 10px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle {
+            height: 80px + min(100, max(10, root.width-percent)) * 1.3px;
+            background: #f4f2ed;
+            border-radius: 8px;
+            clip: true;
+            accessible-role: button;
+            accessible-label: root.caption == "" ? "Select photo " + (root.position + 1) : "Select photo: " + root.caption;
+            accessible-action-default => { root.chosen(root.media-id); }
+            forward-focus: photo-hit;
+            Image {
+                width: max(56px, (parent.width - 16px) * root.width-percent / 100);
+                height: parent.height - 12px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                source: root.preview;
+                image-fit: contain;
+            }
+            photo-hit := KeyboardTarget {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.chosen(root.media-id); }
+            }
+        }
+        HorizontalLayout {
+            height: 33px;
+            spacing: 5px;
+            ToolLabel { width: 42px; label: "SIZE"; ink: #777167; }
+            for size in [25, 50, 75, 100]: ActionButton {
+                width: 43px;
+                height: 30px;
+                label: size + "%";
+                accessible-name: "Show image at " + size + " percent of page width";
+                selected: root.width-percent == size;
+                clicked => { root.resized(root.media-id, size); }
+            }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            ActionButton {
+                width: 43px;
+                height: 30px;
+                label: "↑";
+                accessible-name: "Move photo up";
+                enabled: root.can-move-up;
+                clicked => { root.moved(root.media-id, -1); }
+            }
+            ActionButton {
+                width: 43px;
+                height: 30px;
+                label: "↓";
+                accessible-name: "Move photo down";
+                enabled: root.can-move-down;
+                clicked => { root.moved(root.media-id, 1); }
+            }
+            ActionButton {
+                width: 71px;
+                height: 30px;
+                label: "Remove";
+                accessible-name: "Remove this photo from page";
+                danger: true;
+                clicked => { root.removed(root.media-id); }
+            }
+        }
+        HorizontalLayout {
+            height: 34px;
+            spacing: 11px;
+            ToolLabel { width: 59px; label: "RESIZE"; ink: #777167; }
+            Slider {
+                horizontal-stretch: 1;
+                height: 28px;
+                minimum: 10;
+                maximum: 100;
+                value: root.width-percent;
+                accessible-label: "Picture width, 10 to 100 percent";
+                changed(value) => { root.resized(root.media-id, Math.round(value)); }
+            }
+            Text {
+                width: 42px;
+                text: root.width-percent + "%";
+                font-size: 12px;
+                font-weight: 700;
+                color: #74634c;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            height: 34px;
+            spacing: 10px;
+            ToolLabel { width: 59px; label: "CAPTION"; ink: #777167; }
+            LineEdit {
+                horizontal-stretch: 1;
+                height: 33px;
+                text: root.caption;
+                placeholder-text: "Add a caption…";
+                accessible-label: "Photo caption";
+                font-size: 12px;
+                edited(value) => { root.caption-changed(root.media-id, value); }
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "Inkpad Beta";
     icon: @image-url("../assets/inkpad-icon-preview.png");
@@ -416,6 +574,8 @@ export component MainWindow inherits Window {
     background: #fffefa;
 
     in property <[NoteRow]> rows: [];
+    in property <[MediaRow]> media-rows: [];
+    in-out property <string> selected-media-id: "";
     in-out property <string> note-title: "";
     in-out property <string> note-body: "";
     in-out property <int> font-size: 17;
@@ -465,6 +625,14 @@ export component MainWindow inherits Window {
     callback window-minimize();
     callback window-toggle-maximize();
     callback window-close();
+    callback paste-image();
+    callback insert-image-file();
+    callback select-media(string);
+    callback resize-media(string, int);
+    callback move-media(string, int);
+    callback delete-media(string);
+    callback caption-media(string, string);
+    callback export-page();
 
     private property <color> ink: #292927;
     private property <color> muted: #6d6962;
@@ -1346,17 +1514,97 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
+                        Rectangle { height: 1px; background: root.line; }
+                        Rectangle {
+                            height: 54px;
+                            background: #fbfaf8;
+                            HorizontalLayout {
+                                padding-left: 26px;
+                                padding-right: 26px;
+                                spacing: 8px;
+                                ToolLabel {
+                                    width: 93px;
+                                    label: "PICTURES";
+                                    ink: #686159;
+                                }
+                                Text {
+                                    text: root.media-rows.length + " on page";
+                                    color: root.muted;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                ActionButton {
+                                    width: 96px;
+                                    height: 33px;
+                                    label: "Paste image";
+                                    accessible-name: "Paste image from clipboard, Control V";
+                                    clicked => { root.paste-image(); }
+                                }
+                                ActionButton {
+                                    width: 99px;
+                                    height: 33px;
+                                    prominent: true;
+                                    label: "Add picture";
+                                    accessible-name: "Insert image file";
+                                    clicked => { root.insert-image-file(); }
+                                }
+                                ActionButton {
+                                    width: 100px;
+                                    height: 33px;
+                                    label: "Export page";
+                                    accessible-name: "Export page with pictures";
+                                    clicked => { root.export-page(); }
+                                }
+                            }
+                        }
+                        if root.media-rows.length > 0: Rectangle {
+                            vertical-stretch: 1;
+                            background: #f8f7f3;
+                            ScrollView {
+                                x: (parent.width - self.width) / 2;
+                                y: 0px;
+                                width: min(parent.width - 36px, 910px);
+                                height: parent.height;
+                                VerticalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    padding-top: 13px;
+                                    padding-bottom: 18px;
+                                    spacing: 11px;
+                                    for media in root.media-rows: MediaCard {
+                                        horizontal-stretch: 1;
+                                        media-id: media.id;
+                                        caption: media.caption;
+                                        width-percent: media.width-percent;
+                                        position: media.position;
+                                        preview: media.preview;
+                                        selected: root.selected-media-id == media.id;
+                                        can-move-up: media.position > 0;
+                                        can-move-down: media.position < root.media-rows.length - 1;
+                                        chosen(id) => { root.selected-media-id = id; root.select-media(id); }
+                                        resized(id, size) => { root.resize-media(id, size); }
+                                        moved(id, direction) => { root.move-media(id, direction); }
+                                        removed(id) => { root.delete-media(id); }
+                                        caption-changed(id, value) => { root.caption-media(id, value); }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if root.edit-mode == "draw": VerticalLayout {
                         spacing: 0px;
                         Rectangle {
-                            height: 59px;
+                            height: 102px;
                             background: #fbfaf8;
-                            HorizontalLayout {
+                            VerticalLayout {
+                              spacing: 0px;
+                              HorizontalLayout {
+                                height: 52px;
                                 padding-left: 23px;
                                 padding-right: 23px;
-                                spacing: 4px;
+                                spacing: 7px;
                                 ActionButton {
                                     width: 62px;
                                     height: 34px;
@@ -1411,27 +1659,6 @@ export component MainWindow inherits Window {
                                     background: transparent;
                                     Rectangle { y: 5px; width: 1px; height: 24px; background: root.line; }
                                 }
-                                for color in [
-                                    {name: "Ink", code: "#263238", paint: #263238},
-                                    {name: "Blue", code: "#386CC5", paint: #386cc5},
-                                    {name: "Teal", code: "#158E89", paint: #158e89},
-                                    {name: "Green", code: "#61A366", paint: #61a366},
-                                    {name: "Coral", code: "#E76E60", paint: #e76e60},
-                                    {name: "Orange", code: "#D99B4A", paint: #d99b4a},
-                                    {name: "Violet", code: "#8B6AB8", paint: #8b6ab8}
-                                ]: Rectangle {
-                                    width: 29px;
-                                    height: 34px;
-                                    background: transparent;
-                                    ColorDot {
-                                        y: (parent.height - self.height) / 2;
-                                        label: color.name;
-                                        value: color.code;
-                                        paint: color.paint;
-                                        selected: !root.eraser && root.brush-color == color.code;
-                                        picked(value) => { root.set-eraser(false); root.set-brush-color(value); }
-                                    }
-                                }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 ActionButton {
                                     width: 55px;
@@ -1446,6 +1673,48 @@ export component MainWindow inherits Window {
                                     label: "Clear";
                                     clicked => { root.request-clear-board(); }
                                 }
+                              }
+                              Rectangle { height: 1px; background: #ebe5dc; }
+                              HorizontalLayout {
+                                height: 49px;
+                                padding-left: 23px;
+                                padding-right: 23px;
+                                spacing: 4px;
+                                ToolLabel { width: 66px; label: "COLOURS"; ink: #70685c; }
+                                for color in [
+                                    {name: "Ink", code: "#263238", paint: #263238},
+                                    {name: "Black", code: "#111111", paint: #111111},
+                                    {name: "Slate", code: "#667085", paint: #667085},
+                                    {name: "Silver", code: "#B6BCC7", paint: #b6bcc7},
+                                    {name: "White", code: "#FFFFFF", paint: #ffffff},
+                                    {name: "Ruby", code: "#D74453", paint: #d74453},
+                                    {name: "Coral", code: "#E76E60", paint: #e76e60},
+                                    {name: "Orange", code: "#EF8E42", paint: #ef8e42},
+                                    {name: "Amber", code: "#E7B341", paint: #e7b341},
+                                    {name: "Lemon", code: "#F0D964", paint: #f0d964},
+                                    {name: "Green", code: "#61A366", paint: #61a366},
+                                    {name: "Mint", code: "#9FDCC5", paint: #9fdcc5},
+                                    {name: "Teal", code: "#158E89", paint: #158e89},
+                                    {name: "Sky", code: "#6EB8E9", paint: #6eb8e9},
+                                    {name: "Blue", code: "#386CC5", paint: #386cc5},
+                                    {name: "Indigo", code: "#555AA9", paint: #555aa9},
+                                    {name: "Violet", code: "#8B6AB8", paint: #8b6ab8},
+                                    {name: "Pink", code: "#EAA1C8", paint: #eaa1c8}
+                                ]: Rectangle {
+                                    width: 29px;
+                                    height: 34px;
+                                    background: transparent;
+                                    ColorDot {
+                                        y: (parent.height - self.height) / 2;
+                                        label: color.name;
+                                        value: color.code;
+                                        paint: color.paint;
+                                        selected: !root.eraser && root.brush-color == color.code;
+                                        picked(value) => { root.set-eraser(false); root.set-brush-color(value); }
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                              }
                             }
                         }
                         Rectangle { height: 1px; background: root.line; }

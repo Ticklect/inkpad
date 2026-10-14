@@ -1,6 +1,6 @@
 ---
 name: inkpad-notes
-description: Use when a user asks to remember, note down, save, search, check, read, rename, pin, format, draw, export or organise something in their local Inkpad notebook (e.g. "note that down in Inkpad", "check my Inkpad notes", or "rename that page"). All operations are headless: never open the Inkpad window or use screen automation.
+description: Use when a user asks to remember, note down, save, search, check, read, rename, pin, format, draw, paste/import pictures, resize or reorder images, caption them, export complete notes or organise something in their local Inkpad notebook. All agent operations are headless; never open the Inkpad window or use screen automation.
 ---
 
 # Inkpad local notes — headless agent skill
@@ -11,27 +11,47 @@ When the user says **"note that down in Inkpad"** or asks to **check their notes
 
 Use an appropriate local command-execution tool:
 
-`D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe`
+`D:\chat\inkpad\target\release\inkpad-agent.exe`
+
+For a packaged version, confirm the package's executable has the same updated `tools/list` before substituting its path; earlier Beta distributions may contain an older agent without picture tools.
 
 The binary emits JSON to standard output. From PowerShell:
 
 ```powershell
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' list
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' search 'topic'
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' get NOTE_ID
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' create --title 'Topic' --body 'Actual facts and context to remember'
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' append NOTE_ID 'Additional information'
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' rename NOTE_ID 'New title'
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' pin NOTE_ID
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' font-size NOTE_ID 19
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' font-choice NOTE_ID Serif
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' active
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' activate NOTE_ID
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' export-text NOTE_ID 'D:\Notes\export.txt'
-& 'D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe' export-png NOTE_ID 'D:\Notes\sketch.png'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' list
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' search 'topic'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' get NOTE_ID
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' create --title 'Topic' --body 'Actual facts and context to remember'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' append NOTE_ID 'Additional information'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' rename NOTE_ID 'New title'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' pin NOTE_ID
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' font-size NOTE_ID 19
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' font-choice NOTE_ID Serif
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' active
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' activate NOTE_ID
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' export-text NOTE_ID 'D:\Notes\export.txt'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' export-png NOTE_ID 'D:\Notes\sketch.png'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' add-image NOTE_ID 'D:\Photos\holiday.jpg' --approved
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' images NOTE_ID
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' image-width NOTE_ID IMAGE_ID 10
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' image-move NOTE_ID IMAGE_ID 0
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' image-caption NOTE_ID IMAGE_ID 'Holiday photo'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' image-delete NOTE_ID IMAGE_ID --confirm
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' read-image NOTE_ID IMAGE_ID --approved
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' export-image NOTE_ID IMAGE_ID 'D:\Notes\picture.png' --approved
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' export-html NOTE_ID 'D:\Notes\complete.html' --approved
 ```
 
-If no command tool is available, connect the Inkpad MCP stdio server as documented in `D:\chat\inkpad\AGENTS.md`. Its 18 native MCP tools cover notes, pinned state, font choices, active selection, export, validated drawing strokes, undo, clear, and deletion without any GUI window. For full stroke JSON in Windows PowerShell 5.1, prefer `add-stroke NOTE_ID @D:\Notes\stroke.json` (use a string variable) or the numeric point syntax detailed in AGENTS.md.
+If no command tool is available, connect the Inkpad MCP stdio server as documented in `D:\chat\inkpad\AGENTS.md`. Its **28 MCP tools** include the original note, font, selection, drawing and export functions, plus `image_insert_file`, `image_insert_base64`, `image_list`, `image_resize`, `image_move`, `image_caption`, `image_delete`, `image_export_html`, `read_image` and `export_image`. For full stroke JSON in Windows PowerShell 5.1, prefer `add-stroke NOTE_ID @D:\Notes\stroke.json` (use a string variable) or the numeric point syntax detailed in AGENTS.md.
+
+## Adding and managing pictures
+
+- If the user says **"add this picture to Inkpad"**, obtain the actual image file path provided/selected by the user. Call `image_insert_file` with note `id`, absolute `path` and `user_approved:true` **only when that exact source is authorized**. For already user-provided base64 PNG/JPEG/GIF/WebP, use `image_insert_base64`; no remote URL fetching and no background folder scanning. Never set `user_approved:true` for a guessed path.
+- The source image stays untouched; Inkpad validates and stores a normalized PNG under its private media directory. Input files are limited to 12 MiB and 16 megapixels, and a page supports up to 100 images. Base64 via MCP is limited to 1 MiB decoded per call. The CLI can read encoded text from `@ABS_PATH.b64` with `--approved`.
+- Use `image_list` to get image IDs before moving, captioning, resizing or removing pictures. `image_resize` uses `width_percent` from **10 to 100**. `image_move` uses zero-based `position`; 0 means first picture. Captions can contain up to **500 characters**.
+- For **"what's in this Inkpad picture?"**, use `read_image` only for the exact selected note attachment, with user approval. MCP receives a normal image content block, max 1 MiB PNG. If larger, use `export_image` to a user-approved new `.png` path; do not claim that exporting alone makes the assistant visually understand the image.
+- Before `image_delete` identify the exact image and require explicit human authorization, then pass `confirm:true`. Deleting the attachment removes its note reference, but backup recovery may keep the PNG file temporarily; do not claim secure destruction of its bytes.
+- For a portable copy containing **all text, inline pictures and drawings**, use `image_export_html` to a user-approved absolute `.html` path with `user_approved:true`. This embeds images into the HTML. It never overwrites a file and does not upload/share it.
 
 ## How to behave
 
@@ -39,8 +59,9 @@ If no command tool is available, connect the Inkpad MCP stdio server as document
 - For **"check my notes"**, run list or search and then get the relevant note; do not claim to have checked based on memory alone.
 - Prefer appending to an existing exact note by ID rather than replacing its whole text.
 - For rename, pin/unpin, font/size changes, active page selection, and exports, use the named action rather than editing the JSON file.
+- For picture inserts, size, order, caption and removals, use the image MCP tools or matching CLI commands. Note title/body changes must preserve the `images` collection and other unsupplied fields.
 - Never manipulate files inside Inkpad's data folder directly; always use the headless CLI or MCP tools so concurrent changes are coordinated safely.
-- **Never delete, clear drawings or undo a saved stroke** unless the user specifically requests it. These destructive actions require `--confirm` (CLI) or `confirm:true` (MCP).
+- **Never delete a note or picture, clear drawings or undo a saved stroke** unless the user specifically requests it. These destructive actions require `--confirm` (CLI) or `confirm:true` (MCP).
 - Treat the user's notes as sensitive. Do not paste them into public services or send them to a network endpoint.
 - The Inkpad GUI need not be running. If it is open, saved external edits automatically appear in its sidebar after a short refresh.
 - A page can contain text and drawing strokes simultaneously; the GUI's Text/Draw viewing mode is temporary and is not a remotely controlled persisted setting. Do not claim an agent changed that visual mode.

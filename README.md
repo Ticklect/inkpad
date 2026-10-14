@@ -8,12 +8,14 @@ A lightweight, local-first Windows notebook and drawing board made with **Rust +
 - **Mac-inspired custom chrome:** frameless unified titlebar with window drag, native edge resizing and minimize/maximize/close controls. Inkpad includes a branded, multi-resolution executable/window/taskbar icon.
 - **In-app confirmation:** deleting pages or clearing drawings uses the app's own confirmation sheet rather than a Windows Yes/No message box. Destructive actions still require confirmation.
 - **Text + drawing in one page:** select **Text** or **Draw** to edit either medium on the same page. Existing old drawing boards are preserved and can also contain text.
+- **Pictures in a page:** paste an image with **Ctrl+V**, use **Paste image** or **Add picture**, or drag a PNG/JPEG/GIF/WebP file from Explorer onto Inkpad. Imported pictures stay with their page after restart.
+- **Picture sizing and layout:** picture blocks have 25%/50%/75%/100% presets, a **continuous 10–100% width slider**, responsive vertical space, captions, move up/down and confirmed removal. Previews preserve image proportions.
 - **Text:** multiline writing with explicit readable dark text, per-page font size (12–40), and Sans / Serif / Mono font styles.
-- **Drawing:** 1100 × 700 canvas with freehand strokes, brush colours, eraser, brush size, undo and clear (with confirmation). Strokes remain editable after restart.
+- **Drawing:** 1100 × 700 canvas with freehand strokes, **18 brush colours**, eraser, brush size, undo and clear (with confirmation). Strokes remain editable after restart.
 - **Automatic local saves:** `%LOCALAPPDATA%\Inkpad\workspace.json` stores all text and strokes; `workspace.json.bak` keeps a previous version. Typing saves after a short pause and again on close.
-- **Rapid background agent checks:** `inkpad-agent.exe` provides headless MCP tools and a JSON CLI for listing, searching, reading, creating and updating notes. Persistent stdio MCP avoids repeated process startup; it never needs a desktop window; see [AGENTS.md](AGENTS.md).
+- **Rapid background agent checks:** `inkpad-agent.exe` provides **28 headless MCP tools** and a JSON CLI for notes, drawings, picture attachments and exports. Agents can insert, read, resize, reorder, caption, delete and export pictures with approval safeguards. Persistent stdio MCP requires no Inkpad desktop window; see [AGENTS.md](AGENTS.md).
 - **Safe multi-process edits:** Windows file locks, merging of unrelated changes, periodic desktop refresh and explicit conflict detection protect against overwriting agent or human work.
-- **Export:** export the current Text view as `.txt`, or the Draw view as `.png`.
+- **Export:** export the current Text view as `.txt`, Draw view as `.png`, or the **complete page as self-contained `.html`** containing text, ordered pictures and drawings. Picture bytes are embedded, so no external asset folder is required to open the export.
 - **Accessible controls:** keyboard-focusable buttons, labelled sidebar pages, Esc to dismiss confirmation, and input controls.
 
 ## Run / build on Windows
@@ -26,10 +28,12 @@ cargo test
 cargo build --release
 ```
 
-The finished desktop executable is `target\release\inkpad.exe`. The optional MCP/CLI executable is `target\release\inkpad-agent.exe`. They use the same notes folder, even when only the agent is running. Set `INKPAD_DATA_DIR` to change this folder consistently for both processes. The portable build lives at `dist\Inkpad-Beta-Pending-Drag-Test\Inkpad.exe`.
+The finished desktop executable is `target\release\inkpad.exe`. The optional MCP/CLI executable is `target\release\inkpad-agent.exe`. They use the same notes folder, even when only the agent is running. Set `INKPAD_DATA_DIR` to change this folder consistently for both processes. The portable build lives at `dist\Inkpad-Beta-Images-Staged\Inkpad.exe`.
 
 ## Data and limitations
 
-The app keeps data entirely on your computer. Back up the `%LOCALAPPDATA%\Inkpad` folder to protect against disk loss. UI preferences are stored separately from `workspace.json` so they cannot inadvertently overwrite note changes. Notes have page-level font choices but **do not yet support rich text per selection**, attachments, syncing between computers or infinite drawing canvas. The drawing editor uses a fixed 1100 × 700 canvas and exports PNG at that resolution.
+The app keeps data entirely on your computer. Back up the **entire** `%LOCALAPPDATA%\Inkpad` folder, including `media/` image files, `workspace.json` and `workspace.json.bak`. Picture files are stored locally as validated PNGs with opaque generated filenames; JSON stores captions, display widths and order. A removed picture's file is retained only while the previous-save backup still references it, then automatically reclaimed after backup rotation. Imports are limited to 12 MiB and 16 megapixels, with up to 100 pictures per page; animated GIFs are imported as a still image.
+
+UI preferences live separately from note content. Notes have page-level fonts but **do not yet support rich text per selection**, synchronisation between computers or an infinite drawing canvas. Picture blocks appear below the note's main text, not between words in a paragraph. The drawing editor uses a fixed 1100 × 700 canvas and exports PNG at that resolution. Clipboard paste, OS drag/drop and image layout have been implemented and headlessly built, but physical on-screen interaction still needs a separate acceptance check when the user allows window interaction.
 
 This is a beta. The first launch creates a welcome page which you can edit or delete. Older notes and sketch-only pages continue to load; their text and strokes are not erased by the migration.

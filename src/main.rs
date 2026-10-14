@@ -2,6 +2,7 @@
 
 mod canvas;
 mod instance;
+mod media;
 mod settings;
 mod store;
 #[cfg(windows)]
@@ -16,6 +17,7 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 use settings::UiSettings;
 use store::{Note, Store, Stroke, Workspace};
+use std::path::Path;
 
 slint::include_modules!();
 
@@ -40,6 +42,7 @@ struct App {
 enum PendingAction {
     Delete { id: String, title: String },
     ClearDrawing { id: String, title: String },
+    DeletePicture { note_id: String, image_id: String },
 }
 
 impl PendingAction {
@@ -55,8 +58,44 @@ impl PendingAction {
                 format!("All strokes on “{title}” will be erased. Your text will remain."),
                 "Clear drawing".into(),
             ),
+            Self::DeletePicture { .. } => (
+                "Remove this picture?".into(),
+                "The image will be removed from this page. Your text and other pictures will remain.".into(),
+                "Remove picture".into(),
+            ),
         }
     }
+}
+
+/// Three-way per-field merge of a note. A headless agent can insert or resize
+/// images while the user is typing in the desktop editor: unrelated changes
+/// are retained instead of treating the whole note as conflicting. Conflicting
+/// edits to the *same* field remain blocked to prevent silent data loss.
+fn merge_field<T: Clone + PartialEq>(
+    base: &T, local: &T, remote: &T, field: &str,
+) -> io::Result<T> {
+    if local == base { return Ok(remote.clone()); }
+    if remote == base || remote == local { return Ok(local.clone()); }
+    Err(io::Error::new(io::ErrorKind::WouldBlock,
+        format!("Both the desktop and an agent changed {field}; the desktop change remains unsaved.")))
+}
+
+fn merge_note(base: &Note, local: &Note, remote: &Note) -> io::Result<Note> {
+    if base.id != local.id || local.id != remote.id {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Conflicting note identity"));
+    }
+    Ok(Note {
+        id: base.id.clone(),
+        title: merge_field(&base.title, &local.title, &remote.title, "the title")?,
+        body: merge_field(&base.body, &local.body, &remote.body, "note text")?,
+        kind: merge_field(&base.kind, &local.kind, &remote.kind, "page type")?,
+        font_size: merge_field(&base.font_size, &local.font_size, &remote.font_size, "font size")?,
+        font_choice: merge_field(&base.font_choice, &local.font_choice, &remote.font_choice, "font family")?,
+        pinned: merge_field(&base.pinned, &local.pinned, &remote.pinned, "pinned state")?,
+        strokes: merge_field(&base.strokes, &local.strokes, &remote.strokes, "drawing strokes")?,
+        images: merge_field(&base.images, &local.images, &remote.images, "picture blocks")?,
+        updated: local.updated.max(remote.updated),
+    })
 }
 
 impl App {
@@ -84,6 +123,9 @@ impl App {
             pending_action: None,
         };
         app.reload_board();
+        // Conservative cleanup only: assets younger than 24 hours or still
+        // referenced by the backup are retained. Never block startup on it.
+        let _ = app.storage.prune_unused_media();
         Ok(app)
     }
 
@@ -117,14 +159,10 @@ impl App {
                 if former == Some(note) { continue; }
                 if let Some(pos) = latest.notes.iter().position(|item| item.id == note.id) {
                     if let Some(former) = former {
-                        if latest.notes[pos] != *former {
-                            return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                                format!("An agent also edited '{}'. Your unsaved changes remain in the window; resolve this conflict before closing.", note.title)));
-                        }
+                        latest.notes[pos] = merge_note(former, note, &latest.notes[pos])?;
                     } else {
                         return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Note ID conflict"));
                     }
-                    latest.notes[pos] = note.clone();
                 } else if former.is_some() {
                     return Err(io::Error::new(io::ErrorKind::NotFound,
                         format!("An agent deleted '{}'. Unsaved local edits remain in the window.", note.title)));
@@ -237,6 +275,15 @@ impl App {
         self.pending_action.as_ref().map(PendingAction::description)
     }
 
+    fn request_image_delete(&mut self, image_id: &str) -> Option<(String, String, String)> {
+        let note = self.active()?;
+        if !note.images.iter().any(|image| image.id == image_id) { return None; }
+        self.pending_action = Some(PendingAction::DeletePicture {
+            note_id: note.id.clone(), image_id: image_id.to_string(),
+        });
+        self.pending_action.as_ref().map(PendingAction::description)
+    }
+
     fn cancel_action(&mut self) { self.pending_action = None; }
 
     fn confirm_action(&mut self) -> io::Result<()> {
@@ -251,6 +298,14 @@ impl App {
                         "The selected page changed. No drawing was cleared."));
                 }
                 self.clear()
+            }
+            PendingAction::DeletePicture { note_id, image_id } => {
+                if self.workspace.active_id != note_id {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "The selected page changed."));
+                }
+                self.persist()?;
+                self.storage.delete_image(&note_id, &image_id)?;
+                self.reload_after_media_change()
             }
         }
     }
@@ -328,6 +383,72 @@ impl App {
         }
         Ok(())
     }
+
+    fn reload_after_media_change(&mut self) -> io::Result<()> {
+        let selected = self.workspace.active_id.clone();
+        let updated = self.storage.read_latest()?;
+        self.baseline = updated.clone();
+        self.workspace = updated;
+        self.workspace.active_id = selected;
+        self.last_seen_file = file_stamp(self.storage.data_path());
+        self.reload_board();
+        Ok(())
+    }
+
+    fn import_image_file(&mut self, path: &Path) -> io::Result<()> {
+        self.persist()?;
+        let id = self.workspace.active_id.clone();
+        self.storage.insert_image_from_file(&id, path)?;
+        self.reload_after_media_change()?;
+        self.edit_mode = "text".to_string();
+        Ok(())
+    }
+
+    fn import_image_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.persist()?;
+        let id = self.workspace.active_id.clone();
+        self.storage.insert_image_bytes(&id, bytes)?;
+        self.reload_after_media_change()?;
+        self.edit_mode = "text".to_string();
+        Ok(())
+    }
+
+    fn update_media(&mut self, id: &str, caption: Option<&str>, width: Option<u8>,
+        position: Option<usize>) -> io::Result<()> {
+        self.persist()?;
+        let note_id = self.workspace.active_id.clone();
+        self.storage.update_image(&note_id, id, caption, width, position)?;
+        self.reload_after_media_change()
+    }
+
+    fn export_complete_page(&self) -> io::Result<()> {
+        let Some(note) = self.active() else { return Ok(()); };
+        let title: String = note.title.chars().map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control() { '_' } else { c }
+        }).take(65).collect();
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Web page with embedded pictures", &["html"])
+            .set_file_name(format!("{}.html", if title.is_empty() { "Inkpad page" } else { &title }))
+            .save_file() else { return Ok(()); };
+        self.storage.export_note_html(&note.id, &path)
+    }
+}
+
+fn png_from_clipboard() -> io::Result<Vec<u8>> {
+    use image::ImageEncoder;
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|e| io::Error::other(format!("Clipboard unavailable: {e}")))?;
+    let item = clipboard.get_image()
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("No picture in clipboard: {e}")))?;
+    let (width, height) = (item.width as u32, item.height as u32);
+    if width == 0 || height == 0 || (width as u64) * (height as u64) > 16_000_000 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Clipboard picture exceeds 16 megapixels"));
+    }
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&item.bytes, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(png)
 }
 
 fn file_stamp(path: &std::path::Path) -> Option<(SystemTime, u64)> {
@@ -350,7 +471,11 @@ fn update_rows(ui: &MainWindow, app: &App) {
     notes.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| b.updated.cmp(&a.updated)).then_with(|| a.title.cmp(&b.title)));
     let rows = notes.into_iter().map(|note| NoteRow {
         id: note.id.clone().into(), title: note.title.clone().into(),
-        subtitle: if note.kind == "board" {
+        subtitle: if !note.images.is_empty() {
+            format!("{} picture{} · {}", note.images.len(), if note.images.len() == 1 { "" } else { "s" },
+                note.body.lines().find(|line| !line.trim().is_empty()).unwrap_or("Photo page"))
+                .chars().take(70).collect::<String>()
+        } else if note.kind == "board" {
             format!("Sketch · {} stroke{}", note.strokes.len(), if note.strokes.len() == 1 { "" } else { "s" })
         } else {
             let preview = note.body.lines().find(|line| !line.trim().is_empty()).unwrap_or("Empty note");
@@ -379,6 +504,36 @@ fn update_editor(ui: &MainWindow, app: &App) {
     }
     ui.set_edit_mode(app.edit_mode.clone().into());
     if let Some(board) = app.board.as_ref() { ui.set_canvas_image(board_image(board)); }
+    update_media_rows(ui, app);
+}
+
+fn update_media_rows(ui: &MainWindow, app: &App) {
+    let mut rows = Vec::new();
+    if let Some(note) = app.active() {
+        let mut images = note.images.clone();
+        images.sort_by_key(|image| image.position);
+        for media in images {
+            let preview = match app.storage.media_preview_path(&media) {
+                Ok(path) => Image::load_from_path(&path).unwrap_or_default(),
+                Err(error) => {
+                    eprintln!("Inkpad image preview unavailable: {error}");
+                    Image::default()
+                }
+            };
+            rows.push(MediaRow {
+                id: media.id.into(),
+                caption: media.caption.into(),
+                width_percent: media.width_percent as i32,
+                position: media.position as i32,
+                preview,
+            });
+        }
+    }
+    let selected = ui.get_selected_media_id().to_string();
+    if !rows.iter().any(|row| row.id == selected) {
+        ui.set_selected_media_id("".into());
+    }
+    ui.set_media_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
 fn update_all(ui: &MainWindow, app: &App) {
@@ -427,6 +582,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     windows_chrome::install(ui.window(), {
         let weak = ui.as_weak();
         move || weak.upgrade().is_some_and(|window| !window.get_delete_confirm_open())
+    }, {
+        let app = app.clone();
+        let weak = ui.as_weak();
+        move |path| {
+            let app = app.clone();
+            let weak = weak.clone();
+            // Schedule outside winit's native event callback to avoid
+            // re-entering Slint while its window adapter is borrowed.
+            slint::Timer::single_shot(Duration::from_millis(0), move || {
+                let Some(ui) = weak.upgrade() else { return; };
+                if app.borrow().pending_action.is_some() { return; }
+                let result = app.borrow_mut().import_image_file(&path);
+                if result.is_ok() { update_all(&ui, &app.borrow()); }
+                set_status(&ui, result);
+            });
+        }
+    }, {
+        let app = app.clone();
+        let weak = ui.as_weak();
+        move || {
+            let Ok(image_png) = png_from_clipboard() else { return false; };
+            let app = app.clone();
+            let weak = weak.clone();
+            slint::Timer::single_shot(Duration::from_millis(0), move || {
+                let Some(ui) = weak.upgrade() else { return; };
+                if app.borrow().pending_action.is_some() { return; }
+                let result = app.borrow_mut().import_image_bytes(&image_png);
+                if result.is_ok() { update_all(&ui, &app.borrow()); }
+                set_status(&ui, result);
+            });
+            true
+        }
     });
     // Frameless windows still receive native WM_CLOSE (Alt+F4, taskbar
     // close). A repeating refresh timer can keep Slint's event loop alive
@@ -651,6 +838,130 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_insert_image_file(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let chosen = rfd::FileDialog::new()
+                .add_filter("Pictures", &["png", "jpg", "jpeg", "webp", "gif"])
+                .pick_file();
+            if let Some(path) = chosen {
+                let result = app.borrow_mut().import_image_file(&path);
+                if result.is_ok() { update_all(&ui, &app.borrow()); }
+                set_status(&ui, result);
+            }
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_paste_image(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let result = png_from_clipboard().and_then(|bytes| app.borrow_mut().import_image_bytes(&bytes));
+            if result.is_ok() { update_all(&ui, &app.borrow()); }
+            set_status(&ui, result);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_select_media(move |image_id| {
+            if let Some(ui) = weak.upgrade() {
+                if !ui.get_delete_confirm_open() {
+                    ui.set_selected_media_id(image_id);
+                }
+            }
+        });
+    }
+    // Rapid resize slider/preset clicks coalesce into one disk write after
+    // a short pause, avoiding fsync for every physical pointer movement.
+    let image_resize_timer = Rc::new(slint::Timer::default());
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        let timer = image_resize_timer.clone();
+        ui.on_resize_media(move |image_id, width| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let id = image_id.to_string();
+            let page_id = app.borrow().workspace.active_id.clone();
+            let width = width.clamp(10, 100) as u8;
+            ui.set_save_status("Updating picture size…".into());
+            let app = app.clone(); let weak = weak.clone();
+            timer.start(slint::TimerMode::SingleShot, Duration::from_millis(180), move || {
+                let Some(ui) = weak.upgrade() else { return; };
+                let current_page = app.borrow().workspace.active_id == page_id;
+                let result = if current_page {
+                    app.borrow_mut().update_media(&id, None, Some(width), None)
+                } else {
+                    app.borrow().storage.update_image(&page_id, &id, None, Some(width), None).map(|_| ())
+                };
+                if current_page && result.is_ok() { update_media_rows(&ui, &app.borrow()); }
+                set_status(&ui, result);
+            });
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_move_media(move |image_id, step| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let index = app.borrow().active()
+                .and_then(|note| note.images.iter().find(|image| image.id == image_id.as_str()))
+                .map(|image| image.position);
+            if let Some(index) = index {
+                let new_index = (index as i32 + step).max(0) as usize;
+                let result = app.borrow_mut().update_media(image_id.as_str(), None, None, Some(new_index));
+                if result.is_ok() { update_media_rows(&ui, &app.borrow()); }
+                set_status(&ui, result);
+            }
+        });
+    }
+    let image_caption_timer = Rc::new(slint::Timer::default());
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        let timer = image_caption_timer.clone();
+        ui.on_caption_media(move |image_id, caption| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let id = image_id.to_string();
+            let caption = caption.to_string();
+            let note_id = app.borrow().workspace.active_id.clone();
+            ui.set_save_status("Saving picture caption…".into());
+            let app = app.clone(); let weak = weak.clone();
+            timer.start(slint::TimerMode::SingleShot, Duration::from_millis(420), move || {
+                let Some(ui) = weak.upgrade() else { return; };
+                let result = if app.borrow().workspace.active_id == note_id {
+                    app.borrow_mut().update_media(&id, Some(&caption), None, None)
+                } else {
+                    app.borrow().storage.update_image(&note_id, &id, Some(&caption), None, None).map(|_| ())
+                };
+                // Don't recreate the gallery on each keystroke. The caption
+                // text input already reflects the user's current edits.
+                set_status(&ui, result);
+            });
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_delete_media(move |image_id| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            if let Some((title, body, action)) = app.borrow_mut().request_image_delete(image_id.as_str()) {
+                ui.set_delete_confirm_title(title.into());
+                ui.set_delete_confirm_body(body.into());
+                ui.set_confirm_action_label(action.into());
+                ui.set_delete_confirm_open(true);
+            }
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_export_page(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            set_status(&ui, app.borrow().export_complete_page());
         });
     }
     {
@@ -948,6 +1259,33 @@ mod tests {
         let stored = agent_store.load().unwrap();
         assert_eq!(stored.active_id, new_id);
         assert!(stored.notes.iter().any(|n| n.body == "Edited in desktop before agent selected"));
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn agent_image_insert_merges_with_unsaved_desktop_text_without_data_loss() {
+        use image::ImageEncoder;
+        let folder = std::env::temp_dir().join(format!(
+            "inkpad-image-concurrent-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut gui = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        let note_id = gui.workspace.active_id.clone();
+        gui.active_mut().unwrap().body = "User is still typing".into();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[12, 80, 160, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let agent = Store::in_folder(folder.clone()).unwrap();
+        let attachment = agent.insert_image_bytes(&note_id, &png).unwrap();
+        gui.persist().unwrap();
+        let stored = agent.read_latest().unwrap();
+        let note = stored.notes.iter().find(|n| n.id == note_id).unwrap();
+        assert_eq!(note.body, "User is still typing");
+        assert_eq!(note.images.len(), 1);
+        assert_eq!(note.images[0].id, attachment.id);
+        assert!(agent.media_path(&attachment).unwrap().exists());
         fs::remove_dir_all(folder).unwrap();
     }
 

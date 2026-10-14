@@ -29,6 +29,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ShowWindow, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
 };
 use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::keyboard::Key;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const HEADER_HEIGHT: f64 = 40.0;
@@ -49,14 +50,19 @@ struct Pressed {
 }
 
 #[derive(Default)]
-struct Tracker { pressed: Option<Pressed> }
+struct Tracker { pressed: Option<Pressed>, ctrl_down: bool }
 
 /// Installs the Windows-only titlebar drag fix into Slint's *existing* winit
 /// window. `can_drag` should return false while a destructive modal is open.
 /// Call once, after constructing the window; never install multiple event
 /// filters on the same Slint window because later registrations replace prior
 /// `on_winit_window_event` callbacks.
-pub fn install(window: &slint::Window, can_drag: impl Fn() -> bool + 'static) {
+pub fn install(
+    window: &slint::Window,
+    can_drag: impl Fn() -> bool + 'static,
+    on_dropped_file: impl Fn(std::path::PathBuf) + 'static,
+    on_image_paste: impl Fn() -> bool + 'static,
+) {
     let state = RefCell::new(Tracker::default());
     window.on_winit_window_event(move |slint_window, event| {
         let Some(action) = slint_window.with_winit_window(|native| {
@@ -68,6 +74,27 @@ pub fn install(window: &slint::Window, can_drag: impl Fn() -> bool + 'static) {
             }
             let scale = native.scale_factor();
             match event {
+                WindowEvent::ModifiersChanged(modifiers) => {
+                    tracker.ctrl_down = modifiers.state().control_key();
+                    EventResult::Propagate
+                }
+                WindowEvent::DroppedFile(path) => {
+                    // Native Windows Explorer file drop, no manual desktop
+                    // automation. The caller handles type/size validation.
+                    on_dropped_file(path.clone());
+                    EventResult::PreventDefault
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if tracker.ctrl_down
+                        && event.state == ElementState::Pressed
+                        && !event.repeat
+                        && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("v")) =>
+                {
+                    // An actual picture overrides Ctrl+V text paste; plain
+                    // clipboard text propagates normally to TextInput.
+                    if on_image_paste() { EventResult::PreventDefault }
+                    else { EventResult::Propagate }
+                }
                 WindowEvent::MouseInput { state: ElementState::Pressed,
                     button: MouseButton::Left, .. } => {
                     let Some(screen) = cursor_position() else { return EventResult::Propagate; };

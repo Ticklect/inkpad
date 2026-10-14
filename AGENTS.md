@@ -1,6 +1,6 @@
 # Inkpad agent access (headless)
 
-Inkpad stores text, formatting, pin state and drawing strokes together in local `workspace.json` records. Agents can read, search, create, rename, append, update, pin, format, export and draw on pages without opening the desktop app or using screen control. The MCP server runs through standard input/output, with **no network listener**, API token, or always-running background service.
+Inkpad stores text, formatting, pin state, drawing strokes and inline picture references in local `workspace.json` records. Images are stored as validated PNGs inside Inkpad's private local media directory. Agents can read, search, create, rename, append, update, pin, format, draw, import pictures, adjust their size/order/captions and export complete notes without opening the desktop app or using screen control. The MCP server runs through standard input/output, with **no network listener**, API token, or always-running background service.
 
 ## Build and executable
 
@@ -10,7 +10,7 @@ From `D:\chat\inkpad` run:
 cargo build --release --bin inkpad-agent
 ```
 
-The agent executable is **`D:\chat\inkpad\target\release\inkpad-agent.exe`** when building from source, or **`D:\chat\inkpad\dist\Inkpad-Beta-Pending-Drag-Test\inkpad-agent.exe`** in the ready-to-run Beta package. Run `inkpad-agent.exe mcp` to start its JSON-RPC/MCP stdio server (MCP mode is also the default). A client should launch one process and keep its stdin/stdout pipes open. Inkpad desktop does not need to be running.
+The agent executable is **`D:\chat\inkpad\target\release\inkpad-agent.exe`** when building from source, or **`D:\chat\inkpad\dist\Inkpad-Beta-Images-Staged\inkpad-agent.exe`** in the ready-to-run Beta package. Run `inkpad-agent.exe mcp` to start its JSON-RPC/MCP stdio server (MCP mode is also the default). A client should launch one process and keep its stdin/stdout pipes open. Inkpad desktop does not need to be running.
 
 **Windows launch behavior:** `inkpad-agent.exe` is deliberately a **console-subsystem** executable so the MCP client's redirected standard input, output and error streams work reliably. The MCP client should start it as a **stdio child process**, with stdin/stdout/stderr connected to pipes. If that client otherwise shows a brief console flash, its Windows process launcher should pass `CREATE_NO_WINDOW` (`0x08000000`) to `CreateProcessW` (for example, Python `subprocess.Popen(..., creationflags=subprocess.CREATE_NO_WINDOW, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)`). The flag suppresses the console window without switching to the Windows GUI subsystem or breaking MCP pipe communication. Clients that already launch stdio servers hidden need no extra setting. Do not use `start`, `cmd /c start`, or another process-detaching launcher, because MCP needs the child's pipes.
 
@@ -82,12 +82,26 @@ Regression coverage: `cargo test --offline --bin inkpad-agent` includes a 1,600-
 | `clear_strokes` | Clears a page's drawings with `confirm: true` and prior human authorization; text remains. |
 | `delete_note` | Deletes a page and its drawing strokes. Must receive a human user's explicit deletion request and `confirm: true`; select by `id` or exact `title`. |
 | `get_workspace_info` | Returns local file location, workspace version, number of pages and active page ID. |
+| `image_insert_file` | Imports a user-selected **absolute local path** (.png, .jpg, .jpeg, .gif or .webp) up to **12 MiB** into a note; requires `user_approved:true`. Accepts `id` or exact unique `title`. Source is not modified, and no network URL is fetched. |
+| `image_insert_base64` | Imports directly supplied image bytes as strict RFC 4648 `data_base64` (up to **1 MiB decoded** per MCP request); requires `user_approved:true`, note `id` or exact `title`. No external file read or URL fetch. |
+| `image_list` | Lists ordered image IDs, stored filenames (opaque local IDs), captions, widths and zero-based positions; no raw bytes or absolute asset paths. |
+| `image_resize` | Changes `image_id` display `width_percent` from **10–100** without altering its original pixels. |
+| `image_move` | Changes `image_id` `position`, zero based (0 = first image); only reorders images within the selected page. |
+| `image_caption` | Changes the selected image's `caption` (up to 500 characters); empty text clears it. |
+| `image_delete` | Removes only the selected image from the note; requires the user's explicit request and `confirm:true`. To preserve backup recovery, the physical private PNG may remain as an orphan until explicit cleanup. |
+| `image_export_html` | Exports a **self-contained** HTML file with escaped note text, drawings and inline base64 images to a user-approved absolute `.html` path; requires `user_approved:true`. Existing files are never overwritten. |
+| `read_image` | Reads the selected *stored attachment* as an MCP `image/png` content block, limited to **1 MiB of PNG bytes**. Requires explicit `user_approved:true`; larger images should be exported using `export_image` instead. The image bytes are not duplicated in text/structured metadata. |
+| `export_image` | Exports an explicitly selected attached image to a **new** user-approved absolute `.png` path. Requires `user_approved:true`, never overwrites or fetches arbitrary files, and does not open the GUI. |
 
-IDs are the safest way to target existing notes; exact titles may be duplicated, in which case the server rejects the request rather than guessing. Read a page before overwriting its whole body, and prefer `append_to_note` for normal note-taking requests. The agent preserves legacy `board` pages and drawing stroke data during text and formatting edits. Only explicitly authorized `undo_last_stroke`, `clear_strokes` or `delete_note` calls remove drawings. The `confirm` argument is a safeguard; it does not independently verify consent, so the calling AI must only supply it after the user has actually authorized the corresponding destructive action.
+IDs are the safest way to target existing notes; exact titles may be duplicated, in which case the server rejects the request rather than guessing. Read a page before overwriting its whole body, and prefer `append_to_note` for normal note-taking requests. The agent preserves legacy `board` pages, drawings and image metadata during text and formatting edits. Only explicitly authorized `undo_last_stroke`, `clear_strokes`, `image_delete` or `delete_note` calls remove content. The `confirm` and `user_approved` arguments are safeguards, **not independent proof of human authorization**; the calling AI must only supply them after the user actually requests the action or names the source/destination file.
+
+**Image access and privacy:** Never guess a local path to read, scan directories for potential images, access browser profiles/secrets, or silently import arbitrary files. Obtain a user-selected absolute path before `image_insert_file`. The agent rejects relative paths, parent-directory traversal, unsupported extensions, invalid image signatures, internal Inkpad workspace paths and oversized files; the Store additionally decodes images within dimension/memory limits, converts to PNG and maintains references under the cross-process workspace lock. `image_insert_base64` only accepts directly provided image bytes and rejects data URLs, malformed base64 or unsupported formats. Up to 100 images may be attached to one page. Do not send images or note HTML to a remote service without the user's request.
 
 **GUI state:** An Inkpad page can hold text and drawings simultaneously. Text/Draw is a temporary editor view choice held in the desktop application's memory, **not** a saved property. Headless calls can edit both layers and the saved active page. They cannot remotely change which editor mode is on screen, invoke dialogs, or manipulate open selection/caret state. When the GUI has unsaved changes, its conflict safeguards can delay applying external updates; `set_active_note` confirms the saved preference, not guaranteed immediate visible switching in every GUI state. The GUI and the agent coordinate durable writes through the same lock.
 
 **Export rules:** The target directory must already exist. `export_note` never opens a Save As dialog and refuses a path that already exists. It requires a full local destination path with the requested `.txt` or `.png` extension. For `.png`, it renders the existing strokes using the same software drawing renderer as Inkpad's GUI; body text is not rendered into that image. `txt` contains the note's body only. Extremely large or malformed saved strokes may be rejected instead of exhausting CPU or memory.
+
+Use `image_export_html` / CLI `export-html` for a complete portable note including text and pictures (and existing drawing strokes). It writes an explicitly approved **new** `.html` file with inline data URIs, so it can be opened without the private media directory. Exports contain private user content. This is a file export, **not** a live publication or cloud share. An already-existing destination or path with `..` is rejected.
 
 ## Optional command-line interface
 
@@ -112,6 +126,15 @@ You can script small tasks directly without MCP:
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' add-stroke NOTE_ID 6 '#0066CC' 10,20 60,80
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' undo-stroke NOTE_ID --confirm
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' clear-strokes NOTE_ID --confirm
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' add-image NOTE_ID 'D:\Photos\holiday.png' --approved
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' images NOTE_ID
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' image-width NOTE_ID IMAGE_ID 10
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' image-move NOTE_ID IMAGE_ID 0
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' image-caption NOTE_ID IMAGE_ID 'Holiday picture'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' image-delete NOTE_ID IMAGE_ID --confirm
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' read-image NOTE_ID IMAGE_ID --approved
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' export-image NOTE_ID IMAGE_ID 'D:\Notes\picture.png' --approved
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' export-html NOTE_ID 'D:\Notes\complete-note.html' --approved
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' delete NOTE_ID --confirm
 ```
 
@@ -126,3 +149,7 @@ $strokeArg = '@' + $jsonFile
 ```
 
 The JSON file must be an existing, absolute `.json` path and at most 128 KiB; stroke values must still pass the normal width, coordinate, colour and point-count validation. Direct `add-stroke NOTE_ID WIDTH COLOR X,Y ...` also works in PowerShell and avoids JSON argument escaping entirely.
+
+For image bytes already supplied in base64 form, a CLI caller can write the exact encoded data to an absolute `.b64` UTF-8 text file (max 1 MiB decoded) and run `add-image-base64 NOTE_ID '@D:\Photos\image.b64' --approved`. The CLI also accepts inline base64, but file-backed input avoids Windows command-line length limits. Use `add-image` for normal existing PNG/JPEG/GIF/WebP files. Neither option fetches remote URLs or manipulates the desktop window or clipboard.
+
+For AI interpretation of an existing image, call `read_image` with its note/image IDs and explicit user approval; it returns native MCP image content for images up to 1 MiB in PNG form. CLI `read-image` prints the base64 JSON result to stdout, so prefer MCP or `export-image` when the output is large. `export_image` copies the named managed attachment to an approved new PNG file, not an arbitrary file. Picture viewing/export is private local activity; never upload it without the user's request.

@@ -13,6 +13,23 @@ pub struct Stroke {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaBlock {
+    /// Opaque ID, never a filesystem path supplied by the user or agent.
+    pub id: String,
+    /// Validated internal basename such as `<id>.png`.
+    pub filename: String,
+    #[serde(default)]
+    pub caption: String,
+    /// Display width as a percentage of available note content space.
+    #[serde(default = "default_image_width")]
+    pub width_percent: u8,
+    #[serde(default)]
+    pub position: usize,
+}
+
+fn default_image_width() -> u8 { 65 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub id: String,
     pub title: String,
@@ -27,6 +44,8 @@ pub struct Note {
     pub pinned: bool,
     #[serde(default)]
     pub strokes: Vec<Stroke>,
+    #[serde(default)]
+    pub images: Vec<MediaBlock>,
     #[serde(default)]
     pub updated: u64,
 }
@@ -46,6 +65,7 @@ impl Note {
             font_choice: default_font(),
             pinned: false,
             strokes: Vec::new(),
+            images: Vec::new(),
             updated: now.as_secs(),
         }
     }
@@ -108,7 +128,7 @@ impl Store {
 
     pub fn read_latest(&self) -> io::Result<Workspace> { self.load() }
 
-    fn lock_workspace(&self) -> io::Result<File> {
+    pub(crate) fn lock_workspace(&self) -> io::Result<File> {
         let lock_path = self.path.with_extension("json.lock");
         let lock = OpenOptions::new().create(true).read(true).write(true).open(lock_path)?;
         // File::lock is an OS-managed cross-process exclusive lock. A GUI and
@@ -118,7 +138,7 @@ impl Store {
         Ok(lock)
     }
 
-    fn read_unlocked(&self) -> io::Result<Workspace> {
+    pub(crate) fn read_unlocked(&self) -> io::Result<Workspace> {
         let primary = fs::read(&self.path)?;
         match serde_json::from_slice::<Workspace>(&primary) {
             Ok(workspace) => Ok(workspace),
@@ -146,6 +166,10 @@ impl Store {
         let mut workspace = if self.path.exists() { self.read_unlocked()? } else { Workspace::default() };
         let outcome = edit(&mut workspace)?;
         self.write_unlocked(&workspace)?;
+        // Under this same OS lock, reclaim media no longer referenced by
+        // either primary workspace or its previous-save backup. Newly imported
+        // files use a .upload staging extension until inside this lock.
+        let _ = self.prune_unused_media_locked(&workspace);
         Ok(outcome)
     }
 

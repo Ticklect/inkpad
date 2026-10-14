@@ -12,6 +12,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"
 png = "0.17"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+base64 = "0.22"
 
 [build-dependencies]
 slint-build = "=1.18.1"
