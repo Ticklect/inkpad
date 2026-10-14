@@ -5,7 +5,7 @@
 //! filenames are opaque generated IDs, never user-provided paths.
 
 use crate::canvas::Board;
-use crate::store::{MediaBlock, Note, Store, Workspace};
+use crate::store::{MediaBlock, Note, Store, TextStyle, Workspace};
 use base64::Engine as _;
 use image::codecs::png::PngEncoder;
 use image::{GenericImageView, ImageEncoder, ImageFormat, ImageReader};
@@ -318,7 +318,15 @@ impl Store {
             figcaption{color:#656565;font-size:14px;margin-top:7px}h1{font-size:2rem}</style></head><body>"
         );
         html.push_str("<h1>"); html.push_str(&escape_html(&note.title)); html.push_str("</h1>");
-        html.push_str("<div class=\"body\">"); html.push_str(&escape_html(&note.body)); html.push_str("</div>");
+        // Global note typography is inherited by the unstyled gaps. Whitelist
+        // legacy font names so saved workspace fields never become raw CSS.
+        let base_family = safe_font_family(&note.font_choice);
+        let base_size = if (12..=40).contains(&note.font_size) { note.font_size } else { 17 };
+        html.push_str(&format!(
+            "<div class=\"body\" style=\"font-family:{base_family};font-size:{base_size}px\">"
+        ));
+        html.push_str(&render_formatted_body(note)?);
+        html.push_str("</div>");
         let mut images = note.images.clone();
         images.sort_by_key(|item| item.position);
         for image in &images {
@@ -349,9 +357,179 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
+/// CSS font families are selected exclusively from fixed declarations. Never
+/// interpolate a saved font name (including names from legacy workspaces).
+fn safe_font_family(name: &str) -> &'static str {
+    match name {
+        "Serif" | "Georgia" => "Georgia,serif",
+        "Mono" | "Consolas" => "Consolas,monospace",
+        _ => "'Segoe UI',Arial,sans-serif",
+    }
+}
+
+fn escaped_char(html: &mut String, ch: char) {
+    match ch {
+        '&' => html.push_str("&amp;"),
+        '<' => html.push_str("&lt;"),
+        '>' => html.push_str("&gt;"),
+        '"' => html.push_str("&quot;"),
+        '\'' => html.push_str("&#39;"),
+        _ => html.push(ch),
+    }
+}
+
+/// Only the four supported style attributes can reach an HTML style value;
+/// the shared rich-text validator rejects malicious colours, sizes and fonts.
+fn safe_style_css(style: &TextStyle) -> io::Result<String> {
+    style.validate().map_err(mime_error)?;
+    let mut css = String::new();
+    if style.bold { css.push_str("font-weight:700;"); }
+    if let Some(color) = &style.color {
+        css.push_str("color:");
+        css.push_str(color);
+        css.push(';');
+    }
+    if let Some(size) = style.size {
+        css.push_str(&format!("font-size:{size}px;"));
+    }
+    if let Some(family) = &style.font_family {
+        css.push_str("font-family:");
+        css.push_str(safe_font_family(family));
+        css.push(';');
+    }
+    Ok(css)
+}
+
+/// Rich runs use half-open Unicode scalar offsets. Walk the body once so
+/// multi-byte emoji and combining characters cannot shift or split the text.
+fn render_formatted_body(note: &Note) -> io::Result<String> {
+    note.validate_rich_text().map_err(mime_error)?;
+    let mut html = String::with_capacity(note.body.len());
+    let mut characters = note.body.chars();
+    let mut position = 0;
+    for run in &note.rich_text {
+        for ch in characters.by_ref().take(run.start - position) {
+            escaped_char(&mut html, ch);
+        }
+        let css = safe_style_css(&run.style)?;
+        html.push_str("<span style=\"");
+        html.push_str(&css);
+        html.push_str("\">");
+        for ch in characters.by_ref().take(run.end - run.start) {
+            escaped_char(&mut html, ch);
+        }
+        html.push_str("</span>");
+        position = run.end;
+    }
+    for ch in characters { escaped_char(&mut html, ch); }
+    Ok(html)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{Stroke, TextStylePatch};
+
+    #[test]
+    fn html_export_preserves_unicode_rich_text_images_drawing_and_safe_css() {
+        let folder = std::env::temp_dir().join(format!("inkpad-rich-html-{}", fresh_id()));
+        let store = Store::in_folder(folder.clone()).unwrap();
+        let note_id = store.load().unwrap().notes[0].id.clone();
+        let text = "A👩‍🚀e\u{301}猫<script>alert(\"x\")</script>\n& end";
+        // Positions 1..4 select a three-scalar emoji, 4..6 a base plus
+        // combining mark, and 6..7 the multibyte Han character.
+        assert_eq!(text.chars().nth(1), Some('👩'));
+        assert_eq!(text.chars().nth(6), Some('猫'));
+        store.mutate(|workspace| {
+            let note = &mut workspace.notes[0];
+            note.title = "<img src=x onerror=alert('oops')>".into();
+            note.body = text.into();
+            note.font_size = 19;
+            note.font_choice = "Serif".into();
+            note.format_text_range(1, 4, TextStylePatch {
+                bold: Some(true), color: Some("#A1B2C3".into()), size: Some(23),
+                font_family: Some("Serif".into()), ..Default::default()
+            }).map_err(mime_error)?;
+            note.format_text_range(4, 6, TextStylePatch {
+                size: Some(31), font_family: Some("Mono".into()), ..Default::default()
+            }).map_err(mime_error)?;
+            note.format_text_range(6, 7, TextStylePatch {
+                bold: Some(true), ..Default::default()
+            }).map_err(mime_error)?;
+            note.strokes.push(Stroke {
+                color: [9, 99, 199, 255], width: 3, eraser: false,
+                points: vec![[10, 20], [30, 50]],
+            });
+            Ok(())
+        }).unwrap();
+
+        let mut source = Vec::new();
+        PngEncoder::new(&mut source).write_image(&[200, 100, 50, 255], 1, 1,
+            image::ExtendedColorType::Rgba8).unwrap();
+        let image = store.insert_image_bytes(&note_id, &source).unwrap();
+        store.update_image(&note_id, &image.id, Some("<svg onload=alert(1)> &"),
+            Some(42), None).unwrap();
+        let before = store.load().unwrap();
+        let output = folder.join("complete-note.html");
+        store.export_note_html(&note_id, &output).unwrap();
+        let html = fs::read_to_string(&output).unwrap();
+
+        assert!(html.contains("default-src 'none'; img-src data:; style-src 'unsafe-inline'"));
+        assert!(html.contains("<div class=\"body\" style=\"font-family:Georgia,serif;font-size:19px\">"));
+        assert!(html.contains("A<span style=\"font-weight:700;color:#A1B2C3;font-size:23px;font-family:Georgia,serif;\">👩‍🚀</span>"));
+        assert!(html.contains("<span style=\"font-size:31px;font-family:Consolas,monospace;\">e\u{301}</span>"));
+        assert!(html.contains("<span style=\"font-weight:700;\">猫</span>"));
+        assert!(html.contains("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;\n&amp; end"));
+        assert!(html.contains("&lt;img src=x onerror=alert(&#39;oops&#39;)&gt;"));
+        assert!(html.contains("&lt;svg onload=alert(1)&gt; &amp;"));
+        assert!(html.contains("style=\"width:42%;height:auto\""));
+        assert_eq!(html.matches("src=\"data:image/png;base64,").count(), 2);
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("<svg "));
+        assert!(!html.contains("file://"));
+        assert!(!html.contains(&folder.to_string_lossy().to_string()));
+        assert_eq!(store.export_note_html(&note_id, &output).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists);
+        assert_eq!(html, fs::read_to_string(&output).unwrap());
+        assert_eq!(store.load().unwrap().notes[0], before.notes[0]);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn html_export_uses_legacy_plain_text_and_rejects_unsafe_styles() {
+        let mut legacy = Note::create("note");
+        legacy.body = "Before <br> & after 👋".into();
+        legacy.font_choice = "evil;font-family:Comic Sans".into();
+        legacy.font_size = 10000;
+        let rendered = render_formatted_body(&legacy).unwrap();
+        assert_eq!(rendered, "Before &lt;br&gt; &amp; after 👋");
+        assert_eq!(safe_font_family(&legacy.font_choice), "'Segoe UI',Arial,sans-serif");
+        assert!(safe_style_css(&TextStyle {
+            color: Some("red;background:url(javascript:alert(1))".into()),
+            ..Default::default()
+        }).is_err());
+        assert!(safe_style_css(&TextStyle {
+            font_family: Some("Serif;background:red".into()),
+            ..Default::default()
+        }).is_err());
+        assert!(safe_style_css(&TextStyle {
+            size: Some(10000), ..Default::default()
+        }).is_err());
+    }
+
+    #[test]
+    fn jpeg_gif_webp_and_png_are_imported_as_bounded_png() {
+        let pixel = image::DynamicImage::new_rgba8(2, 2);
+        for source_format in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Gif, ImageFormat::WebP] {
+            let mut encoded = Cursor::new(Vec::new());
+            pixel.write_to(&mut encoded, source_format).unwrap();
+            let normalized = normalize_to_png(encoded.get_ref()).unwrap();
+            assert_eq!(&normalized[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            let decoded = image::load_from_memory(&normalized).unwrap();
+            assert_eq!(decoded.dimensions(), (2, 2));
+        }
+    }
+
     #[test]
     fn image_import_resize_move_export_and_legacy_compatibility() {
         let folder = std::env::temp_dir().join(format!("inkpad-media-{}-{}", std::process::id(), fresh_id()));

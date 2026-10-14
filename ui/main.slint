@@ -1,4 +1,4 @@
-import { LineEdit, ScrollView, Slider } from "std-widgets.slint";
+import { LineEdit, ScrollView, Slider, SpinBox } from "std-widgets.slint";
 
 export struct NoteRow {
     id: string,
@@ -18,12 +18,30 @@ export struct MediaRow {
     preview: image,
 }
 
+// Palette shared by the notebook chrome, controls, pictures and dialogs.
+// The host persists appearance-theme; the effective dark flag follows it.
+global InkTheme {
+    in-out property <bool> dark: false;
+    out property <color> canvas: dark ? #181d25 : #fffefa;
+    out property <color> paper: dark ? #232a34 : #ffffff;
+    out property <color> toolbar: dark ? #202732 : #fbfaf8;
+    out property <color> sidebar: dark ? #1c232c : #f4f1eb;
+    out property <color> chrome: dark ? #202631 : #f6f3ee;
+    out property <color> secondary: dark ? #2c3541 : #f5f3ef;
+    out property <color> line: dark ? #3c4552 : #e9e5dd;
+    out property <color> ink: dark ? #eef1f6 : #292927;
+    out property <color> muted: dark ? #b5bfcd : #6d6962;
+    out property <color> subtle: dark ? #8995a5 : #948d80;
+    out property <color> accent: dark ? #eec36b : #b98b37;
+}
+
 // A compact button that stays accessible to mouse, keyboard, and screen readers.
 component KeyboardTarget {
     in property <bool> enabled: true;
     out property <bool> has-hover <=> mouse-surface.has-hover;
     out property <bool> has-focus <=> keyboard.has-focus;
     callback clicked <=> mouse-surface.clicked;
+    callback pressing(bool);
     callback focus-keyboard();
     focus-keyboard => { keyboard.focus(); }
     forward-focus: keyboard;
@@ -44,10 +62,19 @@ component KeyboardTarget {
         height: parent.height;
         enabled: root.enabled;
         mouse-cursor: pointer;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                root.pressing(true);
+            }
+            if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                root.pressing(false);
+            }
+        }
     }
 }
 
 component ActionButton inherits Rectangle {
+    in property <bool> dark: InkTheme.dark;
     in property <string> label: "";
     in property <string> accessible-name: "";
     in property <bool> selected: false;
@@ -65,8 +92,8 @@ component ActionButton inherits Rectangle {
     min-width: 30px;
     border-radius: 9px;
     border-width: 1px;
-    border-color: hit.has-focus ? #b18534 : root.destructive ? #aa473c : root.prominent ? #c8972a : root.selected ? #dfc576 : root.subtle ? #e9e5df : #dfddd8;
-    background: !root.enabled ? #f3f1ed : root.destructive ? (hit.has-hover ? #9f4138 : #b24c41) : root.prominent ? #e6b846 : root.selected ? #f9e8b2 : hit.has-hover ? (root.danger ? #f8e6e3 : #eeece6) : root.subtle ? transparent : #ffffff;
+    border-color: hit.has-focus ? #d8aa55 : root.destructive ? #ae584f : root.prominent ? #c8972a : root.selected ? #c99b44 : root.dark ? #454c59 : root.subtle ? #e9e5df : #dfddd8;
+    background: !root.enabled ? (root.dark ? #252b35 : #f3f1ed) : root.destructive ? (hit.has-hover ? #9f4138 : #b24c41) : root.prominent ? #e6b846 : root.selected ? (root.dark ? #514129 : #f9e8b2) : hit.has-hover ? (root.dark ? #353d49 : root.danger ? #f8e6e3 : #eeece6) : root.subtle ? transparent : root.dark ? #282f39 : #ffffff;
     accessible-role: button;
     accessible-label: root.accessible-name == "" ? root.label : root.accessible-name;
     accessible-enabled: root.enabled;
@@ -83,7 +110,7 @@ component ActionButton inherits Rectangle {
         font-family: "Segoe UI";
         font-size: 12px;
         font-weight: 600;
-        color: !root.enabled ? #a7a39b : root.destructive ? #ffffff : root.prominent ? #352b16 : root.danger ? #b25046 : root.selected ? #6e5219 : #494945;
+        color: !root.enabled ? (root.dark ? #697482 : #a7a39b) : root.destructive ? #ffffff : root.prominent ? #352b16 : root.danger ? (root.dark ? #f2a79d : #b25046) : root.selected ? (root.dark ? #f5d58d : #6e5219) : root.dark ? #eceef3 : #494945;
     }
     hit := KeyboardTarget {
         width: parent.width;
@@ -175,15 +202,34 @@ component ToolLabel inherits Rectangle {
 }
 
 component StepButton inherits Rectangle {
+    in property <bool> dark: InkTheme.dark;
     in property <bool> add: false;
     in property <bool> enabled: true;
+    in property <bool> hold-mode: false;
+    private property <bool> held: false;
+    private property <bool> repeating: false;
+    private property <bool> focus-active: hit.has-focus;
     callback clicked();
+    changed enabled => {
+        if (!root.enabled) {
+            root.held = false;
+            root.repeating = false;
+        }
+    }
+    // A grabbed pointer may keep delivering move events after it leaves the button.
+    // Releasing keyboard/window focus must also halt a running repeat.
+    changed focus-active => {
+        if (!root.focus-active) {
+            root.held = false;
+            root.repeating = false;
+        }
+    }
     width: 32px;
     height: 34px;
     border-width: 1px;
-    border-color: hit.has-focus ? #aa7d29 : #dfddd8;
+    border-color: hit.has-focus ? #d8aa55 : root.dark ? #454c59 : #dfddd8;
     border-radius: 8px;
-    background: hit.has-hover && root.enabled ? #ede9e0 : #ffffff;
+    background: hit.has-hover && root.enabled ? (root.dark ? #39414e : #ede9e0) : root.dark ? #282f39 : #ffffff;
     accessible-role: button;
     accessible-label: root.add ? "Increase size" : "Decrease size";
     accessible-enabled: root.enabled;
@@ -195,7 +241,7 @@ component StepButton inherits Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         border-radius: 1px;
-        background: root.enabled ? #44413c : #aaa69f;
+        background: root.enabled ? (root.dark ? #edf0f5 : #44413c) : #aaa69f;
     }
     if root.add: Rectangle {
         width: 1.5px;
@@ -203,13 +249,50 @@ component StepButton inherits Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         border-radius: 1px;
-        background: root.enabled ? #44413c : #aaa69f;
+        background: root.enabled ? (root.dark ? #edf0f5 : #44413c) : #aaa69f;
     }
     hit := KeyboardTarget {
         width: parent.width;
         height: parent.height;
         enabled: root.enabled;
         clicked => { root.clicked(); }
+    }
+    Timer {
+        interval: 360ms;
+        running: root.enabled && root.held && !root.repeating;
+        triggered => { root.repeating = true; }
+    }
+    Timer {
+        interval: 75ms;
+        running: root.enabled && root.held && root.repeating;
+        triggered => { if (root.enabled && root.held) { root.clicked(); } }
+    }
+    if root.hold-mode: hold-hit := TouchArea {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down && !root.held) {
+                hit.focus-keyboard();
+                root.held = true;
+                root.repeating = false;
+                root.clicked();
+            }
+            // A pointer grab does not guarantee that has-hover becomes false on exit.
+            // Stop as soon as the pointer leaves; moving back inside will not restart
+            // until a fresh down event, preventing an unexpected runaway repeat.
+            if (event.kind == PointerEventKind.move &&
+                (self.mouse-x < 0px || self.mouse-x >= self.width ||
+                 self.mouse-y < 0px || self.mouse-y >= self.height)) {
+                root.held = false;
+                root.repeating = false;
+            }
+            if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                root.held = false;
+                root.repeating = false;
+            }
+        }
     }
 }
 
@@ -219,7 +302,7 @@ component DeleteRowButton inherits Rectangle {
     width: 32px;
     height: 34px;
     border-radius: 7px;
-    background: hit.has-hover ? #f4dcd8 : transparent;
+    background: hit.has-hover ? (InkTheme.dark ? #503d45 : #f4dcd8) : transparent;
     border-width: hit.has-focus ? 1px : 0px;
     border-color: #b25046;
     accessible-role: button;
@@ -259,7 +342,7 @@ component SidebarToggle inherits Rectangle {
     width: 36px;
     height: 36px;
     border-radius: 9px;
-    background: root.enabled && hit.has-hover ? #e7e3dc : transparent;
+    background: root.enabled && hit.has-hover ? (InkTheme.dark ? #343b48 : #e7e3dc) : transparent;
     border-width: hit.has-focus ? 1px : 0px;
     border-color: #bb923f;
     accessible-role: button;
@@ -300,7 +383,7 @@ component ChromeButton inherits Rectangle {
     callback clicked();
     width: 44px;
     height: 40px;
-    background: root.enabled && hit.has-hover ? (root.close-button ? #c8574e : #e8e5de) : transparent;
+    background: root.enabled && hit.has-hover ? (root.close-button ? #c8574e : InkTheme.dark ? #363f4d : #e8e5de) : transparent;
     accessible-role: button;
     accessible-label: root.action-name;
     accessible-enabled: root.enabled;
@@ -315,7 +398,7 @@ component ChromeButton inherits Rectangle {
         font-weight: 500;
         horizontal-alignment: center;
         vertical-alignment: center;
-        color: !root.enabled ? #aaa59e : hit.has-hover && root.close-button ? #ffffff : #655e54;
+        color: !root.enabled ? #aaa59e : hit.has-hover && root.close-button ? #ffffff : InkTheme.dark ? #c8d1de : #655e54;
     }
     hit := KeyboardTarget {
         width: parent.width;
@@ -329,9 +412,9 @@ component NewPageButton inherits Rectangle {
     in property <bool> enabled: true;
     callback clicked();
     height: 42px;
-    background: hit.has-hover ? #fffefa : #f9f7f2;
+    background: hit.has-hover ? InkTheme.paper : InkTheme.toolbar;
     border-width: 1px;
-    border-color: hit.has-focus ? #b98b37 : #e0d9cb;
+    border-color: hit.has-focus ? #b98b37 : InkTheme.line;
     border-radius: 10px;
     accessible-role: button;
     accessible-label: "New page";
@@ -368,7 +451,7 @@ component NewPageButton inherits Rectangle {
             text: "New page";
             font-size: 13px;
             font-weight: 600;
-            color: #39342e;
+            color: InkTheme.ink;
             horizontal-stretch: 1;
             vertical-alignment: center;
         }
@@ -385,16 +468,17 @@ component ColorDot inherits Rectangle {
     in property <color> paint: #242f32;
     in property <string> value: "#242F32";
     in property <string> label: "Black";
+    in property <string> category: "brush";
     in property <bool> selected: false;
     callback picked(string);
     width: 29px;
     height: 29px;
     border-radius: 15px;
     border-width: root.selected ? 2px : 1px;
-    border-color: root.selected ? #b18534 : #d8d5cd;
-    background: #ffffff;
+    border-color: root.selected ? #e1b558 : InkTheme.line;
+    background: InkTheme.paper;
     accessible-role: button;
-    accessible-label: root.label + " brush";
+    accessible-label: root.label + " " + root.category;
     accessible-action-default => { root.picked(root.value); }
     forward-focus: hit;
     Rectangle {
@@ -432,8 +516,8 @@ component MediaCard inherits Rectangle {
     height: 272px + min(100, max(10, root.width-percent)) * 1.3px;
     border-radius: 13px;
     border-width: root.selected ? 2px : 1px;
-    border-color: root.selected ? #d6a645 : #e7e3db;
-    background: #fffefa;
+    border-color: root.selected ? #d6a645 : InkTheme.line;
+    background: InkTheme.paper;
     VerticalLayout {
         padding-left: 14px;
         padding-right: 14px;
@@ -445,7 +529,7 @@ component MediaCard inherits Rectangle {
             spacing: 7px;
             Text {
                 text: "PHOTO " + (root.position + 1);
-                color: #706858;
+                color: InkTheme.muted;
                 font-size: 10px;
                 font-weight: 700;
                 letter-spacing: 1px;
@@ -454,7 +538,7 @@ component MediaCard inherits Rectangle {
             Rectangle { horizontal-stretch: 1; background: transparent; }
             Text {
                 text: root.width-percent + "% OF PAGE";
-                color: #8a8172;
+                color: InkTheme.muted;
                 font-size: 10px;
                 font-weight: 700;
                 vertical-alignment: center;
@@ -462,7 +546,7 @@ component MediaCard inherits Rectangle {
         }
         Rectangle {
             height: 80px + min(100, max(10, root.width-percent)) * 1.3px;
-            background: #f4f2ed;
+            background: InkTheme.secondary;
             border-radius: 8px;
             clip: true;
             accessible-role: button;
@@ -486,7 +570,7 @@ component MediaCard inherits Rectangle {
         HorizontalLayout {
             height: 33px;
             spacing: 5px;
-            ToolLabel { width: 42px; label: "SIZE"; ink: #777167; }
+            ToolLabel { width: 42px; label: "SIZE"; ink: InkTheme.muted; }
             for size in [25, 50, 75, 100]: ActionButton {
                 width: 43px;
                 height: 30px;
@@ -524,7 +608,7 @@ component MediaCard inherits Rectangle {
         HorizontalLayout {
             height: 34px;
             spacing: 11px;
-            ToolLabel { width: 59px; label: "RESIZE"; ink: #777167; }
+            ToolLabel { width: 59px; label: "RESIZE"; ink: InkTheme.muted; }
             Slider {
                 horizontal-stretch: 1;
                 height: 28px;
@@ -539,7 +623,7 @@ component MediaCard inherits Rectangle {
                 text: root.width-percent + "%";
                 font-size: 12px;
                 font-weight: 700;
-                color: #74634c;
+                color: InkTheme.ink;
                 horizontal-alignment: right;
                 vertical-alignment: center;
             }
@@ -547,7 +631,7 @@ component MediaCard inherits Rectangle {
         HorizontalLayout {
             height: 34px;
             spacing: 10px;
-            ToolLabel { width: 59px; label: "CAPTION"; ink: #777167; }
+            ToolLabel { width: 59px; label: "CAPTION"; ink: InkTheme.muted; }
             LineEdit {
                 horizontal-stretch: 1;
                 height: 33px;
@@ -571,11 +655,19 @@ export component MainWindow inherits Window {
     min-width: 1010px;
     min-height: 660px;
     default-font-family: "Segoe UI";
-    background: #fffefa;
+    background: InkTheme.canvas;
 
     in property <[NoteRow]> rows: [];
     in property <[MediaRow]> media-rows: [];
     in-out property <string> selected-media-id: "";
+    in-out property <string> appearance-theme: "light";
+    in property <bool> system-dark: false;
+    in property <bool> selection-bold: false;
+    in property <string> text-color: "#292927";
+    in property <styled-text> note-styled-preview;
+    in-out property <bool> formatted-preview: false;
+    in-out property <int> format-start: 0;
+    in-out property <int> format-end: 0;
     in-out property <string> note-title: "";
     in-out property <string> note-body: "";
     in-out property <int> font-size: 17;
@@ -633,11 +725,21 @@ export component MainWindow inherits Window {
     callback delete-media(string);
     callback caption-media(string, string);
     callback export-page();
+    callback change-appearance-theme(string);
+    callback request-formatted-preview();
+    callback apply-text-format(string);
+    callback apply-text-color(string);
 
-    private property <color> ink: #292927;
-    private property <color> muted: #6d6962;
-    private property <color> line: #e9e5dd;
+    private property <color> ink: InkTheme.ink;
+    private property <color> muted: InkTheme.muted;
+    private property <color> line: InkTheme.line;
     private property <bool> renaming: false;
+    changed appearance-theme => {
+        InkTheme.dark = root.appearance-theme == "dark" || (root.appearance-theme == "system" && root.system-dark);
+    }
+    changed system-dark => {
+        InkTheme.dark = root.appearance-theme == "dark" || (root.appearance-theme == "system" && root.system-dark);
+    }
     changed delete-confirm-open => {
         if (root.delete-confirm-open) {
             modal-cancel.focus-button();
@@ -664,7 +766,7 @@ export component MainWindow inherits Window {
         spacing: 0px;
         Rectangle {
             height: 40px;
-            background: #f6f3ee;
+            background: InkTheme.chrome;
             WindowMoveArea {
                 HorizontalLayout {
                     padding-left: 18px;
@@ -691,11 +793,48 @@ export component MainWindow inherits Window {
                             text: "Inkpad Beta";
                             font-size: 12px;
                             font-weight: 600;
-                            color: #5f584e;
+                            color: InkTheme.muted;
                             vertical-alignment: center;
                         }
                     }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Rectangle {
+                        width: 171px;
+                        height: 40px;
+                        background: transparent;
+                        HorizontalLayout {
+                            spacing: 4px;
+                            padding-top: 6px;
+                            padding-bottom: 6px;
+                            ActionButton {
+                                width: 52px;
+                                height: 28px;
+                                label: "Light";
+                                selected: root.appearance-theme == "light";
+                                accessible-name: "Use light appearance";
+                                enabled: !root.delete-confirm-open;
+                                clicked => { root.appearance-theme = "light"; root.change-appearance-theme("light"); }
+                            }
+                            ActionButton {
+                                width: 52px;
+                                height: 28px;
+                                label: "Dark";
+                                selected: root.appearance-theme == "dark";
+                                accessible-name: "Use dark appearance";
+                                enabled: !root.delete-confirm-open;
+                                clicked => { root.appearance-theme = "dark"; root.change-appearance-theme("dark"); }
+                            }
+                            ActionButton {
+                                width: 52px;
+                                height: 28px;
+                                label: "Auto";
+                                selected: root.appearance-theme == "system";
+                                accessible-name: "Follow system appearance";
+                                enabled: !root.delete-confirm-open;
+                                clicked => { root.appearance-theme = "system"; root.change-appearance-theme("system"); }
+                            }
+                        }
+                    }
                     ChromeButton {
                         symbol: "−";
                         action-name: "Minimize window";
@@ -730,7 +869,7 @@ export component MainWindow inherits Window {
         // Persistent navigation; collapsed state is stored by the Rust host.
         Rectangle {
             width: root.sidebar-collapsed ? 60px : 278px;
-            background: #f4f1eb;
+            background: InkTheme.sidebar;
             border-width: 0px;
             if !root.sidebar-collapsed: VerticalLayout {
                 padding-left: 16px;
@@ -765,7 +904,7 @@ export component MainWindow inherits Window {
                             font-size: 10px;
                             font-weight: 700;
                             letter-spacing: 1.1px;
-                            color: #6f6a60;
+                            color: InkTheme.muted;
                             vertical-alignment: center;
                         }
                     }
@@ -797,7 +936,7 @@ export component MainWindow inherits Window {
                     border-radius: 9px;
                     border-width: 1px;
                     border-color: #e4e0d8;
-                    background: #ffffff;
+                    background: InkTheme.paper;
                     HorizontalLayout {
                         padding-left: 12px;
                         padding-right: 9px;
@@ -856,7 +995,7 @@ export component MainWindow inherits Window {
                             font-size: 10px;
                             font-weight: 700;
                             letter-spacing: 1.45px;
-                            color: #77736c;
+                            color: InkTheme.muted;
                             vertical-alignment: center;
                         }
                     }
@@ -895,7 +1034,7 @@ export component MainWindow inherits Window {
                         for entry in root.rows: Rectangle {
                             height: 67px;
                             border-radius: 9px;
-                            background: entry.active ? #fbe9b9 : item-hit.has-hover ? #ece9e2 : transparent;
+                            background: entry.active ? (InkTheme.dark ? #463c2d : #fbe9b9) : item-hit.has-hover ? (InkTheme.dark ? #303947 : #ece9e2) : transparent;
                             border-width: item-hit.has-focus ? 1px : 0px;
                             border-color: #c18b24;
                             HorizontalLayout {
@@ -929,7 +1068,7 @@ export component MainWindow inherits Window {
                                             spacing: 4px;
                                             Text {
                                                 text: entry.title == "" ? "Untitled" : entry.title;
-                                                color: #37342e;
+                                                color: InkTheme.ink;
                                                 font-weight: entry.active ? 700 : 600;
                                                 font-size: 13px;
                                                 overflow: elide;
@@ -937,7 +1076,7 @@ export component MainWindow inherits Window {
                                             }
                                             Text {
                                                 text: entry.subtitle == "" ? (entry.kind == "board" ? "Drawing" : "Empty page") : entry.subtitle;
-                                                color: #68635b;
+                                                color: InkTheme.muted;
                                                 font-size: 11px;
                                                 overflow: elide;
                                             }
@@ -985,7 +1124,7 @@ export component MainWindow inherits Window {
                                     text: root.note-count == 0 ? "No pages yet" : "No matching pages";
                                     font-size: 13px;
                                     font-weight: 600;
-                                    color: #837a6a;
+                                    color: InkTheme.muted;
                                     horizontal-alignment: center;
                                 }
                                 Text {
@@ -1000,7 +1139,7 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle { height: 13px; background: transparent; }
-                Rectangle { height: 1px; background: #e2ded6; }
+                Rectangle { height: 1px; background: InkTheme.line; }
                 Rectangle { height: 14px; background: transparent; }
                 HorizontalLayout {
                     height: 29px;
@@ -1092,7 +1231,7 @@ export component MainWindow inherits Window {
                     width: 44px;
                     height: 42px;
                     border-radius: 9px;
-                    background: search-hit.has-hover ? #e7e3dc : transparent;
+                    background: search-hit.has-hover ? (InkTheme.dark ? #343c49 : #e7e3dc) : transparent;
                     accessible-role: button;
                     accessible-label: "Expand sidebar to search pages";
                     accessible-action-default => { root.toggle-sidebar(); }
@@ -1133,7 +1272,7 @@ export component MainWindow inherits Window {
                         width: parent.width;
                         height: parent.height;
                         text: root.note-count + "";
-                        color: #6f6a60;
+                        color: InkTheme.muted;
                         font-size: 11px;
                         font-weight: 700;
                         horizontal-alignment: center;
@@ -1148,13 +1287,13 @@ export component MainWindow inherits Window {
         // Editor and canvas share the same document header and save affordances.
         Rectangle {
             horizontal-stretch: 1;
-            background: #fffefa;
+            background: InkTheme.canvas;
             VerticalLayout {
                 spacing: 0px;
 
                 Rectangle {
                     height: 47px;
-                    background: #fbfaf8;
+                    background: InkTheme.toolbar;
                     HorizontalLayout {
                         padding-left: 31px;
                         padding-right: 29px;
@@ -1169,7 +1308,7 @@ export component MainWindow inherits Window {
                                 width: parent.width;
                                 height: parent.height;
                                 text: "ALL NOTES";
-                                color: #716c64;
+                                color: InkTheme.muted;
                                 font-size: 10px;
                                 font-weight: 700;
                                 letter-spacing: 1.2px;
@@ -1241,7 +1380,7 @@ export component MainWindow inherits Window {
                     spacing: 0px;
                     Rectangle {
                         height: 106px;
-                        background: #ffffff;
+                        background: InkTheme.paper;
                         VerticalLayout {
                             padding-left: 33px;
                             padding-right: 29px;
@@ -1250,7 +1389,7 @@ export component MainWindow inherits Window {
                             spacing: 7px;
                             Text {
                                 text: "YOUR PAGE";
-                                color: #6f6a60;
+                                color: InkTheme.muted;
                                 font-size: 10px;
                                 letter-spacing: 1.15px;
                                 font-weight: 700;
@@ -1265,7 +1404,7 @@ export component MainWindow inherits Window {
                                         width: parent.width;
                                         height: parent.height;
                                         text: root.note-title == "" ? "Untitled page" : root.note-title;
-                                        color: #27241e;
+                                        color: InkTheme.ink;
                                         font-size: 26px;
                                         font-weight: 700;
                                         overflow: elide;
@@ -1337,7 +1476,7 @@ export component MainWindow inherits Window {
                     Rectangle { height: 1px; background: root.line; }
                     Rectangle {
                         height: 49px;
-                        background: #ffffff;
+                        background: InkTheme.paper;
                         HorizontalLayout {
                             padding-left: 33px;
                             padding-right: 29px;
@@ -1379,7 +1518,7 @@ export component MainWindow inherits Window {
                         spacing: 0px;
                         Rectangle {
                             height: 54px;
-                            background: #fbfaf8;
+                            background: InkTheme.toolbar;
                             HorizontalLayout {
                                 padding-left: 24px;
                                 padding-right: 24px;
@@ -1434,6 +1573,7 @@ export component MainWindow inherits Window {
                                 StepButton {
                                     width: 32px;
                                     height: 34px;
+                                    hold-mode: true;
                                     enabled: root.font-size > 12;
                                     clicked => { root.change-font-size(max(12, root.font-size - 1)); }
                                 }
@@ -1456,30 +1596,109 @@ export component MainWindow inherits Window {
                                     width: 32px;
                                     height: 34px;
                                     add: true;
+                                    hold-mode: true;
                                     enabled: root.font-size < 40;
                                     clicked => { root.change-font-size(min(40, root.font-size + 1)); }
                                 }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 ToolLabel {
-                                    width: 77px;
-                                    label: "PLAIN TEXT";
-                                    ink: #6f6a60;
+                                    width: 83px;
+                                    label: root.formatted-preview ? "FORMATTED" : "EDIT SOURCE";
+                                    ink: root.muted;
+                                }
+                                ActionButton {
+                                    width: 76px;
+                                    height: 33px;
+                                    label: root.formatted-preview ? "Edit text" : "Preview";
+                                    selected: root.formatted-preview;
+                                    accessible-name: root.formatted-preview ? "Return to text editing" : "Preview formatted note";
+                                    clicked => {
+                                        if (!root.formatted-preview) {
+                                            root.request-formatted-preview();
+                                        }
+                                        root.formatted-preview = !root.formatted-preview;
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle { height: 1px; background: root.line; }
+                        if !root.formatted-preview: Rectangle {
+                            height: 48px;
+                            background: InkTheme.toolbar;
+                            HorizontalLayout {
+                                padding-left: 23px;
+                                padding-right: 23px;
+                                spacing: 5px;
+                                ToolLabel { width: 48px; label: "STYLE"; ink: root.muted; }
+                                for style in [
+                                    {label: "B", value: "bold", accessible: "Bold selected range"}
+                                ]: ActionButton {
+                                    width: 31px;
+                                    height: 31px;
+                                    label: style.label;
+                                    accessible-name: style.accessible;
+                                    selected: root.selection-bold;
+                                    clicked => { root.apply-text-format(style.value); }
+                                }
+                                Rectangle { width: 1px; height: 26px; background: root.line; }
+                                ToolLabel { width: 41px; label: "RANGE"; ink: root.muted; }
+                                SpinBox {
+                                    width: 70px;
+                                    height: 31px;
+                                    minimum: 0;
+                                    maximum: 1000000;
+                                    value <=> root.format-start;
+                                    accessible-label: "Range start position, zero based";
+                                }
+                                Text {
+                                    width: 13px;
+                                    text: "–";
+                                    color: root.muted;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                SpinBox {
+                                    width: 70px;
+                                    height: 31px;
+                                    minimum: 0;
+                                    maximum: 1000000;
+                                    value <=> root.format-end;
+                                    accessible-label: "Range end position, exclusive";
+                                }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                ToolLabel { width: 40px; label: "INK"; ink: root.muted; }
+                                for tone in [
+                                    {name: "Ink", code: "#292927", paint: #292927},
+                                    {name: "Red", code: "#D74453", paint: #d74453},
+                                    {name: "Orange", code: "#EF8E42", paint: #ef8e42},
+                                    {name: "Green", code: "#158E89", paint: #158e89},
+                                    {name: "Blue", code: "#386CC5", paint: #386cc5},
+                                    {name: "Violet", code: "#8B6AB8", paint: #8b6ab8}
+                                ]: ColorDot {
+                                    category: "text colour";
+                                    width: 27px;
+                                    height: 27px;
+                                    label: tone.name;
+                                    value: tone.code;
+                                    paint: tone.paint;
+                                    selected: root.text-color == tone.code;
+                                    picked(value) => { root.apply-text-color(value); }
                                 }
                             }
                         }
                         Rectangle { height: 1px; background: root.line; }
                         Rectangle {
                             vertical-stretch: 1;
-                            background: #ffffff;
+                            background: InkTheme.paper;
                             Rectangle {
                                 x: (parent.width - self.width) / 2;
                                 y: 0px;
                                 width: min(parent.width - 32px, 900px);
                                 height: parent.height;
-                                background: #ffffff;
+                                background: InkTheme.paper;
                                 // Direct TextInput avoids the styled TextEdit's implicit sizing:
                                 // its geometry and ink colour are fixed relative to this page.
-                                body-scroll := ScrollView {
+                                if !root.formatted-preview: body-scroll := ScrollView {
                                     x: 36px;
                                     y: 25px;
                                     width: parent.width - 72px;
@@ -1495,29 +1714,47 @@ export component MainWindow inherits Window {
                                         wrap: word-wrap;
                                         font-size: root.font-size * 1px;
                                         font-family: root.font-choice == "Serif" || root.font-choice == "Georgia" ? "Georgia" : root.font-choice == "Mono" || root.font-choice == "Consolas" ? "Consolas" : "Segoe UI";
-                                        color: #242424;
+                                        color: InkTheme.ink;
                                         selection-background-color: #f2d889;
-                                        selection-foreground-color: #242424;
+                                        selection-foreground-color: InkTheme.ink;
                                         vertical-alignment: top;
                                         edited => { root.edit-body(self.text); }
                                     }
                                 }
-                                if root.note-body == "": Text {
-                                    x: body-scroll.x;
-                                    y: body-scroll.y;
-                                    width: body-scroll.width;
+                                if !root.formatted-preview && root.note-body == "": Text {
+                                    x: 36px;
+                                    y: 25px;
+                                    width: parent.width - 72px;
                                     text: "Start writing something...";
-                                    color: #9c998f;
+                                    color: InkTheme.subtle;
                                     font-size: root.font-size * 1px;
                                     vertical-alignment: top;
                                     accessible-role: none;
+                                }
+                                if root.formatted-preview: ScrollView {
+                                    x: 36px;
+                                    y: 25px;
+                                    width: parent.width - 72px;
+                                    height: parent.height - 50px;
+                                    content-width: self.visible-width;
+                                    content-height: max(self.visible-height, rich-render.preferred-height + 12px);
+                                    rich-render := StyledText {
+                                        width: parent.width;
+                                        height: max(parent.height, self.preferred-height + 12px);
+                                        text: root.note-styled-preview;
+                                        default-font-family: root.font-choice == "Serif" || root.font-choice == "Georgia" ? "Georgia" : root.font-choice == "Mono" || root.font-choice == "Consolas" ? "Consolas" : "Segoe UI";
+                                        default-font-size: root.font-size * 1px;
+                                        default-color: InkTheme.ink;
+                                        link-color: InkTheme.dark ? #a8c8ff : #285bb2;
+                                        vertical-alignment: top;
+                                    }
                                 }
                             }
                         }
                         Rectangle { height: 1px; background: root.line; }
                         Rectangle {
                             height: 54px;
-                            background: #fbfaf8;
+                            background: InkTheme.toolbar;
                             HorizontalLayout {
                                 padding-left: 26px;
                                 padding-right: 26px;
@@ -1560,7 +1797,7 @@ export component MainWindow inherits Window {
                         }
                         if root.media-rows.length > 0: Rectangle {
                             vertical-stretch: 1;
-                            background: #f8f7f3;
+                            background: InkTheme.secondary;
                             ScrollView {
                                 x: (parent.width - self.width) / 2;
                                 y: 0px;
@@ -1597,7 +1834,7 @@ export component MainWindow inherits Window {
                         spacing: 0px;
                         Rectangle {
                             height: 102px;
-                            background: #fbfaf8;
+                            background: InkTheme.toolbar;
                             VerticalLayout {
                               spacing: 0px;
                               HorizontalLayout {
@@ -1628,6 +1865,7 @@ export component MainWindow inherits Window {
                                 StepButton {
                                     width: 29px;
                                     height: 34px;
+                                    hold-mode: true;
                                     enabled: root.brush-size > 1;
                                     clicked => { root.set-brush-size(max(1, root.brush-size - 1)); }
                                 }
@@ -1650,6 +1888,7 @@ export component MainWindow inherits Window {
                                     width: 29px;
                                     height: 34px;
                                     add: true;
+                                    hold-mode: true;
                                     enabled: root.brush-size < 40;
                                     clicked => { root.set-brush-size(min(40, root.brush-size + 1)); }
                                 }
@@ -1674,7 +1913,7 @@ export component MainWindow inherits Window {
                                     clicked => { root.request-clear-board(); }
                                 }
                               }
-                              Rectangle { height: 1px; background: #ebe5dc; }
+                              Rectangle { height: 1px; background: root.line; }
                               HorizontalLayout {
                                 height: 49px;
                                 padding-left: 23px;
@@ -1720,7 +1959,7 @@ export component MainWindow inherits Window {
                         Rectangle { height: 1px; background: root.line; }
                         Rectangle {
                             vertical-stretch: 1;
-                            background: #f5f3ef;
+                            background: InkTheme.secondary;
                             board-sheet := Rectangle {
                                 width: min(parent.width - 72px, (parent.height - 62px) * 11 / 7);
                                 height: self.width * 7 / 11;
@@ -1759,13 +1998,13 @@ export component MainWindow inherits Window {
                         }
                         Rectangle {
                             height: 40px;
-                            background: #fbfaf8;
+                            background: InkTheme.toolbar;
                             HorizontalLayout {
                                 padding-left: 32px;
                                 padding-right: 32px;
                                 Text {
                                     text: "1100 × 700 CANVAS";
-                                    color: #948d80;
+                                    color: InkTheme.subtle;
                                     font-weight: 700;
                                     font-size: 10px;
                                     letter-spacing: 0.8px;
@@ -1775,7 +2014,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     text: root.eraser ? "Erase on canvas" : "Drag on canvas to draw";
                                     font-size: 11px;
-                                    color: #948d80;
+                                    color: InkTheme.subtle;
                                     vertical-alignment: center;
                                 }
                             }
@@ -1785,7 +2024,7 @@ export component MainWindow inherits Window {
 
                 if !root.has-note: Rectangle {
                     vertical-stretch: 1;
-                    background: #fffefa;
+                    background: InkTheme.canvas;
                     Rectangle {
                         width: min(parent.width - 64px, 420px);
                         height: 325px;
@@ -1815,14 +2054,14 @@ export component MainWindow inherits Window {
                             Text {
                                 text: "Start a new page";
                                 font-family: "Segoe UI";
-                                color: #38332c;
+                                color: InkTheme.ink;
                                 font-size: 25px;
                                 font-weight: 700;
                                 horizontal-alignment: center;
                             }
                             Text {
                                 text: "A space for notes and sketches. Everything stays on this device.";
-                                color: #79736a;
+                                color: InkTheme.muted;
                                 font-size: 13px;
                                 wrap: word-wrap;
                                 horizontal-alignment: center;
@@ -1904,10 +2143,10 @@ export component MainWindow inherits Window {
             height: 211px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            background: #fffdfa;
+            background: InkTheme.paper;
             border-radius: 16px;
             border-width: 1px;
-            border-color: #e2dbcf;
+            border-color: InkTheme.line;
             TouchArea {
                 width: parent.width;
                 height: parent.height;
@@ -1923,12 +2162,12 @@ export component MainWindow inherits Window {
                     text: root.delete-confirm-title == "" ? "Delete this page?" : root.delete-confirm-title;
                     font-size: 21px;
                     font-weight: 700;
-                    color: #302c27;
+                    color: InkTheme.ink;
                 }
                 Text {
                     text: root.delete-confirm-body == "" ? "This page will be permanently deleted." : root.delete-confirm-body;
                     font-size: 13px;
-                    color: #6f6a60;
+                    color: InkTheme.muted;
                     wrap: word-wrap;
                 }
                 Rectangle { vertical-stretch: 1; background: transparent; }

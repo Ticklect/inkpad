@@ -92,12 +92,21 @@ Regression coverage: `cargo test --offline --bin inkpad-agent` includes a 1,600-
 | `image_export_html` | Exports a **self-contained** HTML file with escaped note text, drawings and inline base64 images to a user-approved absolute `.html` path; requires `user_approved:true`. Existing files are never overwritten. |
 | `read_image` | Reads the selected *stored attachment* as an MCP `image/png` content block, limited to **1 MiB of PNG bytes**. Requires explicit `user_approved:true`; larger images should be exported using `export_image` instead. The image bytes are not duplicated in text/structured metadata. |
 | `export_image` | Exports an explicitly selected attached image to a **new** user-approved absolute `.png` path. Requires `user_approved:true`, never overwrites or fetches arbitrary files, and does not open the GUI. |
+| `get_app_settings` | Reads the persisted UI theme (`light`, `dark`, `system`) and sidebar collapsed state without opening Inkpad. These are separate from note content. |
+| `set_app_theme` | Sets durable `theme` to `light`, `dark`, or `system` using the settings transaction lock; preserves sidebar preference and all notes. |
+| `set_sidebar_collapsed` | Sets durable `collapsed: true` or `false` without changing the theme or notes. The open desktop may apply settings after its own refresh. |
+| `get_note_formatting` | Reads the selected page's sparse `rich_text` runs and Unicode scalar character count. Unstyled gaps inherit note-wide font settings; returns no image bytes. |
+| `format_text_range` | Applies bold, foreground `color` (`#RRGGBB`), `size` (12–40), or `font_family` (`Sans`, `Serif`, `Mono`) on `[start,end)` Unicode scalar indices. Accepts `reset_color`, `reset_size`, `reset_font_family` and `bold:false` to remove overrides. Unspecified fields remain unchanged. |
+| `clear_text_formatting` | Clears all supported style overrides on `[start,end)` but preserves characters and surrounding styles. |
+| `replace_text_range` | Inserts, replaces or deletes text on `[start,end)` Unicode scalar indices, preserving/rebasing remaining formatting. `start=end` inserts text and empty `text` deletes a selection. |
 
 IDs are the safest way to target existing notes; exact titles may be duplicated, in which case the server rejects the request rather than guessing. Read a page before overwriting its whole body, and prefer `append_to_note` for normal note-taking requests. The agent preserves legacy `board` pages, drawings and image metadata during text and formatting edits. Only explicitly authorized `undo_last_stroke`, `clear_strokes`, `image_delete` or `delete_note` calls remove content. The `confirm` and `user_approved` arguments are safeguards, **not independent proof of human authorization**; the calling AI must only supply them after the user actually requests the action or names the source/destination file.
 
 **Image access and privacy:** Never guess a local path to read, scan directories for potential images, access browser profiles/secrets, or silently import arbitrary files. Obtain a user-selected absolute path before `image_insert_file`. The agent rejects relative paths, parent-directory traversal, unsupported extensions, invalid image signatures, internal Inkpad workspace paths and oversized files; the Store additionally decodes images within dimension/memory limits, converts to PNG and maintains references under the cross-process workspace lock. `image_insert_base64` only accepts directly provided image bytes and rejects data URLs, malformed base64 or unsupported formats. Up to 100 images may be attached to one page. Do not send images or note HTML to a remote service without the user's request.
 
 **GUI state:** An Inkpad page can hold text and drawings simultaneously. Text/Draw is a temporary editor view choice held in the desktop application's memory, **not** a saved property. Headless calls can edit both layers and the saved active page. They cannot remotely change which editor mode is on screen, invoke dialogs, or manipulate open selection/caret state. When the GUI has unsaved changes, its conflict safeguards can delay applying external updates; `set_active_note` confirms the saved preference, not guaranteed immediate visible switching in every GUI state. The GUI and the agent coordinate durable writes through the same lock.
+
+**Rich-text selection contract:** Ranges always use `unit:"unicode_scalar"` and half-open indices `[start,end)` into the saved UTF-8 body **as counted by Rust `str::chars()`**. A multi-codepoint emoji or combining sequence may occupy several scalar positions. These are **not UTF-8 byte offsets, UTF-16 code units, or grapheme cluster indices**. Read `get_note_formatting` / `read_note` before choosing exact offsets; for example `A👩‍🚀é猫Z` has eight Unicode scalar values. Only bold, foreground colour, font size and font family are persistable rich-text properties in this Beta; **italic, underline, highlight/background colour and GUI caret/selection are not supported**. `format_text_range` requires at least one valid attribute and rejects setting and resetting the same field simultaneously. Invalid edits do not save partial changes. Ordinary `append_to_note` and `update_note` preserve/rebase existing spans, rather than deleting them.
 
 **Export rules:** The target directory must already exist. `export_note` never opens a Save As dialog and refuses a path that already exists. It requires a full local destination path with the requested `.txt` or `.png` extension. For `.png`, it renders the existing strokes using the same software drawing renderer as Inkpad's GUI; body text is not rendered into that image. `txt` contains the note's body only. Extremely large or malformed saved strokes may be rejected instead of exhausting CPU or memory.
 
@@ -134,6 +143,16 @@ You can script small tasks directly without MCP:
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' image-delete NOTE_ID IMAGE_ID --confirm
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' read-image NOTE_ID IMAGE_ID --approved
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' export-image NOTE_ID IMAGE_ID 'D:\Notes\picture.png' --approved
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' settings
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' theme dark
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' theme system
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' sidebar collapsed
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' sidebar expanded
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' formatting NOTE_ID
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' format-range NOTE_ID 0 5 --bold true --color '#AA3377' --size 23 --family Serif
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' format-range NOTE_ID 0 5 --bold false --reset-color --reset-size --reset-family
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' clear-format NOTE_ID 0 5
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' replace-range NOTE_ID 0 5 'New text'
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' export-html NOTE_ID 'D:\Notes\complete-note.html' --approved
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' delete NOTE_ID --confirm
 ```

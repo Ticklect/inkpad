@@ -5,6 +5,8 @@
 
 #[path = "../store.rs"]
 mod store;
+#[path = "../settings.rs"]
+mod settings;
 #[path = "../media.rs"]
 mod media;
 #[path = "../canvas.rs"]

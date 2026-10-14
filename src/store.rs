@@ -4,6 +4,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "rich_text.rs"]
+pub mod rich_text;
+pub use self::rich_text::{TextRun, TextStyle, TextStylePatch};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
     pub color: [u8; 4],
@@ -35,6 +39,10 @@ pub struct Note {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    /// Sparse, non-overlapping style spans over Unicode scalar indices in body.
+    /// Legacy workspaces without this field keep the full original plain text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rich_text: Vec<TextRun>,
     pub kind: String,
     #[serde(default = "default_font_size")]
     pub font_size: i32,
@@ -60,6 +68,7 @@ impl Note {
             id: format!("{:x}-{:x}", now.as_nanos(), std::process::id()),
             title: if kind == "board" { "Untitled board" } else { "Untitled note" }.to_string(),
             body: String::new(),
+            rich_text: Vec::new(),
             kind: if kind == "board" { "board" } else { "note" }.to_string(),
             font_size: default_font_size(),
             font_choice: default_font(),
@@ -72,6 +81,38 @@ impl Note {
 
     pub fn touch(&mut self) {
         self.updated = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    /// Format selected text. Indices are half-open Unicode scalar positions,
+    /// not UTF-8 byte offsets, UTF-16 offsets or visible grapheme clusters.
+    pub fn format_text_range(&mut self, start: usize, end: usize,
+                             patch: TextStylePatch) -> Result<(), String> {
+        rich_text::format_range(&self.body, &mut self.rich_text, start, end, patch)?;
+        self.touch();
+        Ok(())
+    }
+
+    pub fn replace_text_range(&mut self, start: usize, end: usize,
+                              replacement: &str) -> Result<(), String> {
+        rich_text::replace_range(&mut self.body, &mut self.rich_text, start, end, replacement)?;
+        self.touch();
+        Ok(())
+    }
+
+    /// Preserve formatting on the unchanged prefix and suffix of an edited
+    /// editor buffer, retaining the exact plain text including Unicode.
+    pub fn set_body_preserving_format(&mut self, edited: String) -> Result<(), String> {
+        rich_text::reconcile_body(&mut self.body, &mut self.rich_text, edited)?;
+        self.touch();
+        Ok(())
+    }
+
+    pub fn style_at(&self, char_index: usize) -> TextStyle {
+        rich_text::style_at(&self.rich_text, char_index)
+    }
+
+    pub fn validate_rich_text(&self) -> Result<(), String> {
+        rich_text::validate_runs(&self.body, &self.rich_text)
     }
 }
 
@@ -88,6 +129,17 @@ impl Default for Workspace {
         note.title = "Welcome to Inkpad".to_string();
         note.body = "Your notes live on this computer and save automatically.\n\nUse Text to write and Draw to sketch, both inside this page.\n\nThe left sidebar keeps everything organised. No account or internet connection required.".to_string();
         Self { version: 1, active_id: note.id.clone(), notes: vec![note] }
+    }
+}
+
+impl Workspace {
+    fn validate_rich_text(&self) -> io::Result<()> {
+        for note in &self.notes {
+            note.validate_rich_text().map_err(|error|
+                io::Error::new(io::ErrorKind::InvalidData,
+                    format!("Invalid formatted text in note '{}': {error}", note.id)))?;
+        }
+        Ok(())
     }
 }
 
@@ -140,11 +192,17 @@ impl Store {
 
     pub(crate) fn read_unlocked(&self) -> io::Result<Workspace> {
         let primary = fs::read(&self.path)?;
-        match serde_json::from_slice::<Workspace>(&primary) {
+        let parse_valid = |bytes: &[u8]| -> io::Result<Workspace> {
+            let workspace: Workspace = serde_json::from_slice(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            workspace.validate_rich_text()?;
+            Ok(workspace)
+        };
+        match parse_valid(&primary) {
             Ok(workspace) => Ok(workspace),
             Err(error) => {
                 let bak = self.path.with_extension("json.bak");
-                match fs::read(&bak).ok().and_then(|bytes| serde_json::from_slice::<Workspace>(&bytes).ok()) {
+                match fs::read(&bak).ok().and_then(|bytes| parse_valid(&bytes).ok()) {
                     Some(workspace) => Ok(workspace),
                     None => Err(io::Error::new(io::ErrorKind::InvalidData,
                         format!("Could not read saved notes ({}). Your data was not overwritten. Path: {}", error, self.path.display()))),
@@ -174,6 +232,7 @@ impl Store {
     }
 
     fn write_unlocked(&self, workspace: &Workspace) -> io::Result<()> {
+        workspace.validate_rich_text()?;
         let encoded = serde_json::to_vec_pretty(workspace)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let temp = self.path.with_extension("json.tmp");
@@ -186,7 +245,7 @@ impl Store {
             // A corrupt primary can be recovered from backup on next launch.
             if fs::read(&self.path).ok()
                 .and_then(|data| serde_json::from_slice::<Workspace>(&data).ok())
-                .is_some()
+                .filter(|workspace| workspace.validate_rich_text().is_ok()).is_some()
             {
                 fs::copy(&self.path, self.path.with_extension("json.bak"))?;
             }
@@ -236,6 +295,71 @@ mod tests {
         store.save(&original).unwrap();
         fs::write(store.data_path(), b"truncated").unwrap();
         assert_eq!(store.load().unwrap().notes[0].title, "Welcome to Inkpad");
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn legacy_json_round_trip_retains_plain_unicode_and_media_fields() {
+        let old = serde_json::json!({
+            "version":1,"active_id":"legacy","notes":[{
+                "id":"legacy","title":"Old 🐈 note","body":"A\n猫👩‍🚀",
+                "kind":"note","font_size":24,"font_choice":"Serif",
+                "pinned":true,"strokes":[{"color":[1,2,3,255],"width":5,
+                    "eraser":false,"points":[[4,5]]}],
+                "images":[{"id":"img","filename":"img.png","caption":"Hi",
+                    "width_percent":40,"position":0}],"updated":99
+            }]
+        });
+        let migrated: Workspace = serde_json::from_value(old).unwrap();
+        assert_eq!(migrated.notes[0].body, "A\n猫👩‍🚀");
+        assert!(migrated.notes[0].rich_text.is_empty());
+        let note = &migrated.notes[0];
+        assert_eq!(note.strokes.len(), 1);
+        assert_eq!(note.images.len(), 1);
+        assert_eq!(note.font_size, 24);
+        let encoded = serde_json::to_value(migrated).unwrap();
+        assert!(encoded["notes"][0].get("rich_text").is_none());
+        assert_eq!(encoded["notes"][0]["images"][0]["caption"], "Hi");
+    }
+
+    #[test]
+    fn mixed_styles_survive_save_restart_and_backup_recovery() {
+        let folder = std::env::temp_dir().join(format!("inkpad-rich-recovery-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Store::in_folder(folder.clone()).unwrap();
+        let mut workspace = store.load().unwrap();
+        let note = &mut workspace.notes[0];
+        note.set_body_preserving_format("one 猫🦊 two".into()).unwrap();
+        note.format_text_range(4, 6, TextStylePatch {
+            bold: Some(true), color: Some("#cc00FF".into()), size: Some(30),
+            font_family: Some("Mono".into()), ..Default::default()
+        }).unwrap();
+        let expected = note.clone();
+        store.save(&workspace).unwrap();
+        // A second save creates a backup containing the attributed text.
+        store.save(&workspace).unwrap();
+        assert_eq!(store.load().unwrap().notes[0], expected);
+        fs::write(store.data_path(), b"{invalid json").unwrap();
+        let recovered = store.load().unwrap();
+        assert_eq!(recovered.notes[0], expected);
+        assert_eq!(recovered.notes[0].style_at(5).font_family.as_deref(), Some("Mono"));
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn malformed_rich_ranges_fall_back_to_valid_backup_without_overwriting() {
+        let folder = std::env::temp_dir().join(format!("inkpad-rich-malformed-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Store::in_folder(folder.clone()).unwrap();
+        let workspace = store.load().unwrap();
+        store.save(&workspace).unwrap();
+        let mut malformed = serde_json::to_value(&workspace).unwrap();
+        malformed["notes"][0]["rich_text"] = serde_json::json!([{
+            "start":10000,"end":10001,"style":{"bold":true}
+        }]);
+        fs::write(store.data_path(), serde_json::to_vec(&malformed).unwrap()).unwrap();
+        assert_eq!(store.load().unwrap().notes[0].title, "Welcome to Inkpad");
+        assert!(fs::read(store.data_path()).unwrap().windows(6).any(|x| x == b"10000,"));
         fs::remove_dir_all(folder).unwrap();
     }
 }

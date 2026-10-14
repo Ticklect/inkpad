@@ -9,14 +9,14 @@ mod store;
 mod windows_chrome;
 
 use canvas::{parse_color, Board, HEIGHT, WIDTH};
-use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
+use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, StyledText, VecModel};
 use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
-use settings::UiSettings;
-use store::{Note, Store, Stroke, Workspace};
+use settings::{AppearanceTheme, UiSettings};
+use store::{Note, Store, Stroke, TextStyle, TextStylePatch, Workspace};
 use std::path::Path;
 
 slint::include_modules!();
@@ -29,6 +29,7 @@ struct App {
     drawing: bool,
     edit_mode: String,
     last_seen_file: Option<(SystemTime, u64)>,
+    last_seen_preferences: Option<(SystemTime, u64)>,
     filter: String,
     query: String,
     brush_size: u16,
@@ -84,10 +85,24 @@ fn merge_note(base: &Note, local: &Note, remote: &Note) -> io::Result<Note> {
     if base.id != local.id || local.id != remote.id {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Conflicting note identity"));
     }
-    Ok(Note {
+    let body = merge_field(&base.body, &local.body, &remote.body, "note text")?;
+    let rich_text = merge_field(&base.rich_text, &local.rich_text, &remote.rich_text, "text formatting")?;
+    // The sparse formatting offsets are attached to Unicode characters in the
+    // body. If one process changed the body and the other process changed its
+    // formatting, rebase runs onto the winning text rather than allowing stale
+    // offsets to silently colour or embolden unrelated characters.
+    let style_source_body = if local.rich_text != base.rich_text {
+        &local.body
+    } else if remote.rich_text != base.rich_text {
+        &remote.body
+    } else {
+        &base.body
+    };
+    let mut merged = Note {
         id: base.id.clone(),
         title: merge_field(&base.title, &local.title, &remote.title, "the title")?,
-        body: merge_field(&base.body, &local.body, &remote.body, "note text")?,
+        body,
+        rich_text,
         kind: merge_field(&base.kind, &local.kind, &remote.kind, "page type")?,
         font_size: merge_field(&base.font_size, &local.font_size, &remote.font_size, "font size")?,
         font_choice: merge_field(&base.font_choice, &local.font_choice, &remote.font_choice, "font family")?,
@@ -95,7 +110,15 @@ fn merge_note(base: &Note, local: &Note, remote: &Note) -> io::Result<Note> {
         strokes: merge_field(&base.strokes, &local.strokes, &remote.strokes, "drawing strokes")?,
         images: merge_field(&base.images, &local.images, &remote.images, "picture blocks")?,
         updated: local.updated.max(remote.updated),
-    })
+    };
+    if style_source_body != &merged.body {
+        let chosen_body = std::mem::replace(&mut merged.body, style_source_body.clone());
+        merged.set_body_preserving_format(chosen_body).map_err(|error|
+            io::Error::new(io::ErrorKind::WouldBlock, format!("Cannot safely merge formatted note text: {error}")))?;
+    }
+    merged.validate_rich_text().map_err(|error|
+        io::Error::new(io::ErrorKind::InvalidData, format!("Invalid merged text formatting: {error}")))?;
+    Ok(merged)
 }
 
 impl App {
@@ -117,6 +140,7 @@ impl App {
         } else { "text" }.to_string();
         let mut app = Self {
             last_seen_file: file_stamp(storage.data_path()),
+            last_seen_preferences: file_stamp(&UiSettings::path_for(storage.data_path())),
             storage, baseline: workspace.clone(), workspace, board: None, drawing: false, edit_mode,
             filter: "all".into(), query: String::new(), brush_size: 6,
             brush_color: "#263238".into(), eraser: false, ui_settings,
@@ -187,11 +211,31 @@ impl App {
     }
 
     fn toggle_sidebar(&mut self) -> io::Result<bool> {
-        let next = !self.ui_settings.sidebar_collapsed;
-        let changed = UiSettings { sidebar_collapsed: next };
-        changed.save(self.storage.data_path())?;
-        self.ui_settings = changed;
-        Ok(next)
+        self.ui_settings = UiSettings::update(self.storage.data_path(), |settings| {
+            settings.sidebar_collapsed = !settings.sidebar_collapsed;
+        })?;
+        self.last_seen_preferences = file_stamp(&UiSettings::path_for(self.storage.data_path()));
+        Ok(self.ui_settings.sidebar_collapsed)
+    }
+
+    fn set_theme(&mut self, choice: &str) -> io::Result<()> {
+        let theme = AppearanceTheme::parse(choice)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid Inkpad appearance theme"))?;
+        self.ui_settings = UiSettings::update(self.storage.data_path(), |settings| {
+            settings.theme = theme;
+        })?;
+        self.last_seen_preferences = file_stamp(&UiSettings::path_for(self.storage.data_path()));
+        Ok(())
+    }
+
+    fn sync_preferences(&mut self) -> io::Result<bool> {
+        let stamp = file_stamp(&UiSettings::path_for(self.storage.data_path()));
+        if stamp == self.last_seen_preferences { return Ok(false); }
+        let fresh = UiSettings::load(self.storage.data_path())?;
+        self.last_seen_preferences = stamp;
+        if fresh == self.ui_settings { return Ok(false); }
+        self.ui_settings = fresh;
+        Ok(true)
     }
 
     /// Called occasionally while the window is open. This is intentionally
@@ -451,6 +495,36 @@ fn png_from_clipboard() -> io::Result<Vec<u8>> {
     Ok(png)
 }
 
+/// Mirror Windows' "Default app mode" when Inkpad's theme is set to System.
+/// Missing or inaccessible registry settings conservatively use light mode.
+#[cfg(windows)]
+fn system_prefers_dark() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER,
+        KEY_QUERY_VALUE, REG_DWORD,
+    };
+    let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0".encode_utf16().collect();
+    let value_name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+    let mut key = std::ptr::null_mut();
+    // SAFETY: All pointers are valid for the full call, the value buffer is
+    // exactly one REG_DWORD, and an opened HKEY is always closed.
+    unsafe {
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) != 0 {
+            return false;
+        }
+        let mut kind = 0u32;
+        let mut size = 4u32;
+        let mut value = 1u32;
+        let result = RegQueryValueExW(key, value_name.as_ptr(), std::ptr::null(), &mut kind,
+            (&mut value as *mut u32).cast::<u8>(), &mut size);
+        let _ = RegCloseKey(key);
+        result == 0 && kind == REG_DWORD && size == 4 && value == 0
+    }
+}
+
+#[cfg(not(windows))]
+fn system_prefers_dark() -> bool { false }
+
 fn file_stamp(path: &std::path::Path) -> Option<(SystemTime, u64)> {
     let metadata = fs::metadata(path).ok()?;
     Some((metadata.modified().ok()?, metadata.len()))
@@ -488,11 +562,71 @@ fn update_rows(ui: &MainWindow, app: &App) {
     ui.set_note_count(app.workspace.notes.len() as i32);
 }
 
+/// Generate a safe StyledText preview from validated attributed character
+/// runs. The editable Slint TextInput currently accepts plain text only; this
+/// renders actual per-range bold and foreground colours without ever treating
+/// note text as author-supplied Markdown/HTML. Per-run font size and family are
+/// preserved in the model, and in HTML export, but remain an editor limitation.
+fn note_styled_preview(note: &Note) -> StyledText {
+    if note.rich_text.is_empty() {
+        return StyledText::from_plain_text(&note.body);
+    }
+    if note.validate_rich_text().is_err() {
+        return StyledText::from_plain_text(&note.body);
+    }
+    let mut markdown = String::with_capacity(note.body.len().saturating_mul(2));
+    let mut current = TextStyle::default();
+    let mut content = String::new();
+    let mut run_index = 0;
+    for (index, ch) in note.body.chars().enumerate() {
+        while run_index < note.rich_text.len() && note.rich_text[run_index].end <= index {
+            run_index += 1;
+        }
+        let style = note.rich_text.get(run_index)
+            .filter(|run| run.start <= index)
+            .map(|run| run.style.clone()).unwrap_or_default();
+        if style != current {
+            append_styled_segment(&mut markdown, &content, &current);
+            content.clear();
+            current = style;
+        }
+        content.push(ch);
+    }
+    append_styled_segment(&mut markdown, &content, &current);
+    StyledText::from_markdown(&markdown)
+        .unwrap_or_else(|_| StyledText::from_plain_text(&note.body))
+}
+
+fn append_styled_segment(out: &mut String, text: &str, style: &TextStyle) {
+    if text.is_empty() { return; }
+    if let Some(color) = &style.color {
+        // Model validation requires exactly a #RRGGBB literal.
+        out.push_str("<font color='");
+        out.push_str(color);
+        out.push_str("'>");
+    }
+    if style.bold { out.push_str("**"); }
+    for ch in text.chars() {
+        match ch {
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '<' | '>'
+                | '#' | '+' | '-' | '.' | '!' | '|' | '~' | '&' => {
+                    out.push('\\'); out.push(ch);
+                }
+            _ => out.push(ch),
+        }
+    }
+    if style.bold { out.push_str("**"); }
+    if style.color.is_some() { out.push_str("</font>"); }
+}
+
 fn update_editor(ui: &MainWindow, app: &App) {
     if let Some(note) = app.active() {
         ui.set_has_note(true);
         ui.set_note_title(note.title.clone().into());
         ui.set_note_body(note.body.clone().into());
+        ui.set_note_styled_preview(note_styled_preview(note));
+        ui.set_selection_bold(false);
+        ui.set_text_color("#292927".into());
         ui.set_font_size(note.font_size);
         ui.set_font_choice(note.font_choice.clone().into());
         ui.set_active_kind(note.kind.clone().into());
@@ -500,6 +634,9 @@ fn update_editor(ui: &MainWindow, app: &App) {
         ui.set_has_note(false);
         ui.set_note_title(SharedString::default());
         ui.set_note_body(SharedString::default());
+        ui.set_note_styled_preview(StyledText::from_plain_text(""));
+        ui.set_selection_bold(false);
+        ui.set_text_color("#292927".into());
         ui.set_active_kind("none".into());
     }
     ui.set_edit_mode(app.edit_mode.clone().into());
@@ -626,6 +763,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = app.borrow();
         update_all(&ui, &state);
         ui.set_sidebar_collapsed(state.ui_settings.sidebar_collapsed);
+        ui.set_appearance_theme(state.ui_settings.theme.as_str().into());
+        ui.set_system_dark(system_prefers_dark());
         ui.set_brush_size(state.brush_size as i32);
         ui.set_brush_color(state.brush_color.clone().into());
         ui.set_eraser(state.eraser);
@@ -646,6 +785,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(true) => update_all(&ui, &app.borrow()),
                 Ok(false) => {}
                 Err(error) => set_status(&ui, Err(error)),
+            }
+            match app.borrow_mut().sync_preferences() {
+                Ok(true) => {
+                    let state = app.borrow();
+                    ui.set_appearance_theme(state.ui_settings.theme.as_str().into());
+                    ui.set_sidebar_collapsed(state.ui_settings.sidebar_collapsed);
+                }
+                Ok(false) => {}
+                Err(error) => set_status(&ui, Err(error)),
+            }
+            // A Windows appearance change while Inkpad is open should be
+            // reflected without reloading the note or moving its caret.
+            if ui.get_appearance_theme().as_str() == "system" {
+                ui.set_system_dark(system_prefers_dark());
             }
         });
     }
@@ -703,7 +856,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     bind_change!(on_edit_body, |app: &mut App, text: SharedString| {
         if let Some(note) = app.active_mut() {
-            note.body = text.to_string(); note.touch();
+            note.set_body_preserving_format(text.to_string())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            note.touch();
         }
         Ok(())
     });
@@ -788,6 +943,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match app.borrow_mut().toggle_sidebar() {
                 Ok(collapsed) => ui.set_sidebar_collapsed(collapsed),
                 Err(error) => set_status(&ui, Err(error)),
+            }
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_change_appearance_theme(move |theme| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let result = app.borrow_mut().set_theme(theme.as_str());
+            if result.is_ok() {
+                ui.set_appearance_theme(app.borrow().ui_settings.theme.as_str().into());
+            }
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_apply_text_format(move |action| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let start = ui.get_format_start().max(0) as usize;
+            let end = ui.get_format_end().max(0) as usize;
+            let outcome = (|| -> io::Result<()> {
+                let mut state = app.borrow_mut();
+                let note = state.active_mut().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No active note"))?;
+                if action.as_str() != "bold" {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported text formatting operation"));
+                }
+                if start >= end || end > note.body.chars().count() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Select a valid nonempty Unicode character range"));
+                }
+                let is_all_bold = (start..end).all(|index| note.style_at(index).bold);
+                note.format_text_range(start, end, TextStylePatch {
+                    bold: Some(!is_all_bold), ..TextStylePatch::default()
+                }).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                note.touch();
+                state.persist()
+            })();
+            if outcome.is_ok() {
+                if let Some(note) = app.borrow().active() {
+                    ui.set_note_styled_preview(note_styled_preview(note));
+                    ui.set_selection_bold(note.style_at(start).bold);
+                }
+            }
+            set_status(&ui, outcome);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_apply_text_color(move |color| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let start = ui.get_format_start().max(0) as usize;
+            let end = ui.get_format_end().max(0) as usize;
+            let outcome = (|| -> io::Result<()> {
+                let mut state = app.borrow_mut();
+                let note = state.active_mut().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No active note"))?;
+                // Ink means the current theme's readable foreground, not a
+                // hard-coded charcoal override that vanishes in dark mode.
+                let patch = if color.as_str() == "#292927" {
+                    TextStylePatch { reset_color: true, ..TextStylePatch::default() }
+                } else {
+                    TextStylePatch { color: Some(color.to_string()), ..TextStylePatch::default() }
+                };
+                note.format_text_range(start, end, patch)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                note.touch();
+                state.persist()
+            })();
+            if outcome.is_ok() {
+                if let Some(note) = app.borrow().active() {
+                    ui.set_note_styled_preview(note_styled_preview(note));
+                }
+                ui.set_text_color(color);
+            }
+            set_status(&ui, outcome);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_request_formatted_preview(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            if let Some(note) = app.borrow().active() {
+                ui.set_note_styled_preview(note_styled_preview(note));
             }
         });
     }
@@ -1095,6 +1335,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn rich_text_preview_parses_untrusted_literal_body_safely() {
+        let mut note = Note::create("note");
+        note.body = "Plain **not markup** <script>alert(1)</script> & emoji 猫🦊".into();
+        let length = note.body.chars().count();
+        note.format_text_range(6, length, TextStylePatch {
+            bold: Some(true), color: Some("#B12466".into()),
+            ..TextStylePatch::default()
+        }).unwrap();
+        // Slint's formatter must not interpret literal user content as HTML
+        // control markup or silently drop the entire preview.
+        let rendered = note_styled_preview(&note);
+        let rendered_debug = format!("{rendered:?}");
+        assert!(rendered_debug.contains("Plain **not markup** <script>alert(1)</script> & emoji 猫🦊"));
+        assert!(rendered_debug.contains("style: Strong"));
+        assert!(rendered_debug.contains("style: Color("));
+    }
+
+    #[test]
+    fn rich_text_agent_format_merges_with_desktop_prefix_edit() {
+        let mut base = Note::create("note");
+        base.body = "hello world".into();
+        let mut local = base.clone();
+        local.set_body_preserving_format("Dear hello world".into()).unwrap();
+        let mut remote = base.clone();
+        remote.format_text_range(6, 11, TextStylePatch {
+            bold: Some(true), ..TextStylePatch::default()
+        }).unwrap();
+        let merged = merge_note(&base, &local, &remote).unwrap();
+        assert_eq!(merged.body, "Dear hello world");
+        merged.validate_rich_text().unwrap();
+        assert!(!merged.style_at(1).bold, "prefixed word must remain unstyled");
+        assert!(merged.style_at(11).bold, "original word styling must follow its text");
+    }
+
+    #[test]
+    fn appearance_theme_persists_and_agent_changes_sync_without_touching_notes() {
+        let root = std::env::temp_dir().join(format!("inkpad-theme-sync-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Store::in_folder(root.clone()).unwrap();
+        let mut app = App::load(store).unwrap();
+        let before_notes = app.storage.read_latest().unwrap().notes;
+        assert_eq!(app.ui_settings.theme, AppearanceTheme::Light);
+        app.set_theme("dark").unwrap();
+        assert_eq!(UiSettings::load(app.storage.data_path()).unwrap().theme, AppearanceTheme::Dark);
+        UiSettings::update(app.storage.data_path(), |s| s.theme = AppearanceTheme::System).unwrap();
+        assert!(app.sync_preferences().unwrap());
+        assert_eq!(app.ui_settings.theme, AppearanceTheme::System);
+        assert_eq!(app.storage.read_latest().unwrap().notes, before_notes);
+        assert!(!app.sync_preferences().unwrap());
+        drop(app);
+        let reopened = App::load(Store::in_folder(root.clone()).unwrap()).unwrap();
+        assert_eq!(reopened.ui_settings.theme, AppearanceTheme::System);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn drawing_survives_restart_and_undo_saves() {

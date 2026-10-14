@@ -2,7 +2,8 @@
 //! Storage mutations use the cross-process transaction lock in `Store`.
 
 use crate::canvas::{Board, HEIGHT, WIDTH};
-use crate::store::{Note, Store, Stroke, Workspace};
+use crate::settings::{AppearanceTheme, UiSettings};
+use crate::store::{Note, Store, Stroke, TextStylePatch, Workspace};
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::fs::OpenOptions;
@@ -344,6 +345,13 @@ fn tool_definitions() -> Vec<Value> {
         json!({"name":"image_export_html","description":"Export a complete self-contained note as HTML with escaped text and inline embedded images at a human-approved absolute .html path. Contains private note content; do not export without user_approved=true. Refuses overwrite and never opens a GUI dialog.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"path":{"type":"string"},"user_approved":{"type":"boolean","const":true}},"required":["path","user_approved"],"additionalProperties":false}}),
         json!({"name":"read_image","description":"Read one selected private Inkpad picture for AI image understanding, returned as an MCP image block (PNG base64, max 1 MiB). Requires explicit user_approved=true from the user requesting picture inspection. For larger images use export_image instead. Never scans files or returns arbitrary paths.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"user_approved":{"type":"boolean","const":true}},"required":["image_id","user_approved"],"additionalProperties":false}}),
         json!({"name":"export_image","description":"Export one stored picture to an explicit user-approved NEW absolute PNG file, without overwriting any existing file. Requires user_approved=true. Never exports a file that is not an attachment of the selected note; does not upload to any network service.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"path":{"type":"string"},"user_approved":{"type":"boolean","const":true}},"required":["image_id","path","user_approved"],"additionalProperties":false}}),
+        json!({"name":"get_app_settings","description":"Read persisted Inkpad appearance theme (light, dark, system) and sidebar collapsed state. Reads local UI settings only, without opening the window or accessing note content.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+        json!({"name":"set_app_theme","description":"Persist Inkpad's appearance preference: light, dark, or system. Uses a cross-process settings lock; no GUI window opened. System resolves to OS preference in the GUI. Does not modify notes.","inputSchema":{"type":"object","properties":{"theme":{"type":"string","enum":["light","dark","system"]}},"required":["theme"],"additionalProperties":false}}),
+        json!({"name":"set_sidebar_collapsed","description":"Persist the Inkpad sidebar collapsed or expanded state using the cross-process settings lock. Does not open a GUI window or touch notes.","inputSchema":{"type":"object","properties":{"collapsed":{"type":"boolean"}},"required":["collapsed"],"additionalProperties":false}}),
+        json!({"name":"get_note_formatting","description":"Read the selected note's sparse rich-text style runs, half-open Unicode scalar ranges, and character count. Style includes bold, foreground color, font size, and font family; unsupported italic/underline/background are not persisted. Returns no image bytes.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"}},"additionalProperties":false}}),
+        json!({"name":"format_text_range","description":"Apply one or more attributes to [start,end) Unicode scalar indices in a note body; all unspecified attributes remain unchanged. Supported: bold boolean, color #RRGGBB, size 12-40, font_family Sans/Serif/Mono, and reset_color/reset_size/reset_font_family booleans. Explicit unit='unicode_scalar' required; rejects invalid/overlapping ranges atomically. No GUI focus required.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":1},"unit":{"type":"string","const":"unicode_scalar"},"bold":{"type":"boolean"},"color":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"},"size":{"type":"integer","minimum":12,"maximum":40},"font_family":{"type":"string","enum":["Sans","Serif","Mono"]},"reset_color":{"type":"boolean"},"reset_size":{"type":"boolean"},"reset_font_family":{"type":"boolean"}},"required":["start","end","unit"],"additionalProperties":false}}),
+        json!({"name":"clear_text_formatting","description":"Clear all supported rich-text overrides on [start,end) Unicode scalar indices, leaving body text and other runs untouched. Explicit unit='unicode_scalar' required.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":1},"unit":{"type":"string","const":"unicode_scalar"}},"required":["start","end","unit"],"additionalProperties":false}}),
+        json!({"name":"replace_text_range","description":"Replace [start,end) characters in saved note body using Unicode scalar indices; start=end inserts, empty text deletes selection. Preserves and rebases formatting outside the edit, including emoji/combining marks. Explicit unit='unicode_scalar' required; max body 1 MiB. Edits note text, not transient GUI caret/selection.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0},"unit":{"type":"string","const":"unicode_scalar"},"text":{"type":"string"}},"required":["start","end","unit","text"],"additionalProperties":false}}),
     ]
 }
 
@@ -445,6 +453,82 @@ fn required_i32(args: &Map<String, Value>, key: &str, min: i32, max: i32) -> Res
     let n = args.get(key).and_then(Value::as_i64)
         .filter(|n| (*n >= min as i64) && (*n <= max as i64));
     n.map(|n| n as i32).ok_or_else(|| format!("{key} must be an integer between {min} and {max}"))
+}
+
+fn scalar_range(args: &Map<String, Value>, allow_empty: bool) -> Result<(usize, usize), String> {
+    if required_string(args, "unit")? != "unicode_scalar" {
+        return Err(invalid("unit must be unicode_scalar (Unicode scalar values, not bytes or UTF-16 code units)"));
+    }
+    let offset = |name: &str| -> Result<usize, String> {
+        args.get(name).and_then(Value::as_u64)
+            .and_then(|number| usize::try_from(number).ok())
+            .ok_or_else(|| format!("{name} must be a nonnegative integer Unicode scalar offset"))
+    };
+    let (start, end) = (offset("start")?, offset("end")?);
+    if start > end || (!allow_empty && start == end) {
+        return Err(invalid(if allow_empty { "start must be <= end" } else { "Formatting requires start < end" }));
+    }
+    Ok((start, end))
+}
+
+fn cli_range_args(args: &[String], style: bool) -> Result<Map<String, Value>, String> {
+    if args.len() < if style { 5 } else { 4 } {
+        return Err(invalid("Provide NOTE_ID START END and any formatting options"));
+    }
+    let start = args[2].parse::<usize>().map_err(|_| invalid("START must be a nonnegative Unicode scalar index"))?;
+    let end = args[3].parse::<usize>().map_err(|_| invalid("END must be a nonnegative Unicode scalar index"))?;
+    let mut options = Map::new();
+    options.insert("id".into(), json!(args[1]));
+    options.insert("start".into(), json!(start));
+    options.insert("end".into(), json!(end));
+    options.insert("unit".into(), json!("unicode_scalar"));
+    if !style { return Ok(options); }
+    let mut i = 4;
+    let mut seen = std::collections::HashSet::new();
+    while i < args.len() {
+        let (key, value, consumes): (&str, Value, usize) = match args[i].as_str() {
+            "--bold" if i + 1 < args.len() => ("bold", json!(parse_cli_bool(&args[i + 1])?), 2),
+            "--color" if i + 1 < args.len() => ("color", json!(&args[i + 1]), 2),
+            "--size" if i + 1 < args.len() => {
+                let size = args[i + 1].parse::<i32>().map_err(|_| invalid("size must be an integer"))?;
+                ("size", json!(size), 2)
+            }
+            "--family" if i + 1 < args.len() => ("font_family", json!(&args[i + 1]), 2),
+            "--reset-color" => ("reset_color", json!(true), 1),
+            "--reset-size" => ("reset_size", json!(true), 1),
+            "--reset-family" => ("reset_font_family", json!(true), 1),
+            _ => return Err(format!("Unknown or incomplete rich-text option: {}", args[i])),
+        };
+        if !seen.insert(key) { return Err(format!("Duplicate rich-text option {key}")); }
+        options.insert(key.to_string(), value);
+        i += consumes;
+    }
+    Ok(options)
+}
+
+fn parse_cli_bool(value: &str) -> Result<bool, String> {
+    match value { "true" => Ok(true), "false" => Ok(false), _ => Err(invalid("Boolean option must be true or false")) }
+}
+
+fn rich_style_patch(args: &Map<String, Value>) -> Result<TextStylePatch, String> {
+    let patch_bool = |key: &str| -> Result<Option<bool>, String> {
+        if args.contains_key(key) { required_bool(args, key).map(Some) } else { Ok(None) }
+    };
+    let bold = patch_bool("bold")?;
+    let color = optional_string(args, "color")?.map(str::to_string);
+    let size = if args.contains_key("size") { Some(required_i32(args, "size", 12, 40)?) } else { None };
+    let font_family = optional_string(args, "font_family")?.map(str::to_string);
+    let reset_color = patch_bool("reset_color")?.unwrap_or(false);
+    let reset_size = patch_bool("reset_size")?.unwrap_or(false);
+    let reset_font_family = patch_bool("reset_font_family")?.unwrap_or(false);
+    if bold.is_none() && color.is_none() && size.is_none() && font_family.is_none()
+        && !(reset_color || reset_size || reset_font_family) {
+        return Err(invalid("Specify at least one supported rich-text formatting change"));
+    }
+    if (reset_color && color.is_some()) || (reset_size && size.is_some()) || (reset_font_family && font_family.is_some()) {
+        return Err(invalid("Cannot set and reset the same rich-text attribute in one operation"));
+    }
+    Ok(TextStylePatch { bold, color, size, font_family, reset_color, reset_size, reset_font_family })
 }
 
 fn require_confirmation(args: &Map<String, Value>, purpose: &str) -> Result<(), String> {
@@ -636,8 +720,10 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
                 if note.body.len() + separator.len() + text.len() > MAX_BODY_BYTES {
                     return Err(invalid("Resulting note body exceeds 1 MiB"));
                 }
-                note.body.push_str(separator);
-                note.body.push_str(text);
+                let mut edited = note.body.clone();
+                edited.push_str(separator);
+                edited.push_str(text);
+                note.set_body_preserving_format(edited).map_err(|error| error.to_string())?;
                 note.touch();
                 Ok(json!({"id":note.id,"title":note.title,"body":note.body,"stroke_count":note.strokes.len()}))
             })
@@ -654,7 +740,7 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
                 let index = find_note_index(workspace, by_title, &key)?;
                 let note = &mut workspace.notes[index];
                 if let Some(title) = title { note.title = title.into(); }
-                if let Some(body) = body { note.body = body.into(); }
+                if let Some(body) = body { note.set_body_preserving_format(body.to_string()).map_err(|error| error.to_string())?; }
                 note.touch();
                 serde_json::to_value(note).map_err(|e| e.to_string())
             })
@@ -900,6 +986,87 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
             Ok(json!({"version":workspace.version,"notes_count":workspace.notes.len(),
                 "active_id":workspace.active_id,"storage_file":store.data_path().display().to_string()}))
         }
+        "get_app_settings" => {
+            object_args(args, &[])?;
+            let settings = UiSettings::load(store.data_path()).map_err(|e| e.to_string())?;
+            serde_json::to_value(settings).map_err(|e| e.to_string())
+        }
+        "set_app_theme" => {
+            let args = object_args(args, &["theme"])?;
+            let theme = required_string(args, "theme")?;
+            if !["light", "dark", "system"].contains(&theme) {
+                return Err(invalid("theme must be light, dark or system"));
+            }
+            let appearance = serde_json::from_value::<AppearanceTheme>(json!(theme))
+                .map_err(|e| format!("Invalid theme: {e}"))?;
+            let updated = UiSettings::update(store.data_path(), |settings| settings.theme = appearance)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(updated).map_err(|e| e.to_string())
+        }
+        "set_sidebar_collapsed" => {
+            let args = object_args(args, &["collapsed"])?;
+            let collapsed = required_bool(args, "collapsed")?;
+            let updated = UiSettings::update(store.data_path(), |settings| settings.sidebar_collapsed = collapsed)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(updated).map_err(|e| e.to_string())
+        }
+        "get_note_formatting" => {
+            let args = object_args(args, &["id","title"])?;
+            let (by_title, key) = selector(args, "title")?;
+            let workspace = load(store)?;
+            let index = find_note_index(&workspace, by_title, &key)?;
+            let note = &workspace.notes[index];
+            note.validate_rich_text().map_err(|e| e.to_string())?;
+            Ok(json!({"id":note.id,"title":note.title,"unit":"unicode_scalar",
+                "length":note.body.chars().count(),"runs":note.rich_text,
+                "supported_attributes":["bold","color","size","font_family"]}))
+        }
+        "format_text_range" => {
+            let args = object_args(args, &["id","title","start","end","unit","bold","color",
+                "size","font_family","reset_color","reset_size","reset_font_family"])?;
+            let (by_title, key) = selector(args, "title")?;
+            let (start, end) = scalar_range(args, false)?;
+            let patch = rich_style_patch(args)?;
+            mutate(store, |workspace| {
+                let index = find_note_index(workspace, by_title, &key)?;
+                let note = &mut workspace.notes[index];
+                note.format_text_range(start, end, patch).map_err(|e| e.to_string())?;
+                note.touch();
+                Ok(json!({"id":note.id,"unit":"unicode_scalar","start":start,"end":end,
+                    "length":note.body.chars().count(),"runs":note.rich_text}))
+            })
+        }
+        "clear_text_formatting" => {
+            let args = object_args(args, &["id","title","start","end","unit"])?;
+            let (by_title, key) = selector(args, "title")?;
+            let (start, end) = scalar_range(args, false)?;
+            let clear = TextStylePatch { bold:Some(false), reset_color:true, reset_size:true,
+                reset_font_family:true, ..Default::default() };
+            mutate(store, |workspace| {
+                let index = find_note_index(workspace, by_title, &key)?;
+                let note = &mut workspace.notes[index];
+                note.format_text_range(start, end, clear).map_err(|e| e.to_string())?;
+                note.touch();
+                Ok(json!({"id":note.id,"unit":"unicode_scalar","start":start,"end":end,
+                    "length":note.body.chars().count(),"runs":note.rich_text}))
+            })
+        }
+        "replace_text_range" => {
+            let args = object_args(args, &["id","title","start","end","unit","text"])?;
+            let (by_title, key) = selector(args, "title")?;
+            let (start, end) = scalar_range(args, true)?;
+            let text = required_string(args, "text")?;
+            validate_body(text)?;
+            mutate(store, |workspace| {
+                let index = find_note_index(workspace, by_title, &key)?;
+                let note = &mut workspace.notes[index];
+                note.replace_text_range(start, end, text).map_err(|e| e.to_string())?;
+                validate_body(&note.body)?;
+                note.touch();
+                Ok(json!({"id":note.id,"title":note.title,"unit":"unicode_scalar",
+                    "length":note.body.chars().count(),"body":note.body,"runs":note.rich_text}))
+            })
+        }
         _ => Err(format!("Unknown tool '{name}'")),
     }
 }
@@ -971,8 +1138,25 @@ fn run_cli(store: &Store, args: &[String]) -> io::Result<()> {
         "clear-strokes" if args.len() == 3 && args[2] == "--confirm" => execute_tool(store, "clear_strokes", &json!({"id":args[1],"confirm":true})),
         "delete" if args.len() == 3 && args[2] == "--confirm" => get(1).and_then(|id| execute_tool(store, "delete_note", &json!({"id":id,"confirm":true}))),
         "info" if args.len() == 1 => execute_tool(store, "get_workspace_info", &json!({})),
+        "settings" if args.len() == 1 => execute_tool(store, "get_app_settings", &json!({})),
+        "theme" if args.len() == 2 => execute_tool(store, "set_app_theme", &json!({"theme":args[1]})),
+        "sidebar" if args.len() == 2 => match args[1].as_str() {
+            "true" | "collapsed" => execute_tool(store, "set_sidebar_collapsed", &json!({"collapsed":true})),
+            "false" | "expanded" => execute_tool(store, "set_sidebar_collapsed", &json!({"collapsed":false})),
+            _ => Err(invalid("sidebar must be true/false or collapsed/expanded")),
+        },
+        "formatting" if args.len() == 2 => execute_tool(store, "get_note_formatting", &json!({"id":args[1]})),
+        "format-range" if args.len() >= 5 => cli_range_args(args, true)
+            .and_then(|values| execute_tool(store, "format_text_range", &Value::Object(values))),
+        "clear-format" if args.len() == 4 => cli_range_args(args, false)
+            .and_then(|values| execute_tool(store, "clear_text_formatting", &Value::Object(values))),
+        "replace-range" if args.len() >= 5 => cli_range_args(args, false)
+            .and_then(|mut values| {
+                values.insert("text".into(), json!(args[4..].join(" ")));
+                execute_tool(store, "replace_text_range", &Value::Object(values))
+            }),
         "--help" | "-h" | "help" => {
-            println!("Inkpad headless agent\n\nMCP stdio: inkpad-agent.exe [mcp]\nCLI:\n  list | search TEXT | get ID | info | active | activate ID\n  create [--title TITLE] [--body TEXT] | append ID TEXT | update ID [--title TITLE] [--body TEXT]\n  rename ID NEW_TITLE | pin ID | unpin ID | font-size ID 12..40 | font-choice ID Sans|Serif|Mono\n  export-text ID ABS_PATH.txt | export-png ID ABS_PATH.png\n  add-stroke ID WIDTH COLOR X,Y [X,Y ...] [--eraser]\n  add-stroke ID @ABS_PATH.json  (PowerShell-friendly file-backed JSON)\n  undo-stroke ID --confirm | clear-strokes ID --confirm | delete ID --confirm\n  add-image ID ABS_IMAGE_PATH --approved\n  add-image-base64 ID @ABS_PATH.b64 --approved (max 1 MiB decoded)\n  images ID | image-width ID IMAGE_ID 10..100 | image-move ID IMAGE_ID POSITION\n  image-caption ID IMAGE_ID TEXT | image-delete ID IMAGE_ID --confirm\n  export-html ID ABS_PATH.html --approved (self-contained)\n  read-image ID IMAGE_ID --approved (max 1 MiB)\n  export-image ID IMAGE_ID ABS_PATH.png --approved\n\nSource files require explicit user approval; destructive actions require explicit user authorization.\nStorage: %LOCALAPPDATA%\\Inkpad\\workspace.json (override with INKPAD_DATA_DIR)\nGUI Text/Draw view mode is transient, not a stored setting.");
+            println!("Inkpad headless agent\n\nMCP stdio: inkpad-agent.exe [mcp]\nCLI:\n  list | search TEXT | get ID | info | active | activate ID\n  create [--title TITLE] [--body TEXT] | append ID TEXT | update ID [--title TITLE] [--body TEXT]\n  rename ID NEW_TITLE | pin ID | unpin ID | font-size ID 12..40 | font-choice ID Sans|Serif|Mono\n  export-text ID ABS_PATH.txt | export-png ID ABS_PATH.png\n  add-stroke ID WIDTH COLOR X,Y [X,Y ...] [--eraser]\n  add-stroke ID @ABS_PATH.json  (PowerShell-friendly file-backed JSON)\n  undo-stroke ID --confirm | clear-strokes ID --confirm | delete ID --confirm\n  add-image ID ABS_IMAGE_PATH --approved\n  add-image-base64 ID @ABS_PATH.b64 --approved (max 1 MiB decoded)\n  images ID | image-width ID IMAGE_ID 10..100 | image-move ID IMAGE_ID POSITION\n  image-caption ID IMAGE_ID TEXT | image-delete ID IMAGE_ID --confirm\n  export-html ID ABS_PATH.html --approved (self-contained)\n  read-image ID IMAGE_ID --approved (max 1 MiB)\n  export-image ID IMAGE_ID ABS_PATH.png --approved\n  settings | theme light|dark|system | sidebar collapsed|expanded\n  formatting ID | format-range ID START END [--bold true|false] [--color #RRGGBB] [--size 12..40] [--family Sans|Serif|Mono] [--reset-color] [--reset-size] [--reset-family]\n  clear-format ID START END | replace-range ID START END TEXT\n  (START/END are half-open Unicode scalar offsets; no italic/underline/background)\n\nSource files require explicit user approval; destructive actions require explicit user authorization.\nStorage: %LOCALAPPDATA%\\Inkpad\\workspace.json (override with INKPAD_DATA_DIR)\nGUI Text/Draw view mode is transient, not a stored setting.");
             return Ok(());
         }
         _ => Err(invalid("Invalid command; run inkpad-agent --help for usage")),
@@ -1064,7 +1248,7 @@ mod tests {
         let responses: Vec<Value> = String::from_utf8(output).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(responses.len(), 4);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 28);
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 35);
         assert_eq!(responses[2]["result"]["structuredContent"]["title"], "From MCP");
         assert_eq!(responses[3]["result"]["isError"], true);
         std::fs::remove_dir_all(folder).unwrap();
@@ -1459,5 +1643,84 @@ mod tests {
         assert!(large.unwrap_err().contains("export_image"));
         std::fs::remove_dir_all(folder).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn agent_appearance_and_sidebar_preferences_use_shared_settings_lock() {
+        let (store, folder) = store();
+        let initial = tool(&store, "get_app_settings", json!({}));
+        assert_eq!(initial["theme"], "light");
+        assert_eq!(initial["sidebar_collapsed"], false);
+        let updated = tool(&store, "set_app_theme", json!({"theme":"dark"}));
+        assert_eq!(updated["theme"], "dark");
+        assert_eq!(updated["sidebar_collapsed"], false);
+        let toggled = tool(&store, "set_sidebar_collapsed", json!({"collapsed":true}));
+        assert_eq!(toggled["theme"], "dark");
+        assert_eq!(toggled["sidebar_collapsed"], true);
+        let settings = UiSettings::load(store.data_path()).unwrap();
+        assert_eq!(settings.theme, AppearanceTheme::Dark);
+        assert!(settings.sidebar_collapsed);
+        assert_eq!(tool(&store, "set_app_theme", json!({"theme":"system"}))["theme"], "system");
+        assert_eq!(tool(&store, "set_app_theme", json!({"theme":"light"}))["theme"], "light");
+        assert!(execute_tool(&store, "set_app_theme", &json!({"theme":"navy"})).is_err());
+        assert!(execute_tool(&store, "set_app_theme", &json!({"theme":true})).is_err());
+        assert!(execute_tool(&store, "set_sidebar_collapsed", &json!({"collapsed":"false"})).is_err());
+        assert_eq!(tool(&store, "get_app_settings", json!({}))["sidebar_collapsed"], true);
+        assert!(!store.data_path().exists(), "UI settings changes must not create/modify note data");
+        assert!(UiSettings::path_for(store.data_path()).exists());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn rich_unicode_range_format_replace_clear_and_legacy_edits_preserve_spans() {
+        let (store, folder) = store();
+        let note = tool(&store, "create_note", json!({"title":"Unicode styles","body":"A👩‍🚀e\u{301}猫Z"}));
+        let id = note["id"].as_str().unwrap();
+        let requested = json!({"id":id,"unit":"unicode_scalar","start":1,"end":7,
+            "bold":true,"color":"#AA33ff","size":24,"font_family":"Serif"});
+        let updated = tool(&store, "format_text_range", requested);
+        assert_eq!(updated["runs"][0]["start"], 1);
+        assert_eq!(updated["runs"][0]["end"], 7);
+        assert_eq!(updated["runs"][0]["style"]["bold"], true);
+        assert_eq!(updated["runs"][0]["style"]["size"], 24);
+        let format = tool(&store, "get_note_formatting", json!({"id":id}));
+        assert_eq!(format["unit"], "unicode_scalar");
+        assert_eq!(format["length"], 8);
+
+        let replaced = tool(&store, "replace_text_range", json!({"id":id,"unit":"unicode_scalar",
+            "start":4,"end":6,"text":"é"}));
+        assert_eq!(replaced["body"], "A👩‍🚀é猫Z");
+        assert_eq!(replaced["runs"][0]["end"], 6);
+        let cleared = tool(&store, "clear_text_formatting", json!({"id":id,"unit":"unicode_scalar",
+            "start":1,"end":3}));
+        assert_eq!(cleared["runs"][0]["start"], 3);
+        assert_eq!(cleared["runs"][0]["end"], 6);
+        let appended = tool(&store, "append_to_note", json!({"id":id,"text":"tail"}));
+        assert_eq!(appended["body"], "A👩‍🚀é猫Z\ntail");
+        let after_append = tool(&store, "get_note_formatting", json!({"id":id}));
+        assert_eq!(after_append["runs"][0]["start"], 3);
+        assert_eq!(after_append["runs"][0]["end"], 6);
+        let body = tool(&store, "read_note", json!({"id":id}))["body"].as_str().unwrap().replace('Z', "Ω");
+        let revised = tool(&store, "update_note", json!({"id":id,"body":body}));
+        assert_eq!(revised["rich_text"][0]["start"], 3);
+        assert_eq!(revised["rich_text"][0]["end"], 6);
+        assert!(execute_tool(&store, "format_text_range", &json!({"id":id,"unit":"unicode_scalar",
+            "start":1,"end":1,"bold":true})).is_err());
+        for malformed in [
+            json!({"id":id,"unit":"byte","start":1,"end":2,"bold":true}),
+            json!({"id":id,"unit":"unicode_scalar","start":1,"end":99,"bold":true}),
+            json!({"id":id,"unit":"unicode_scalar","start":1,"end":2,"color":"red"}),
+            json!({"id":id,"unit":"unicode_scalar","start":1,"end":2,"size":50}),
+            json!({"id":id,"unit":"unicode_scalar","start":1,"end":2,"font_family":"Comic Sans"}),
+            json!({"id":id,"unit":"unicode_scalar","start":1,"end":2,"color":"#AABBCC","reset_color":true}),
+            json!({"id":id,"unit":"unicode_scalar","start":1,"end":2,"italic":true}),
+            json!({"id":id,"unit":"unicode_scalar","start":1,"end":2}),
+        ] {
+            assert!(execute_tool(&store, "format_text_range", &malformed).is_err(), "Accepted {malformed}");
+        }
+        let final_note = tool(&store, "read_note", json!({"id":id}));
+        assert_eq!(final_note["rich_text"][0]["start"], 3);
+        assert_eq!(final_note["rich_text"][0]["end"], 6);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 }
