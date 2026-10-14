@@ -46,10 +46,13 @@ The binary emits JSON to standard output. From PowerShell:
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' format-range NOTE_ID 0 5 --bold true --color '#AA3377' --size 22 --family Serif
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' clear-format NOTE_ID 0 5
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' replace-range NOTE_ID 0 5 'New text'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' format-batch NOTE_ID '@D:\Notes\format-operations.json'
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' copy-fragment NOTE_ID 1 7
+& 'D:\chat\inkpad\target\release\inkpad-agent.exe' paste-fragment NOTE_ID 5 5 '@D:\Notes\rich-fragment.json'
 & 'D:\chat\inkpad\target\release\inkpad-agent.exe' export-html NOTE_ID 'D:\Notes\complete.html' --approved
 ```
 
-If no command tool is available, connect the Inkpad MCP stdio server as documented in `D:\chat\inkpad\AGENTS.md`. Its **35 MCP tools** include the original 28 note, drawing, image and export functions, plus durable `get_app_settings`, `set_app_theme`, `set_sidebar_collapsed`, `get_note_formatting`, `format_text_range`, `clear_text_formatting` and `replace_text_range`. For full stroke JSON in Windows PowerShell 5.1, prefer `add-stroke NOTE_ID @D:\Notes\stroke.json` (use a string variable) or the numeric point syntax detailed in AGENTS.md.
+If no command tool is available, connect the Inkpad MCP stdio server as documented in `D:\chat\inkpad\AGENTS.md`. Its **38 MCP tools** preserve the previous 35 note, drawing, image, settings and rich-text functions and add `format_text_batch`, `copy_rich_fragment` and `paste_rich_fragment`. For full stroke JSON in Windows PowerShell 5.1, prefer `add-stroke NOTE_ID @D:\Notes\stroke.json` (use a string variable) or the numeric point syntax detailed in AGENTS.md.
 
 ## Adding and managing pictures
 
@@ -69,6 +72,9 @@ If no command tool is available, connect the Inkpad MCP stdio server as document
 - For a user-requested appearance change, read `get_app_settings` first as needed; use `set_app_theme` (`light`, `dark`, or `system`) or `set_sidebar_collapsed` for persisted preferences. These commands do not control which transient editor panel is visible and do not edit notes.
 - For **"make these words bold / change their colour / font"**, first read the note body and formatting; count Unicode **scalar** positions (`str::chars()`, not byte/UTF-16/grapheme offsets) and call `format_text_range` with half-open `[start,end)` and `unit:"unicode_scalar"`. Use `get_note_formatting` to verify. Only bold, foreground `#RRGGBB`, size 12–40 and font family Sans/Serif/Mono are supported. Never claim italic, underline or highlight/background colour support.
 - For **"remove this formatting"**, use `clear_text_formatting`; for a precise replacement, use `replace_text_range`, which keeps surrounding styles. `append_to_note` / `update_note` also preserve span data. Selection/caret and temporary GUI view modes are not remotely changed by headless operations.
+- For **multi-range formatting**, use `format_text_batch` with 1–32 ordered operations and `expected_body` to detect stale document text; the entire batch commits or none does. New operations use **UAX extended grapheme-safe** selection by default, even though offsets remain Unicode scalar indices; specify `boundary_policy:"scalar"` only for deliberate partial grapheme edits.
+- For **"copy these formatted words"**, call `copy_rich_fragment` on the exact selected Unicode range; it returns styled JSON (text, relative runs, source font defaults) to the AI/client. For **"paste the copied rich text here"**, pass that returned JSON to `paste_rich_fragment`, preferably with `expected_text` matching the selected target. Neither tool accesses the operating-system clipboard. The fragment text must be at most 256 KiB and the style runs must be valid/canonical.
+- The desktop's rich-text undo/redo history is bounded **session memory only**. It is not saved to the notebook, so do **not** claim durable undo/redo or call a non-existent MCP undo/redo tool. `undo_last_stroke` remains a different, explicitly confirmed action for drawing strokes only.
 - For picture inserts, size, order, caption and removals, use the image MCP tools or matching CLI commands. Note title/body changes must preserve the `images` collection and other unsupplied fields.
 - Never manipulate files inside Inkpad's data folder directly; always use the headless CLI or MCP tools so concurrent changes are coordinated safely.
 - **Never delete a note or picture, clear drawings or undo a saved stroke** unless the user specifically requests it. These destructive actions require `--confirm` (CLI) or `confirm:true` (MCP).

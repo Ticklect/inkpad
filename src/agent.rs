@@ -3,8 +3,9 @@
 
 use crate::canvas::{Board, HEIGHT, WIDTH};
 use crate::settings::{AppearanceTheme, UiSettings};
-use crate::store::{Note, Store, Stroke, TextStylePatch, Workspace};
+use crate::store::{Note, Store, Stroke, TextRun, TextStylePatch, Workspace};
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Write};
@@ -21,6 +22,29 @@ const MAX_STROKE_JSON_BYTES: usize = 128 * 1024;
 const MAX_IMAGE_FILE_BYTES: u64 = 12 * 1024 * 1024;
 const MAX_IMAGE_BASE64_BYTES: usize = 1024 * 1024;
 const MAX_IMAGE_CAPTION_CHARS: usize = 500;
+const MAX_BATCH_FORMAT_OPS: usize = 32;
+const MAX_FRAGMENT_TEXT_BYTES: usize = 256 * 1024;
+const MAX_FRAGMENT_RUNS: usize = 2048;
+
+/// In-memory rich fragment for a client-owned clipboard. Never reads or writes
+/// the OS clipboard and never stores an undo history beside the workspace.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RichFragment {
+    format_version: u8,
+    unit: String,
+    text: String,
+    runs: Vec<TextRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    defaults: Option<FragmentDefaults>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FragmentDefaults {
+    size: i32,
+    font_family: String,
+}
 
 /// Local image paths are access to files outside Inkpad; the MCP client must
 /// attest that the user explicitly selected the file. This is not a technical
@@ -352,6 +376,9 @@ fn tool_definitions() -> Vec<Value> {
         json!({"name":"format_text_range","description":"Apply one or more attributes to [start,end) Unicode scalar indices in a note body; all unspecified attributes remain unchanged. Supported: bold boolean, color #RRGGBB, size 12-40, font_family Sans/Serif/Mono, and reset_color/reset_size/reset_font_family booleans. Explicit unit='unicode_scalar' required; rejects invalid/overlapping ranges atomically. No GUI focus required.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":1},"unit":{"type":"string","const":"unicode_scalar"},"bold":{"type":"boolean"},"color":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"},"size":{"type":"integer","minimum":12,"maximum":40},"font_family":{"type":"string","enum":["Sans","Serif","Mono"]},"reset_color":{"type":"boolean"},"reset_size":{"type":"boolean"},"reset_font_family":{"type":"boolean"}},"required":["start","end","unit"],"additionalProperties":false}}),
         json!({"name":"clear_text_formatting","description":"Clear all supported rich-text overrides on [start,end) Unicode scalar indices, leaving body text and other runs untouched. Explicit unit='unicode_scalar' required.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":1},"unit":{"type":"string","const":"unicode_scalar"}},"required":["start","end","unit"],"additionalProperties":false}}),
         json!({"name":"replace_text_range","description":"Replace [start,end) characters in saved note body using Unicode scalar indices; start=end inserts, empty text deletes selection. Preserves and rebases formatting outside the edit, including emoji/combining marks. Explicit unit='unicode_scalar' required; max body 1 MiB. Edits note text, not transient GUI caret/selection.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0},"unit":{"type":"string","const":"unicode_scalar"},"text":{"type":"string"}},"required":["start","end","unit","text"],"additionalProperties":false}}),
+        json!({"name":"format_text_batch","description":"Atomically apply 1–32 ordered rich-text style patches in ONE cross-process transaction. Each operation uses [start,end) Unicode scalar offsets; overlaps are applied sequentially. By default grapheme_safe rejects splitting combining marks or emoji clusters; boundary_policy=scalar opts into exact scalar boundaries. Optional expected_body must match the complete current note body before any change, guarding against stale offsets. Preserves all other note content.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"unit":{"type":"string","const":"unicode_scalar"},"boundary_policy":{"type":"string","enum":["grapheme_safe","scalar"]},"expected_body":{"type":"string"},"operations":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":1},"bold":{"type":"boolean"},"color":{"type":"string","pattern":"^#[0-9a-fA-F]{6}$"},"size":{"type":"integer","minimum":12,"maximum":40},"font_family":{"type":"string","enum":["Sans","Serif","Mono"]},"reset_color":{"type":"boolean"},"reset_size":{"type":"boolean"},"reset_font_family":{"type":"boolean"}},"required":["start","end"],"additionalProperties":false}}},"required":["unit","operations"],"additionalProperties":false}}),
+        json!({"name":"copy_rich_fragment","description":"Return a user-selected styled text fragment as structured JSON with relative Unicode scalar runs and source font defaults; never reads/writes the system clipboard or files. Requires note ID/unique title and scalar [start,end) offsets. Default grapheme_safe prevents splitting emoji/combining clusters; boundary_policy=scalar opts into scalar-level selection. Max selected text 256 KiB.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"unit":{"type":"string","const":"unicode_scalar"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0},"boundary_policy":{"type":"string","enum":["grapheme_safe","scalar"]}},"required":["unit","start","end"],"additionalProperties":false}}),
+        json!({"name":"paste_rich_fragment","description":"Insert/replace a note selection with a previously returned rich fragment, without accessing OS clipboard. Reapplies validated bold, color, font and sizes, preserves unaffected text/styles, and commits atomically under Store lock. Fragment format_version=1, unit=unicode_scalar, text up to 256 KiB, up to 2048 canonical styled runs. Optional expected_text ensures the exact destination selection has not changed. Default grapheme_safe boundary validation; no durable text undo/redo is implied.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"unit":{"type":"string","const":"unicode_scalar"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0},"boundary_policy":{"type":"string","enum":["grapheme_safe","scalar"]},"expected_text":{"type":"string"},"fragment":{"type":"object","properties":{"format_version":{"type":"integer","const":1},"unit":{"type":"string","const":"unicode_scalar"},"text":{"type":"string"},"runs":{"type":"array"},"defaults":{"type":"object","properties":{"size":{"type":"integer","minimum":12,"maximum":40},"font_family":{"type":"string","enum":["Sans","Serif","Mono"]}},"required":["size","font_family"],"additionalProperties":false}},"required":["format_version","unit","text","runs"],"additionalProperties":false}},"required":["unit","start","end","fragment"],"additionalProperties":false}}),
     ]
 }
 
@@ -531,6 +558,116 @@ fn rich_style_patch(args: &Map<String, Value>) -> Result<TextStylePatch, String>
     Ok(TextStylePatch { bold, color, size, font_family, reset_color, reset_size, reset_font_family })
 }
 
+/// New operations default to extended grapheme safety, unlike the legacy
+/// scalar-range tools whose behavior must remain backwards compatible.
+/// Both modes use exact Rust Unicode-scalar offsets for storage.
+fn boundary_policy(args: &Map<String, Value>) -> Result<bool, String> {
+    match optional_string(args, "boundary_policy")? {
+        None | Some("grapheme_safe") => Ok(true),
+        Some("scalar") => Ok(false),
+        _ => Err(invalid("boundary_policy must be grapheme_safe or scalar")),
+    }
+}
+
+fn check_grapheme_boundaries(body: &str, start: usize, end: usize, check: bool) -> Result<(), String> {
+    if !check { return Ok(()); }
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut current = 0usize;
+    let mut start_ok = start == 0;
+    let mut end_ok = end == 0;
+    for grapheme in body.graphemes(true) {
+        current += grapheme.chars().count();
+        if current == start { start_ok = true; }
+        if current == end { end_ok = true; }
+    }
+    if start_ok && end_ok { Ok(()) }
+    else { Err(invalid("Selection splits a Unicode grapheme (combining mark, emoji sequence or cluster); use whole grapheme boundaries or explicit boundary_policy:scalar")) }
+}
+
+fn scalar_slice(body: &str, start: usize, end: usize) -> Result<&str, String> {
+    if start > end { return Err(invalid("start must not exceed end")); }
+    let to_byte = |offset: usize| -> Option<usize> {
+        body.char_indices().map(|(i, _)| i).chain(std::iter::once(body.len())).nth(offset)
+    };
+    let begin = to_byte(start).ok_or_else(|| invalid("start is outside the note's Unicode scalar range"))?;
+    let finish = to_byte(end).ok_or_else(|| invalid("end is outside the note's Unicode scalar range"))?;
+    Ok(&body[begin..finish])
+}
+
+fn validate_fragment(fragment: &RichFragment) -> Result<(), String> {
+    if fragment.format_version != 1 || fragment.unit != "unicode_scalar" {
+        return Err(invalid("Rich fragment requires format_version:1 and unit:unicode_scalar"));
+    }
+    if fragment.text.len() > MAX_FRAGMENT_TEXT_BYTES || fragment.runs.len() > MAX_FRAGMENT_RUNS {
+        return Err(invalid("Rich fragment exceeds the 256 KiB text or 2048 run limit"));
+    }
+    validate_body(&fragment.text)?;
+    crate::store::rich_text::validate_runs(&fragment.text, &fragment.runs)?;
+    if let Some(defaults) = &fragment.defaults {
+        if !(12..=40).contains(&defaults.size)
+            || !matches!(defaults.font_family.as_str(), "Sans" | "Serif" | "Mono") {
+            return Err(invalid("Rich fragment defaults must have size 12..40 and font_family Sans/Serif/Mono"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_fragment(input: &Value) -> Result<RichFragment, String> {
+    // The desktop editor's clipboard uses {version,text,runs}. Accept that
+    // versioned interchange format as well as our richer MCP wrapper, so a
+    // client can pass a GUI-created fragment without ever reading OS clipboard.
+    if input.get("version").is_some() && input.get("format_version").is_none() {
+        let native: crate::store::rich_text::StyledFragment =
+            serde_json::from_value(input.clone())
+                .map_err(|error| format!("Invalid Inkpad styled fragment: {error}"))?;
+        native.validate()?;
+        let fragment = RichFragment {
+            format_version:native.version, unit:"unicode_scalar".into(),
+            text:native.text, runs:native.runs,
+            defaults:native.defaults.map(|defaults| FragmentDefaults {
+                size:defaults.size, font_family:defaults.font_family
+            })
+        };
+        validate_fragment(&fragment)?;
+        return Ok(fragment);
+    }
+    let fragment: RichFragment = serde_json::from_value(input.clone())
+        .map_err(|error| format!("Invalid rich fragment schema: {error}"))?;
+    validate_fragment(&fragment)?;
+    Ok(fragment)
+}
+
+fn build_fragment(note: &Note, start: usize, end: usize) -> Result<RichFragment, String> {
+    let native = note.copy_styled_range(start, end)?;
+    let text = native.text;
+    if text.len() > MAX_FRAGMENT_TEXT_BYTES {
+        return Err(invalid("Selected fragment exceeds 256 KiB; choose a smaller range"));
+    }
+    let fragment = RichFragment {
+        format_version:native.version, unit:"unicode_scalar".into(), text, runs:native.runs,
+        defaults:Some(FragmentDefaults {size:note.font_size, font_family:note.font_choice.clone()})
+    };
+    validate_fragment(&fragment)?;
+    Ok(fragment)
+}
+
+fn paste_fragment(note: &mut Note, start: usize, end: usize, fragment: &RichFragment) -> Result<(), String> {
+    validate_fragment(fragment)?;
+    // Delegate to the SAME validated implementation used by the desktop
+    // editor: this copies gaps, explicit runs and inherited source font
+    // defaults in one pass rather than repeatedly formatting a large note.
+    let native = crate::store::rich_text::StyledFragment {
+        version:fragment.format_version,
+        text:fragment.text.clone(),
+        runs:fragment.runs.clone(),
+        defaults:fragment.defaults.as_ref().map(|defaults| crate::store::rich_text::FragmentDefaults {
+            size:defaults.size, font_family:defaults.font_family.clone()
+        }),
+    };
+    note.paste_styled_range(start, end, &native)?;
+    Ok(())
+}
+
 fn require_confirmation(args: &Map<String, Value>, purpose: &str) -> Result<(), String> {
     if args.get("confirm") == Some(&Value::Bool(true)) { Ok(()) }
     else { Err(format!("{purpose} requires the user's explicit authorization and confirm:true")) }
@@ -614,6 +751,29 @@ fn cli_stroke_json(value: &str) -> Result<Value, String> {
         serde_json::from_slice(payload).map_err(|e| format!("Invalid stroke JSON file: {e}"))
     } else {
         serde_json::from_str(value).map_err(|e| format!("Invalid JSON stroke: {e}"))
+    }
+}
+
+/// CLI JSON input is always an explicit argument, never OS clipboard content.
+/// File-backed input avoids Windows PowerShell's native JSON quoting hazards.
+fn cli_rich_json(value: &str) -> Result<Value, String> {
+    if let Some(filepath) = value.strip_prefix('@') {
+        let path = Path::new(filepath);
+        if !path.is_absolute()
+            || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+            || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
+            return Err(invalid("Rich JSON input must be an absolute .json path without traversal"));
+        }
+        let mut bytes = Vec::new();
+        OpenOptions::new().read(true).open(path).map_err(|e| e.to_string())?
+            .take((512 * 1024 + 1) as u64).read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 512 * 1024 { return Err(invalid("Rich JSON must be at most 512 KiB")); }
+        let bytes = bytes.strip_prefix(&[0xEF,0xBB,0xBF]).unwrap_or(&bytes);
+        serde_json::from_slice(bytes).map_err(|e| format!("Invalid rich JSON file: {e}"))
+    } else {
+        if value.len() > 512 * 1024 { return Err(invalid("Rich JSON must be at most 512 KiB")); }
+        serde_json::from_str(value).map_err(|e| format!("Invalid rich JSON: {e}"))
     }
 }
 
@@ -1067,6 +1227,83 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
                     "length":note.body.chars().count(),"body":note.body,"runs":note.rich_text}))
             })
         }
+        "format_text_batch" => {
+            let args = object_args(args, &["id","title","unit","boundary_policy","expected_body","operations"])?;
+            if required_string(args, "unit")? != "unicode_scalar" {
+                return Err(invalid("unit must be unicode_scalar"));
+            }
+            let grapheme_safe = boundary_policy(args)?;
+            let (by_title, key) = selector(args, "title")?;
+            let expected_body = optional_string(args, "expected_body")?.map(str::to_owned);
+            let ops = args.get("operations").and_then(Value::as_array)
+                .filter(|ops| !ops.is_empty() && ops.len() <= MAX_BATCH_FORMAT_OPS)
+                .ok_or_else(|| invalid("operations must have 1 to 32 patches"))?;
+            let mut parsed = Vec::with_capacity(ops.len());
+            for (i, op) in ops.iter().enumerate() {
+                let fields = object_args(op, &["start","end","bold","color","size",
+                    "font_family","reset_color","reset_size","reset_font_family"])
+                    .map_err(|error| format!("operations[{i}]: {error}"))?;
+                let start = fields.get("start").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| format!("operations[{i}].start must be nonnegative integer"))?;
+                let end = fields.get("end").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| format!("operations[{i}].end must be nonnegative integer"))?;
+                if start >= end { return Err(format!("operations[{i}] requires start < end")); }
+                parsed.push((start, end, rich_style_patch(fields)
+                    .map_err(|error| format!("operations[{i}]: {error}"))?));
+            }
+            mutate(store, |workspace| {
+                let index = find_note_index(workspace, by_title, &key)?;
+                let note = &mut workspace.notes[index];
+                if expected_body.as_deref().is_some_and(|body| body != note.body) {
+                    return Err(invalid("Note body changed since expected_body; refresh before applying batch"));
+                }
+                for (start, end, _) in &parsed {
+                    check_grapheme_boundaries(&note.body, *start, *end, grapheme_safe)?;
+                }
+                for (start, end, patch) in parsed {
+                    note.format_text_range(start, end, patch)?;
+                }
+                Ok(json!({"id":note.id,"unit":"unicode_scalar","applied":ops.len(),
+                    "length":note.body.chars().count(),"runs":note.rich_text}))
+            })
+        }
+        "copy_rich_fragment" => {
+            let args = object_args(args, &["id","title","unit","start","end","boundary_policy"])?;
+            let (start, end) = scalar_range(args, true)?;
+            let grapheme_safe = boundary_policy(args)?;
+            let (by_title, key) = selector(args, "title")?;
+            let workspace = load(store)?;
+            let index = find_note_index(&workspace, by_title, &key)?;
+            let note = &workspace.notes[index];
+            check_grapheme_boundaries(&note.body, start, end, grapheme_safe)?;
+            serde_json::to_value(build_fragment(note, start, end)?).map_err(|e| e.to_string())
+        }
+        "paste_rich_fragment" => {
+            let args = object_args(args, &["id","title","unit","start","end",
+                "boundary_policy","expected_text","fragment"])?;
+            let (start, end) = scalar_range(args, true)?;
+            let grapheme_safe = boundary_policy(args)?;
+            let (by_title, key) = selector(args, "title")?;
+            let expected = optional_string(args, "expected_text")?.map(str::to_owned);
+            let fragment = parse_fragment(args.get("fragment")
+                .ok_or_else(|| invalid("fragment is required"))?)?;
+            mutate(store, |workspace| {
+                let index = find_note_index(workspace, by_title, &key)?;
+                let note = &mut workspace.notes[index];
+                check_grapheme_boundaries(&note.body, start, end, grapheme_safe)?;
+                if expected.as_deref().is_some_and(|original| scalar_slice(&note.body,start,end).ok() != Some(original)) {
+                    return Err(invalid("Destination selection changed since expected_text; refresh before pasting"));
+                }
+                let final_bytes = note.body.len()
+                    .saturating_sub(scalar_slice(&note.body,start,end)?.len())
+                    .saturating_add(fragment.text.len());
+                if final_bytes > MAX_BODY_BYTES { return Err(invalid("Pasted note would exceed 1 MiB")); }
+                paste_fragment(note, start, end, &fragment)?;
+                Ok(json!({"id":note.id,"unit":"unicode_scalar",
+                    "inserted":fragment.text.chars().count(),
+                    "length":note.body.chars().count(),"runs":note.rich_text}))
+            })
+        }
         _ => Err(format!("Unknown tool '{name}'")),
     }
 }
@@ -1155,8 +1392,30 @@ fn run_cli(store: &Store, args: &[String]) -> io::Result<()> {
                 values.insert("text".into(), json!(args[4..].join(" ")));
                 execute_tool(store, "replace_text_range", &Value::Object(values))
             }),
+        "format-batch" if args.len() == 3 => cli_rich_json(&args[2])
+            .and_then(|value| {
+                let fields = object_args(&value, &["operations","expected_body","boundary_policy"])?;
+                let mut params = fields.clone();
+                params.insert("id".into(), json!(args[1]));
+                params.insert("unit".into(), json!("unicode_scalar"));
+                execute_tool(store, "format_text_batch", &Value::Object(params))
+            }),
+        "copy-fragment" if args.len() == 4 || args.len() == 5 && args[4] == "--scalar" => {
+            cli_range_args(args, false).and_then(|mut fields| {
+                if args.len() == 5 { fields.insert("boundary_policy".into(), json!("scalar")); }
+                execute_tool(store, "copy_rich_fragment", &Value::Object(fields))
+            })
+        },
+        "paste-fragment" if args.len() == 5 || args.len() == 6 && args[5] == "--scalar" => {
+            cli_range_args(args, false).and_then(|mut fields| {
+                if args.len() == 6 { fields.insert("boundary_policy".into(), json!("scalar")); }
+                let fragment = cli_rich_json(&args[4])?;
+                fields.insert("fragment".into(), fragment);
+                execute_tool(store, "paste_rich_fragment", &Value::Object(fields))
+            })
+        },
         "--help" | "-h" | "help" => {
-            println!("Inkpad headless agent\n\nMCP stdio: inkpad-agent.exe [mcp]\nCLI:\n  list | search TEXT | get ID | info | active | activate ID\n  create [--title TITLE] [--body TEXT] | append ID TEXT | update ID [--title TITLE] [--body TEXT]\n  rename ID NEW_TITLE | pin ID | unpin ID | font-size ID 12..40 | font-choice ID Sans|Serif|Mono\n  export-text ID ABS_PATH.txt | export-png ID ABS_PATH.png\n  add-stroke ID WIDTH COLOR X,Y [X,Y ...] [--eraser]\n  add-stroke ID @ABS_PATH.json  (PowerShell-friendly file-backed JSON)\n  undo-stroke ID --confirm | clear-strokes ID --confirm | delete ID --confirm\n  add-image ID ABS_IMAGE_PATH --approved\n  add-image-base64 ID @ABS_PATH.b64 --approved (max 1 MiB decoded)\n  images ID | image-width ID IMAGE_ID 10..100 | image-move ID IMAGE_ID POSITION\n  image-caption ID IMAGE_ID TEXT | image-delete ID IMAGE_ID --confirm\n  export-html ID ABS_PATH.html --approved (self-contained)\n  read-image ID IMAGE_ID --approved (max 1 MiB)\n  export-image ID IMAGE_ID ABS_PATH.png --approved\n  settings | theme light|dark|system | sidebar collapsed|expanded\n  formatting ID | format-range ID START END [--bold true|false] [--color #RRGGBB] [--size 12..40] [--family Sans|Serif|Mono] [--reset-color] [--reset-size] [--reset-family]\n  clear-format ID START END | replace-range ID START END TEXT\n  (START/END are half-open Unicode scalar offsets; no italic/underline/background)\n\nSource files require explicit user approval; destructive actions require explicit user authorization.\nStorage: %LOCALAPPDATA%\\Inkpad\\workspace.json (override with INKPAD_DATA_DIR)\nGUI Text/Draw view mode is transient, not a stored setting.");
+            println!("Inkpad headless agent\n\nMCP stdio: inkpad-agent.exe [mcp]\nCLI:\n  list | search TEXT | get ID | info | active | activate ID\n  create [--title TITLE] [--body TEXT] | append ID TEXT | update ID [--title TITLE] [--body TEXT]\n  rename ID NEW_TITLE | pin ID | unpin ID | font-size ID 12..40 | font-choice ID Sans|Serif|Mono\n  export-text ID ABS_PATH.txt | export-png ID ABS_PATH.png\n  add-stroke ID WIDTH COLOR X,Y [X,Y ...] [--eraser]\n  add-stroke ID @ABS_PATH.json  (PowerShell-friendly file-backed JSON)\n  undo-stroke ID --confirm | clear-strokes ID --confirm | delete ID --confirm\n  add-image ID ABS_IMAGE_PATH --approved\n  add-image-base64 ID @ABS_PATH.b64 --approved (max 1 MiB decoded)\n  images ID | image-width ID IMAGE_ID 10..100 | image-move ID IMAGE_ID POSITION\n  image-caption ID IMAGE_ID TEXT | image-delete ID IMAGE_ID --confirm\n  export-html ID ABS_PATH.html --approved (self-contained)\n  read-image ID IMAGE_ID --approved (max 1 MiB)\n  export-image ID IMAGE_ID ABS_PATH.png --approved\n  settings | theme light|dark|system | sidebar collapsed|expanded\n  formatting ID | format-range ID START END [--bold true|false] [--color #RRGGBB] [--size 12..40] [--family Sans|Serif|Mono] [--reset-color] [--reset-size] [--reset-family]\n  clear-format ID START END | replace-range ID START END TEXT\n  format-batch ID @ABS_PATH.json  (1..32 ordered operations; optional expected_body)\n  copy-fragment ID START END [--scalar] | paste-fragment ID START END @ABS_PATH.json [--scalar]\n  (START/END are Unicode scalar offsets; new fragment/batch tools default to grapheme safe)\n  (No OS clipboard access and no persisted note-text undo/redo history)\n\nSource files require explicit user approval; destructive actions require explicit user authorization.\nStorage: %LOCALAPPDATA%\\Inkpad\\workspace.json (override with INKPAD_DATA_DIR)\nGUI Text/Draw view mode is transient, not a stored setting.");
             return Ok(());
         }
         _ => Err(invalid("Invalid command; run inkpad-agent --help for usage")),
@@ -1248,7 +1507,7 @@ mod tests {
         let responses: Vec<Value> = String::from_utf8(output).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(responses.len(), 4);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 35);
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 38);
         assert_eq!(responses[2]["result"]["structuredContent"]["title"], "From MCP");
         assert_eq!(responses[3]["result"]["isError"], true);
         std::fs::remove_dir_all(folder).unwrap();
@@ -1721,6 +1980,142 @@ mod tests {
         let final_note = tool(&store, "read_note", json!({"id":id}));
         assert_eq!(final_note["rich_text"][0]["start"], 3);
         assert_eq!(final_note["rich_text"][0]["end"], 6);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn atomic_unicode_batch_uses_exact_grapheme_boundaries_and_preserves_other_pages() {
+        let (store, folder) = store();
+        let created = tool(&store, "create_note", json!({"title":"Batch test","body":"A👩‍🚀e\u{301}猫 Z"}));
+        let id = created["id"].as_str().unwrap();
+        let other = tool(&store, "create_note", json!({"title":"Unaffected","body":"no changes"}));
+        let other_id = other["id"].as_str().unwrap();
+        let batch = json!({"id":id,"unit":"unicode_scalar",
+            "expected_body":"A👩‍🚀e\u{301}猫 Z",
+            "operations":[
+                {"start":1,"end":4,"bold":true,"color":"#AABBCC"},
+                {"start":4,"end":6,"size":23,"font_family":"Serif"},
+                {"start":1,"end":4,"color":"#EE11AA"}
+            ]});
+        let done = tool(&store,"format_text_batch",batch.clone());
+        assert_eq!(done["applied"],3);
+        assert_eq!(done["runs"][0]["start"],1);
+        assert_eq!(done["runs"][0]["end"],4);
+        assert_eq!(done["runs"][0]["style"]["color"],"#EE11AA");
+        assert_eq!(done["runs"][1]["start"],4);
+        assert_eq!(done["runs"][1]["end"],6);
+        assert_eq!(done["runs"][1]["style"]["size"],23);
+        let baseline = tool(&store,"read_note",json!({"id":id}));
+        let mut invalid = batch.clone();
+        invalid["operations"][1]["end"] = json!(999);
+        assert!(execute_tool(&store,"format_text_batch",&invalid).is_err());
+        assert_eq!(tool(&store,"read_note",json!({"id":id})),baseline,"partial batch never committed");
+        let mut stale = batch.clone();
+        stale["expected_body"] = json!("outdated");
+        assert!(execute_tool(&store,"format_text_batch",&stale).unwrap_err().contains("expected_body"));
+        for (lo,hi) in [(2,4),(1,3),(4,5),(5,6)] {
+            let request = json!({"id":id,"unit":"unicode_scalar",
+                "operations":[{"start":lo,"end":hi,"bold":true}]});
+            assert!(execute_tool(&store,"format_text_batch",&request).is_err(),"Split grapheme {lo}..{hi}");
+        }
+        let scalar = tool(&store,"format_text_batch",json!({"id":id,
+            "unit":"unicode_scalar","boundary_policy":"scalar",
+            "operations":[{"start":2,"end":3,"bold":false}]}));
+        assert_eq!(scalar["applied"],1);
+        assert_eq!(tool(&store,"read_note",json!({"id":other_id}))["body"],"no changes");
+        let reopened = store.load().unwrap();
+        reopened.notes.iter().find(|n| n.id == id).unwrap().validate_rich_text().unwrap();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn portable_rich_fragment_copies_and_pastes_without_os_clipboard_and_survives_restart() {
+        let (store, folder) = store();
+        let origin = tool(&store,"create_note",json!({"title":"Source","body":"A👩‍🚀e\u{301}猫Z"}));
+        let source_id = origin["id"].as_str().unwrap();
+        let destination = tool(&store,"create_note",json!({"title":"Target","body":"X日Y"}));
+        let target_id = destination["id"].as_str().unwrap();
+        tool(&store,"set_font_size",json!({"id":source_id,"size":26}));
+        tool(&store,"set_font_choice",json!({"id":source_id,"choice":"Serif"}));
+        tool(&store,"set_font_choice",json!({"id":target_id,"choice":"Mono"}));
+        tool(&store,"format_text_batch",json!({"id":source_id,"unit":"unicode_scalar",
+            "operations":[{"start":1,"end":4,"bold":true,"color":"#990033"},
+                {"start":4,"end":6,"size":32}]}));
+        let copied = tool(&store,"copy_rich_fragment",json!({"id":source_id,
+            "start":1,"end":6,"unit":"unicode_scalar"}));
+        assert_eq!(copied["text"],"👩‍🚀e\u{301}");
+        assert_eq!(copied["runs"].as_array().unwrap().len(),2);
+        assert_eq!(copied["runs"][0]["start"],0);
+        assert_eq!(copied["runs"][0]["end"],3);
+        assert_eq!(copied["defaults"]["size"],26);
+        assert_eq!(copied["defaults"]["font_family"],"Serif");
+        assert!(execute_tool(&store,"copy_rich_fragment",&json!({
+            "id":source_id,"start":1,"end":2,"unit":"unicode_scalar"})).is_err());
+        assert!(execute_tool(&store,"copy_rich_fragment",&json!({
+            "id":source_id,"start":4,"end":5,"unit":"unicode_scalar"})).is_err());
+        let original = tool(&store,"read_note",json!({"id":target_id}));
+        assert!(execute_tool(&store,"paste_rich_fragment",&json!({"id":target_id,
+            "start":1,"end":2,"unit":"unicode_scalar",
+            "expected_text":"another character","fragment":copied})).is_err());
+        assert_eq!(tool(&store,"read_note",json!({"id":target_id})),original);
+        let pasted = tool(&store,"paste_rich_fragment",json!({"id":target_id,
+            "start":1,"end":2,"unit":"unicode_scalar",
+            "expected_text":"日","fragment":copied}));
+        assert_eq!(pasted["inserted"],5);
+        let reopened = store.load().unwrap();
+        let target = reopened.notes.iter().find(|n| n.id == target_id).unwrap();
+        assert_eq!(target.body,"X👩‍🚀e\u{301}Y");
+        assert_eq!(target.style_at(1).bold,true);
+        assert_eq!(target.style_at(1).color.as_deref(),Some("#990033"));
+        assert_eq!(target.style_at(1).font_family.as_deref(),Some("Serif"));
+        assert_eq!(target.style_at(1).size,Some(26));
+        assert_eq!(target.style_at(4).size,Some(32));
+        assert_eq!(target.style_at(0).font_family,None,"Outside pasted range retains defaults");
+        target.validate_rich_text().unwrap();
+        assert_eq!(reopened.notes.iter().find(|n| n.id == source_id).unwrap().body,"A👩‍🚀e\u{301}猫Z");
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn fragment_rejects_forged_invalid_runs_and_oversized_payload_atomically() {
+        let (store, folder) = store();
+        let created = tool(&store,"create_note",json!({"title":"Protected","body":"abcd"}));
+        let id = created["id"].as_str().unwrap();
+        let before = tool(&store,"read_note",json!({"id":id}));
+        let valid = json!({"format_version":1,"unit":"unicode_scalar","text":"hey",
+            "runs":[{"start":0,"end":3,"style":{"bold":true}}]});
+        let malformed = [
+            json!({"format_version":2,"unit":"unicode_scalar","text":"hey","runs":[]}),
+            json!({"format_version":1,"unit":"utf16","text":"hey","runs":[]}),
+            json!({"format_version":1,"unit":"unicode_scalar","text":"hey",
+                "runs":[{"start":0,"end":9,"style":{"bold":true}}]}),
+            json!({"format_version":1,"unit":"unicode_scalar","text":"hey",
+                "runs":[{"start":0,"end":2,"style":{"bold":true}},{"start":1,"end":3,"style":{"color":"#AA33AA"}}]}),
+            json!({"format_version":1,"unit":"unicode_scalar","text":"hey",
+                "runs":[{"start":0,"end":3,"style":{"size":99}}]}),
+            json!({"format_version":1,"unit":"unicode_scalar","text":"hey","runs":[],
+                "defaults":{"size":99,"font_family":"Serif"}}),
+            json!({"format_version":1,"unit":"unicode_scalar","text":"a".repeat(MAX_FRAGMENT_TEXT_BYTES+1),"runs":[]}),
+        ];
+        for fragment in malformed {
+            assert!(execute_tool(&store,"paste_rich_fragment",&json!({"id":id,"start":2,"end":2,
+                "unit":"unicode_scalar","fragment":fragment})).is_err());
+        }
+        assert!(execute_tool(&store,"paste_rich_fragment",&json!({"id":id,
+            "start":99,"end":99,"unit":"unicode_scalar","fragment":valid})).is_err());
+        assert_eq!(tool(&store,"read_note",json!({"id":id})),before);
+        let native_gui = json!({"version":1,"text":"✔","runs":[
+            {"start":0,"end":1,"style":{"bold":true}}
+        ],"defaults":{"size":21,"font_family":"Serif"}});
+        let pasted = tool(&store,"paste_rich_fragment",json!({"id":id,
+            "start":1,"end":2,"unit":"unicode_scalar","expected_text":"b",
+            "fragment":native_gui}));
+        assert_eq!(pasted["length"],4);
+        let styled = tool(&store,"read_note",json!({"id":id}));
+        assert_eq!(styled["body"],"a✔cd");
+        assert_eq!(styled["rich_text"][0]["style"]["font_family"],"Serif");
+        assert_eq!(styled["rich_text"][0]["style"]["size"],21);
+        assert_eq!(styled["rich_text"][0]["style"]["bold"],true);
         std::fs::remove_dir_all(folder).unwrap();
     }
 }

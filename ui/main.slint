@@ -18,6 +18,22 @@ export struct MediaRow {
     preview: image,
 }
 
+// The native host pre-splits rich text into Unicode-safe word/whitespace spans.
+// Flexbox wraps at span boundaries; the host must fall back to StyledText for
+// complex shaping/bidirectional text or exceptionally large notes.
+export struct RichPreviewSpan {
+    text: string,
+    size: int,
+    family: string,
+    bold: bool,
+    foreground: color,
+    has_foreground: bool,
+}
+
+export struct RichPreviewParagraph {
+    spans: [RichPreviewSpan],
+}
+
 // Palette shared by the notebook chrome, controls, pictures and dialogs.
 // The host persists appearance-theme; the effective dark flag follows it.
 global InkTheme {
@@ -664,10 +680,23 @@ export component MainWindow inherits Window {
     in property <bool> system-dark: false;
     in property <bool> selection-bold: false;
     in property <string> text-color: "#292927";
+    in property <int> selected-text-size: 0;
+    in property <string> selected-text-family: "";
     in property <styled-text> note-styled-preview;
+    in property <[RichPreviewParagraph]> rich-preview-paragraphs: [];
+    // Set by the host ONLY when wrapping per-run spans is appropriate.
+    in property <bool> rich-preview-exact: false;
     in-out property <bool> formatted-preview: false;
     in-out property <int> format-start: 0;
     in-out property <int> format-end: 0;
+    // UTF-8 byte offsets reported by Slint TextInput (not Unicode scalar indices).
+    // The Rust host converts these into the format-start/end character indices.
+    in-out property <int> selection-anchor-byte: 0;
+    in-out property <int> selection-caret-byte: 0;
+    in-out property <bool> advanced-text-range: false;
+    in-out property <string> custom-text-color: "#292927";
+    private property <bool> text-editor-focused: false;
+    private property <int> restore-editor-token: 0;
     in-out property <string> note-title: "";
     in-out property <string> note-body: "";
     in-out property <int> font-size: 17;
@@ -729,10 +758,26 @@ export component MainWindow inherits Window {
     callback request-formatted-preview();
     callback apply-text-format(string);
     callback apply-text-color(string);
+    callback select-body-range(int, int);
+    callback undo-rich-edit();
+    callback redo-rich-edit();
+    // Return false when no rich fragment applies; native TextInput then handles
+    // the ordinary plain-text clipboard shortcut without any interference.
+    callback copy-rich-selection() -> bool;
+    callback cut-rich-selection() -> bool;
+    callback paste-rich-selection() -> bool;
+    public function restore-text-selection() {
+        // Body TextInput lives inside the note view's conditional tree. It watches
+        // this token locally so the root need not reference a scoped child id.
+        if (!root.advanced-text-range && !root.formatted-preview) {
+            root.restore-editor-token += 1;
+        }
+    }
 
     private property <color> ink: InkTheme.ink;
     private property <color> muted: InkTheme.muted;
     private property <color> line: InkTheme.line;
+    private property <string> active-text-family: root.selected-text-family == "" ? root.font-choice : root.selected-text-family;
     private property <bool> renaming: false;
     changed appearance-theme => {
         InkTheme.dark = root.appearance-theme == "dark" || (root.appearance-theme == "system" && root.system-dark);
@@ -754,6 +799,15 @@ export component MainWindow inherits Window {
             keys: @keys(Control + B);
             activated => {
                 if (!root.delete-confirm-open) { root.toggle-sidebar(); }
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + Alt + B);
+            activated => {
+                if (!root.delete-confirm-open && root.has-note && root.edit-mode == "text" && root.text-editor-focused && !root.formatted-preview) {
+                    root.apply-text-format("bold");
+                    root.restore-text-selection();
+                }
             }
         }
         KeyBinding {
@@ -1532,25 +1586,25 @@ export component MainWindow inherits Window {
                                     width: 60px;
                                     height: 34px;
                                     subtle: true;
-                                    selected: root.font-choice == "Sans" || root.font-choice == "Segoe UI";
+                                    selected: root.active-text-family == "Sans";
                                     label: "Sans";
-                                    clicked => { root.change-font-choice("Sans"); }
+                                    clicked => { root.change-font-choice("Sans"); root.restore-text-selection(); }
                                 }
                                 ActionButton {
                                     width: 60px;
                                     height: 34px;
                                     subtle: true;
-                                    selected: root.font-choice == "Serif" || root.font-choice == "Georgia";
+                                    selected: root.active-text-family == "Serif";
                                     label: "Serif";
-                                    clicked => { root.change-font-choice("Serif"); }
+                                    clicked => { root.change-font-choice("Serif"); root.restore-text-selection(); }
                                 }
                                 ActionButton {
                                     width: 60px;
                                     height: 34px;
                                     subtle: true;
-                                    selected: root.font-choice == "Mono" || root.font-choice == "Consolas";
+                                    selected: root.active-text-family == "Mono";
                                     label: "Mono";
-                                    clicked => { root.change-font-choice("Mono"); }
+                                    clicked => { root.change-font-choice("Mono"); root.restore-text-selection(); }
                                 }
                                 Rectangle { width: 8px; height: 34px; background: transparent; }
                                 Rectangle {
@@ -1574,8 +1628,9 @@ export component MainWindow inherits Window {
                                     width: 32px;
                                     height: 34px;
                                     hold-mode: true;
-                                    enabled: root.font-size > 12;
-                                    clicked => { root.change-font-size(max(12, root.font-size - 1)); }
+                                    enabled: (root.selected-text-size > 0 && root.selected-text-size > 12) ||
+                                             (root.selected-text-size <= 0 && root.font-size > 12);
+                                    clicked => { root.change-font-size(max(12, (root.selected-text-size > 0 ? root.selected-text-size : root.font-size) - 1)); }
                                 }
                                 Rectangle {
                                     width: 30px;
@@ -1584,7 +1639,7 @@ export component MainWindow inherits Window {
                                     Text {
                                         width: parent.width;
                                         height: parent.height;
-                                        text: root.font-size + "";
+                                        text: (root.selected-text-size > 0 ? root.selected-text-size : root.font-size) + "";
                                         color: root.ink;
                                         font-size: 13px;
                                         font-weight: 700;
@@ -1597,8 +1652,9 @@ export component MainWindow inherits Window {
                                     height: 34px;
                                     add: true;
                                     hold-mode: true;
-                                    enabled: root.font-size < 40;
-                                    clicked => { root.change-font-size(min(40, root.font-size + 1)); }
+                                    enabled: (root.selected-text-size > 0 && root.selected-text-size < 40) ||
+                                             (root.selected-text-size <= 0 && root.font-size < 40);
+                                    clicked => { root.change-font-size(min(40, (root.selected-text-size > 0 ? root.selected-text-size : root.font-size) + 1)); }
                                 }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 ToolLabel {
@@ -1628,45 +1684,53 @@ export component MainWindow inherits Window {
                             HorizontalLayout {
                                 padding-left: 23px;
                                 padding-right: 23px;
-                                spacing: 5px;
-                                ToolLabel { width: 48px; label: "STYLE"; ink: root.muted; }
-                                for style in [
-                                    {label: "B", value: "bold", accessible: "Bold selected range"}
-                                ]: ActionButton {
-                                    width: 31px;
+                                spacing: 7px;
+                                ToolLabel { width: 39px; label: "STYLE"; ink: root.muted; }
+                                ActionButton {
+                                    width: 38px;
                                     height: 31px;
-                                    label: style.label;
-                                    accessible-name: style.accessible;
+                                    label: "B";
+                                    accessible-name: "Bold selected text or typing style, Control Alt B";
                                     selected: root.selection-bold;
-                                    clicked => { root.apply-text-format(style.value); }
+                                    clicked => { root.apply-text-format("bold"); root.restore-text-selection(); }
+                                }
+                                ActionButton {
+                                    width: 32px;
+                                    height: 31px;
+                                    subtle: true;
+                                    label: "↶";
+                                    accessible-name: "Undo text change, Control Z";
+                                    clicked => { root.undo-rich-edit(); }
+                                }
+                                ActionButton {
+                                    width: 32px;
+                                    height: 31px;
+                                    subtle: true;
+                                    label: "↷";
+                                    accessible-name: "Redo text change, Control Y";
+                                    clicked => { root.redo-rich-edit(); }
                                 }
                                 Rectangle { width: 1px; height: 26px; background: root.line; }
-                                ToolLabel { width: 41px; label: "RANGE"; ink: root.muted; }
-                                SpinBox {
-                                    width: 70px;
-                                    height: 31px;
-                                    minimum: 0;
-                                    maximum: 1000000;
-                                    value <=> root.format-start;
-                                    accessible-label: "Range start position, zero based";
-                                }
                                 Text {
-                                    width: 13px;
-                                    text: "–";
-                                    color: root.muted;
-                                    horizontal-alignment: center;
+                                    horizontal-stretch: 1;
+                                    text: root.selection-anchor-byte == root.selection-caret-byte ?
+                                        "Place caret, then choose a style" :
+                                        "Selected " + (max(root.format-start, root.format-end) - min(root.format-start, root.format-end)) + " characters";
+                                    overflow: elide;
+                                    font-size: 11px;
+                                    color: root.selection-anchor-byte == root.selection-caret-byte ? InkTheme.muted : InkTheme.accent;
                                     vertical-alignment: center;
                                 }
-                                SpinBox {
-                                    width: 70px;
+                                ActionButton {
+                                    width: 71px;
                                     height: 31px;
-                                    minimum: 0;
-                                    maximum: 1000000;
-                                    value <=> root.format-end;
-                                    accessible-label: "Range end position, exclusive";
+                                    subtle: true;
+                                    selected: root.advanced-text-range;
+                                    label: "Range…";
+                                    accessible-name: root.advanced-text-range ? "Hide advanced manual character range" : "Show advanced manual character range";
+                                    clicked => { root.advanced-text-range = !root.advanced-text-range; }
                                 }
-                                Rectangle { horizontal-stretch: 1; background: transparent; }
-                                ToolLabel { width: 40px; label: "INK"; ink: root.muted; }
+                                ToolLabel { width: 32px; label: "INK"; ink: root.muted; }
                                 for tone in [
                                     {name: "Ink", code: "#292927", paint: #292927},
                                     {name: "Red", code: "#D74453", paint: #d74453},
@@ -1682,7 +1746,50 @@ export component MainWindow inherits Window {
                                     value: tone.code;
                                     paint: tone.paint;
                                     selected: root.text-color == tone.code;
-                                    picked(value) => { root.apply-text-color(value); }
+                                    picked(value) => { root.apply-text-color(value); root.restore-text-selection(); }
+                                }
+                            }
+                        }
+                        if !root.formatted-preview && root.advanced-text-range: Rectangle {
+                            height: 45px;
+                            background: InkTheme.secondary;
+                            HorizontalLayout {
+                                padding-left: 23px;
+                                padding-right: 23px;
+                                spacing: 9px;
+                                ToolLabel { width: 101px; label: "MANUAL RANGE"; ink: root.muted; }
+                                SpinBox {
+                                    width: 78px;
+                                    height: 31px;
+                                    minimum: 0;
+                                    maximum: 1000000;
+                                    value <=> root.format-start;
+                                    accessible-label: "Unicode character offset for start of formatting range";
+                                }
+                                Text { width: 16px; text: "–"; color: root.muted; horizontal-alignment: center; vertical-alignment: center; }
+                                SpinBox {
+                                    width: 78px;
+                                    height: 31px;
+                                    minimum: 0;
+                                    maximum: 1000000;
+                                    value <=> root.format-end;
+                                    accessible-label: "Exclusive Unicode character offset for end of formatting range";
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: "Advanced fallback · character positions, end exclusive";
+                                    color: root.muted;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                LineEdit {
+                                    width: 96px;
+                                    height: 30px;
+                                    text <=> root.custom-text-color;
+                                    placeholder-text: "#RRGGBB";
+                                    accessible-label: "Custom text colour hex, press Enter to apply";
+                                    accepted => { root.apply-text-color(self.text); }
                                 }
                             }
                         }
@@ -1698,7 +1805,8 @@ export component MainWindow inherits Window {
                                 background: InkTheme.paper;
                                 // Direct TextInput avoids the styled TextEdit's implicit sizing:
                                 // its geometry and ink colour are fixed relative to this page.
-                                if !root.formatted-preview: body-scroll := ScrollView {
+                                body-scroll := ScrollView {
+                                    visible: !root.formatted-preview;
                                     x: 36px;
                                     y: 25px;
                                     width: parent.width - 72px;
@@ -1707,6 +1815,14 @@ export component MainWindow inherits Window {
                                     content-height: max(self.visible-height, body-input.preferred-height + 12px);
 
                                     body-input := TextInput {
+                                        private property <int> restore-request: root.restore-editor-token;
+                                        changed has-focus => { root.text-editor-focused = self.has-focus; }
+                                        changed restore-request => {
+                                            if (root.edit-mode == "text" && !root.formatted-preview) {
+                                                self.focus();
+                                                self.set-selection-offsets(root.selection-anchor-byte, root.selection-caret-byte);
+                                            }
+                                        }
                                         width: body-scroll.visible-width;
                                         height: max(body-scroll.visible-height, self.preferred-height + 12px);
                                         text <=> root.note-body;
@@ -1718,7 +1834,41 @@ export component MainWindow inherits Window {
                                         selection-background-color: #f2d889;
                                         selection-foreground-color: InkTheme.ink;
                                         vertical-alignment: top;
+                                        key-pressed(event) => {
+                                            if (event.modifiers.control && !event.modifiers.alt && (event.text == "c" || event.text == "C")) {
+                                                return root.copy-rich-selection() ? accept : reject;
+                                            }
+                                            if (event.modifiers.control && !event.modifiers.alt && (event.text == "x" || event.text == "X")) {
+                                                return root.cut-rich-selection() ? accept : reject;
+                                            }
+                                            if (event.modifiers.control && !event.modifiers.alt && (event.text == "v" || event.text == "V")) {
+                                                return root.paste-rich-selection() ? accept : reject;
+                                            }
+                                            if (event.modifiers.control && !event.modifiers.alt && (event.text == "z" || event.text == "Z")) {
+                                                if (event.modifiers.shift) {
+                                                    root.redo-rich-edit();
+                                                } else {
+                                                    root.undo-rich-edit();
+                                                }
+                                                return accept;
+                                            }
+                                            if (event.modifiers.control && !event.modifiers.alt && (event.text == "y" || event.text == "Y")) {
+                                                root.redo-rich-edit();
+                                                return accept;
+                                            }
+                                            return reject;
+                                        }
                                         edited => { root.edit-body(self.text); }
+                                        changed cursor-position-byte-offset => {
+                                            root.selection-caret-byte = self.cursor-position-byte-offset;
+                                            root.selection-anchor-byte = self.anchor-position-byte-offset;
+                                            root.select-body-range(root.selection-anchor-byte, root.selection-caret-byte);
+                                        }
+                                        changed anchor-position-byte-offset => {
+                                            root.selection-anchor-byte = self.anchor-position-byte-offset;
+                                            root.selection-caret-byte = self.cursor-position-byte-offset;
+                                            root.select-body-range(root.selection-anchor-byte, root.selection-caret-byte);
+                                        }
                                     }
                                 }
                                 if !root.formatted-preview && root.note-body == "": Text {
@@ -1731,7 +1881,7 @@ export component MainWindow inherits Window {
                                     vertical-alignment: top;
                                     accessible-role: none;
                                 }
-                                if root.formatted-preview: ScrollView {
+                                if root.formatted-preview && (!root.rich-preview-exact || root.rich-preview-paragraphs.length == 0): ScrollView {
                                     x: 36px;
                                     y: 25px;
                                     width: parent.width - 72px;
@@ -1748,6 +1898,50 @@ export component MainWindow inherits Window {
                                         link-color: InkTheme.dark ? #a8c8ff : #285bb2;
                                         vertical-alignment: top;
                                     }
+                                }
+                                if root.formatted-preview && root.rich-preview-exact && root.rich-preview-paragraphs.length > 0: ScrollView {
+                                    x: 36px;
+                                    y: 25px;
+                                    width: parent.width - 72px;
+                                    height: parent.height - 50px;
+                                    content-width: self.visible-width;
+                                    content-height: max(self.visible-height, rich-visual-body.preferred-height + 12px);
+                                    rich-visual-body := VerticalLayout {
+                                        width: parent.visible-width;
+                                        spacing: 0px;
+                                        for paragraph in root.rich-preview-paragraphs: FlexboxLayout {
+                                            width: parent.width;
+                                            height: max(self.preferred-height, root.font-size * 1.45px);
+                                            flex-wrap: wrap;
+                                            spacing-horizontal: 0px;
+                                            spacing-vertical: 0px;
+                                            cross-axis-alignment: end;
+                                            for span in paragraph.spans: Text {
+                                                text: span.text;
+                                                font-size: max(8, span.size) * 1px;
+                                                font-family: span.family;
+                                                font-weight: span.bold ? 700 : 400;
+                                                color: span.has_foreground ? span.foreground : InkTheme.ink;
+                                                width: min(self.preferred-width, parent.width);
+                                                height: self.preferred-height;
+                                                wrap: word-wrap;
+                                                vertical-alignment: bottom;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.formatted-preview: Text {
+                                    x: 36px;
+                                    y: 3px;
+                                    width: parent.width - 72px;
+                                    height: 16px;
+                                    text: root.rich-preview-exact && root.rich-preview-paragraphs.length > 0
+                                        ? "Formatted preview · individual fonts and sizes; line wrapping may differ from the editor."
+                                        : "Preview shows emphasis and colour. Inline font and size use page defaults.";
+                                    color: InkTheme.subtle;
+                                    font-size: 10px;
+                                    overflow: elide;
+                                    vertical-alignment: center;
                                 }
                             }
                         }

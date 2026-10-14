@@ -1,14 +1,17 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod canvas;
+mod editor_session;
 mod instance;
 mod media;
 mod settings;
 mod store;
+mod visual_preview;
 #[cfg(windows)]
 mod windows_chrome;
 
 use canvas::{parse_color, Board, HEIGHT, WIDTH};
+use editor_session::{EditKind, TextHistory};
 use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, StyledText, VecModel};
 use std::cell::RefCell;
 use std::fs;
@@ -16,7 +19,7 @@ use std::io;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 use settings::{AppearanceTheme, UiSettings};
-use store::{Note, Store, Stroke, TextStyle, TextStylePatch, Workspace};
+use store::{Note, Store, Stroke, StyledFragment, TextSelection, TextStyle, TextStylePatch, Workspace};
 use std::path::Path;
 
 slint::include_modules!();
@@ -37,6 +40,10 @@ struct App {
     eraser: bool,
     ui_settings: UiSettings,
     pending_action: Option<PendingAction>,
+    text_history: TextHistory,
+    typing_style: Option<TextStyle>,
+    selection: TextSelection,
+    rich_clipboard: Option<StyledFragment>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +128,143 @@ fn merge_note(base: &Note, local: &Note, remote: &Note) -> io::Result<Note> {
     Ok(merged)
 }
 
+/// TextInput's selection fields are UTF-8 byte offsets. The stored rich
+/// document uses Unicode scalar positions. Never truncate offsets into a
+/// multi-byte character, even when selection is reversed (Shift+Home etc.).
+fn selected_range(ui: &MainWindow, note: &Note) -> io::Result<TextSelection> {
+    if ui.get_advanced_text_range() {
+        let start = ui.get_format_start();
+        let end = ui.get_format_end();
+        if start < 0 || end < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid character range"));
+        }
+        let selection = TextSelection { anchor: start as usize, focus: end as usize };
+        selection.validate(&note.body).map_err(io::Error::other)?;
+        return Ok(selection);
+    }
+    let anchor = ui.get_selection_anchor_byte();
+    let caret = ui.get_selection_caret_byte();
+    if anchor < 0 || caret < 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid editor selection"));
+    }
+    TextSelection::from_utf8_bytes(&note.body, anchor as usize, caret as usize)
+        .map_err(io::Error::other)
+}
+
+fn sync_format_toolbar(ui: &MainWindow, note: &Note, selection: TextSelection,
+                       typed: Option<&TextStyle>) {
+    let style = typed.cloned().or_else(|| note.caret_style(selection).ok()).unwrap_or_default();
+    ui.set_selection_bold(style.bold);
+    ui.set_text_color(style.color.unwrap_or_else(|| "#292927".into()).into());
+    ui.set_selected_text_size(style.size.unwrap_or(note.font_size));
+    ui.set_selected_text_family(style.font_family.unwrap_or_else(|| note.font_choice.clone()).into());
+}
+
+/// A Slint TextInput edit is delivered as a complete plain buffer. Derive the
+/// minimal unchanged scalar prefix/suffix, then replace that one region with
+/// a specific transient caret style if the toolbar selected one. This also
+/// covers Unicode IME, native text paste, selection replace and Backspace.
+fn apply_text_input_edit(note: &mut Note, edited: String,
+                         typed: Option<TextStyle>) -> io::Result<bool> {
+    if note.body == edited { return Ok(false); }
+    let old_length = note.body.chars().count();
+    let new_length = edited.chars().count();
+    let start = note.body.chars().zip(edited.chars())
+        .take_while(|(old, new)| old == new).count();
+    let suffix = note.body.chars().rev().zip(edited.chars().rev())
+        .take((old_length - start).min(new_length - start))
+        .take_while(|(old, new)| old == new).count();
+    let new_start_byte = edited.char_indices().nth(start).map(|(pos,_)| pos)
+        .unwrap_or(edited.len());
+    let new_end_byte = edited.char_indices().nth(new_length - suffix)
+        .map(|(pos,_)| pos).unwrap_or(edited.len());
+    let replacement = &edited[new_start_byte..new_end_byte];
+    note.replace_selection(TextSelection {
+        anchor: start, focus: old_length - suffix,
+    }, replacement, typed).map_err(io::Error::other)?;
+    debug_assert_eq!(note.body, edited);
+    Ok(true)
+}
+
+/// Apply formatting to the current native TextInput selection. A caret-only
+/// operation changes the pending typing style without creating an invalid
+/// zero-length persisted run; a real selected range is immediately durable.
+fn apply_editor_format(app: &mut App, selection: TextSelection,
+                       patch: TextStylePatch) -> io::Result<bool> {
+    let before = app.active().cloned().ok_or_else(||
+        io::Error::new(io::ErrorKind::NotFound, "No active note"))?;
+    let mut edited = before.clone();
+    let mut typed = app.typing_style.clone();
+    let changed = edited.format_selection(selection, patch, &mut typed)
+        .map_err(io::Error::other)?;
+    if changed {
+        app.text_history.record(&before, EditKind::Formatting);
+        if let Some(note) = app.active_mut() { *note = edited; }
+        if let Some(after) = app.active().cloned() { app.text_history.commit_after(&after); }
+    }
+    app.typing_style = typed;
+    app.selection = selection;
+    if changed { app.persist()?; }
+    Ok(changed)
+}
+
+/// Check the on-disk revision immediately before undo/redo. The periodic GUI
+/// synchronization timer may not have fired yet; refusing a stale replay is
+/// safer than rolling back a collaborator's newer text or formatting.
+fn check_editor_history_fresh(app: &App) -> io::Result<()> {
+    let latest = app.storage.read_latest()?;
+    let base = app.baseline.notes.iter().find(|n| n.id == app.workspace.active_id);
+    let remote = latest.notes.iter().find(|n| n.id == app.workspace.active_id);
+    match (base, remote) {
+        (Some(base), Some(remote)) if base.body == remote.body && base.rich_text == remote.rich_text => Ok(()),
+        _ => Err(io::Error::new(io::ErrorKind::WouldBlock,
+            "Undo/redo blocked: another editor or agent changed this note; reload before replaying history")),
+    }
+}
+
+fn cut_or_paste_rich_text(app: &mut App, selection: TextSelection,
+                          fragment: Option<&StyledFragment>) -> io::Result<usize> {
+    let before = app.active().cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No selected note"))?;
+    let mut edited = before.clone();
+    let (start, end) = selection.range();
+    let next = if let Some(fragment) = fragment {
+        edited.paste_styled_range(start, end, fragment).map_err(io::Error::other)?
+    } else {
+        edited.replace_selection(selection, "", None).map_err(io::Error::other)?
+    };
+    if edited != before {
+        app.text_history.record(&before, EditKind::Formatting);
+        if let Some(note) = app.active_mut() { *note = edited; }
+        if let Some(after) = app.active().cloned() { app.text_history.commit_after(&after); }
+        app.selection = TextSelection::caret(next);
+        app.typing_style = None;
+        app.persist()?;
+    }
+    Ok(next)
+}
+
+fn copy_native_rich_selection(app: &mut App, ui: &MainWindow) -> io::Result<bool> {
+    let note = match app.active() { Some(note) => note, None => return Ok(false) };
+    let selection = selected_range(ui, note)?;
+    let (start, end) = selection.range();
+    if start == end { return Ok(false); }
+    let fragment = note.copy_styled_range(start, end).map_err(io::Error::other)?;
+    let mut clipboard = arboard::Clipboard::new().map_err(io::Error::other)?;
+    clipboard.set_text(fragment.text.clone()).map_err(io::Error::other)?;
+    app.rich_clipboard = Some(fragment);
+    Ok(true)
+}
+
+fn refresh_text_after_clipboard(ui: &MainWindow, app: &App, next_caret: usize) {
+    update_editor(ui, app);
+    let Some(note) = app.active() else { return };
+    let Ok((offset, _)) = TextSelection::caret(next_caret).to_utf8_bytes(&note.body) else { return };
+    if offset > i32::MAX as usize { return; }
+    ui.set_selection_anchor_byte(offset as i32);
+    ui.set_selection_caret_byte(offset as i32);
+}
+
 impl App {
     fn load(storage: Store) -> io::Result<Self> {
         let mut workspace = storage.load()?;
@@ -145,6 +289,9 @@ impl App {
             filter: "all".into(), query: String::new(), brush_size: 6,
             brush_color: "#263238".into(), eraser: false, ui_settings,
             pending_action: None,
+            text_history: TextHistory::default(), typing_style: None,
+            selection: TextSelection::caret(0),
+            rich_clipboard: None,
         };
         app.reload_board();
         // Conservative cleanup only: assets younger than 24 hours or still
@@ -261,6 +408,9 @@ impl App {
         };
         self.baseline = latest.clone();
         self.workspace = latest;
+        self.text_history.discard_on_external_sync();
+        self.typing_style = None;
+        self.selection = TextSelection::caret(0);
         self.workspace.active_id = if self.workspace.notes.iter().any(|n| n.id == selected) {
             selected
         } else {
@@ -280,6 +430,9 @@ impl App {
         self.workspace.active_id = note.id.clone();
         self.workspace.notes.push(note);
         self.edit_mode = if kind == "board" { "draw" } else { "text" }.to_string();
+        self.selection = TextSelection::caret(0);
+        self.typing_style = None;
+        self.text_history.clear_for_other_note(&self.workspace.active_id);
         self.reload_board();
         self.persist()
     }
@@ -288,6 +441,9 @@ impl App {
         if self.workspace.notes.iter().any(|note| note.id == id) {
             self.workspace.active_id = id.into();
             self.edit_mode = if self.active().is_some_and(|n| n.kind == "board") { "draw" } else { "text" }.into();
+            self.selection = TextSelection::caret(0);
+            self.typing_style = None;
+            self.text_history.clear_for_other_note(&self.workspace.active_id);
             self.reload_board();
             self.persist()?;
         }
@@ -597,6 +753,35 @@ fn note_styled_preview(note: &Note) -> StyledText {
         .unwrap_or_else(|_| StyledText::from_plain_text(&note.body))
 }
 
+fn update_visual_preview(ui: &MainWindow, note: &Note) {
+    ui.set_note_styled_preview(note_styled_preview(note));
+    if let Some(paragraphs) = visual_preview::build(note) {
+        let rows = paragraphs.into_iter().map(|paragraph| {
+            let spans = paragraph.spans.into_iter().map(|span| {
+                let (has_foreground, foreground) = span.foreground
+                    .map(|rgb| (true, slint::Color::from_rgb_u8(rgb[0], rgb[1], rgb[2])))
+                    .unwrap_or((false, slint::Color::default()));
+                RichPreviewSpan {
+                    text: span.text.into(),
+                    size: span.font_size,
+                    family: span.family.into(),
+                    bold: span.bold,
+                    foreground,
+                    has_foreground,
+                }
+            }).collect::<Vec<_>>();
+            RichPreviewParagraph {
+                spans: ModelRc::from(Rc::new(VecModel::from(spans))),
+            }
+        }).collect::<Vec<_>>();
+        ui.set_rich_preview_paragraphs(ModelRc::from(Rc::new(VecModel::from(rows))));
+        ui.set_rich_preview_exact(true);
+    } else {
+        ui.set_rich_preview_paragraphs(ModelRc::from(Rc::new(VecModel::from(Vec::<RichPreviewParagraph>::new()))));
+        ui.set_rich_preview_exact(false);
+    }
+}
+
 fn append_styled_segment(out: &mut String, text: &str, style: &TextStyle) {
     if text.is_empty() { return; }
     if let Some(color) = &style.color {
@@ -624,7 +809,7 @@ fn update_editor(ui: &MainWindow, app: &App) {
         ui.set_has_note(true);
         ui.set_note_title(note.title.clone().into());
         ui.set_note_body(note.body.clone().into());
-        ui.set_note_styled_preview(note_styled_preview(note));
+        update_visual_preview(ui, note);
         ui.set_selection_bold(false);
         ui.set_text_color("#292927".into());
         ui.set_font_size(note.font_size);
@@ -817,8 +1002,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Font buttons emit callbacks rather than two-way bindings;
                 // reflect the accepted per-note value immediately in the UI.
                 if let Some(note) = state.active() {
-                    ui.set_font_size(note.font_size);
-                    ui.set_font_choice(note.font_choice.clone().into());
+                    let style = state.typing_style.as_ref().cloned()
+                        .or_else(|| note.caret_style(state.selection).ok()).unwrap_or_default();
+                    ui.set_font_size(style.size.unwrap_or(note.font_size));
+                    ui.set_font_choice(style.font_family.unwrap_or_else(|| note.font_choice.clone()).into());
                 }
                 drop(state);
                 if let Err(error) = result {
@@ -855,21 +1042,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     });
     bind_change!(on_edit_body, |app: &mut App, text: SharedString| {
-        if let Some(note) = app.active_mut() {
-            note.set_body_preserving_format(text.to_string())
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            note.touch();
+        let edited = text.to_string();
+        if let Some(before) = app.active().cloned() {
+            if before.body != edited {
+                let typed = app.typing_style.clone();
+                app.text_history.record(&before, EditKind::Typing);
+                if let Some(note) = app.active_mut() {
+                    apply_text_input_edit(note, edited, typed)?;
+                }
+                if let Some(after) = app.active().cloned() { app.text_history.commit_after(&after); }
+            }
         }
         Ok(())
     });
     bind_change!(on_change_font_size, |app: &mut App, size: i32| {
-        if let Some(note) = app.active_mut() { note.font_size = size.clamp(12, 40); note.touch(); }
+        let size = size.clamp(12, 40);
+        if let Some(before) = app.active().cloned() {
+            let selection = app.selection;
+            if !selection.is_caret() { app.text_history.record(&before, EditKind::Formatting); }
+            let typing = &mut app.typing_style;
+            if let Some(note) = app.workspace.notes.iter_mut().find(|n| n.id == app.workspace.active_id) {
+                note.format_selection(selection, TextStylePatch {
+                    size: Some(size), ..TextStylePatch::default()
+                }, typing).map_err(io::Error::other)?;
+            }
+            if !selection.is_caret() {
+                if let Some(after) = app.active().cloned() { app.text_history.commit_after(&after); }
+            }
+        }
         Ok(())
     });
     bind_change!(on_change_font_choice, |app: &mut App, choice: SharedString| {
-        if let Some(note) = app.active_mut() {
-            let choice = choice.to_string();
-            if ["Sans", "Serif", "Mono"].contains(&choice.as_str()) { note.font_choice = choice; note.touch(); }
+        let choice = choice.to_string();
+        if ["Sans", "Serif", "Mono"].contains(&choice.as_str()) {
+            if let Some(before) = app.active().cloned() {
+                let selection = app.selection;
+                if !selection.is_caret() { app.text_history.record(&before, EditKind::Formatting); }
+                let typing = &mut app.typing_style;
+                if let Some(note) = app.workspace.notes.iter_mut().find(|n| n.id == app.workspace.active_id) {
+                    note.format_selection(selection, TextStylePatch {
+                        font_family: Some(choice), ..TextStylePatch::default()
+                    }, typing).map_err(io::Error::other)?;
+                }
+                if !selection.is_caret() {
+                    if let Some(after) = app.active().cloned() { app.text_history.commit_after(&after); }
+                }
+            }
         }
         Ok(())
     });
@@ -960,34 +1178,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let app = app.clone(); let weak = ui.as_weak();
+        ui.on_select_body_range(move |anchor, caret| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if anchor < 0 || caret < 0 { return; }
+            let mut state = app.borrow_mut();
+            if state.pending_action.is_some() { return; }
+            let Some(note) = state.active() else { return; };
+            let Ok(selection) = TextSelection::from_utf8_bytes(&note.body, anchor as usize, caret as usize) else {
+                return; // Changes may be transient while the OS IME is composing text.
+            };
+            state.selection = selection;
+            let note = state.active().expect("note selected above");
+            sync_format_toolbar(&ui, note, selection, state.typing_style.as_ref());
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
         ui.on_apply_text_format(move |action| {
             let Some(ui) = weak.upgrade() else { return; };
             if app.borrow().pending_action.is_some() { return; }
-            let start = ui.get_format_start().max(0) as usize;
-            let end = ui.get_format_end().max(0) as usize;
-            let outcome = (|| -> io::Result<()> {
+            let outcome = (|| -> io::Result<bool> {
                 let mut state = app.borrow_mut();
-                let note = state.active_mut().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No active note"))?;
                 if action.as_str() != "bold" {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported text formatting operation"));
                 }
-                if start >= end || end > note.body.chars().count() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Select a valid nonempty Unicode character range"));
-                }
-                let is_all_bold = (start..end).all(|index| note.style_at(index).bold);
-                note.format_text_range(start, end, TextStylePatch {
+                let selection = selected_range(&ui, state.active()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No active note"))?)?;
+                let (start, end) = selection.range();
+                let is_all_bold = if start == end {
+                    state.typing_style.as_ref().cloned()
+                        .or_else(|| state.active().and_then(|n| n.caret_style(selection).ok()))
+                        .unwrap_or_default().bold
+                } else {
+                    (start..end).all(|index| state.active().is_some_and(|n| n.style_at(index).bold))
+                };
+                apply_editor_format(&mut state, selection, TextStylePatch {
                     bold: Some(!is_all_bold), ..TextStylePatch::default()
-                }).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-                note.touch();
-                state.persist()
+                })
             })();
             if outcome.is_ok() {
-                if let Some(note) = app.borrow().active() {
-                    ui.set_note_styled_preview(note_styled_preview(note));
-                    ui.set_selection_bold(note.style_at(start).bold);
+                let state = app.borrow();
+                if let Some(note) = state.active() {
+                    update_visual_preview(&ui, note);
+                    sync_format_toolbar(&ui, note, state.selection, state.typing_style.as_ref());
                 }
+                drop(state);
+                ui.invoke_restore_text_selection();
             }
-            set_status(&ui, outcome);
+            set_status(&ui, outcome.map(|_| ()));
         });
     }
     {
@@ -995,11 +1233,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.on_apply_text_color(move |color| {
             let Some(ui) = weak.upgrade() else { return; };
             if app.borrow().pending_action.is_some() { return; }
-            let start = ui.get_format_start().max(0) as usize;
-            let end = ui.get_format_end().max(0) as usize;
-            let outcome = (|| -> io::Result<()> {
+            let outcome = (|| -> io::Result<bool> {
                 let mut state = app.borrow_mut();
-                let note = state.active_mut().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No active note"))?;
+                let selection = selected_range(&ui, state.active()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No active note"))?)?;
                 // Ink means the current theme's readable foreground, not a
                 // hard-coded charcoal override that vanishes in dark mode.
                 let patch = if color.as_str() == "#292927" {
@@ -1007,18 +1244,121 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     TextStylePatch { color: Some(color.to_string()), ..TextStylePatch::default() }
                 };
-                note.format_text_range(start, end, patch)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-                note.touch();
-                state.persist()
+                apply_editor_format(&mut state, selection, patch)
             })();
             if outcome.is_ok() {
-                if let Some(note) = app.borrow().active() {
-                    ui.set_note_styled_preview(note_styled_preview(note));
+                let state = app.borrow();
+                if let Some(note) = state.active() {
+                    update_visual_preview(&ui, note);
+                    sync_format_toolbar(&ui, note, state.selection, state.typing_style.as_ref());
                 }
-                ui.set_text_color(color);
+                drop(state);
+                ui.invoke_restore_text_selection();
             }
-            set_status(&ui, outcome);
+            set_status(&ui, outcome.map(|_| ()));
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_undo_rich_edit(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let result = (|| -> io::Result<()> {
+                let mut state = app.borrow_mut();
+                check_editor_history_fresh(&state)?;
+                let App { workspace, text_history, .. } = &mut *state;
+                let note = workspace.notes.iter_mut().find(|note| note.id == workspace.active_id)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No active note"))?;
+                let changed = text_history.undo_before(note).map_err(io::Error::other)?;
+                if changed { state.persist()?; }
+                Ok(())
+            })();
+            if result.is_ok() { update_editor(&ui, &app.borrow()); }
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_redo_rich_edit(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let result = (|| -> io::Result<()> {
+                let mut state = app.borrow_mut();
+                check_editor_history_fresh(&state)?;
+                let App { workspace, text_history, .. } = &mut *state;
+                let note = workspace.notes.iter_mut().find(|note| note.id == workspace.active_id)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No active note"))?;
+                let changed = text_history.redo(note).map_err(io::Error::other)?;
+                if changed { state.persist()?; }
+                Ok(())
+            })();
+            if result.is_ok() { update_editor(&ui, &app.borrow()); }
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_copy_rich_selection(move || {
+            let Some(ui) = weak.upgrade() else { return false; };
+            if app.borrow().pending_action.is_some() { return false; }
+            copy_native_rich_selection(&mut app.borrow_mut(), &ui).unwrap_or(false)
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_cut_rich_selection(move || {
+            let Some(ui) = weak.upgrade() else { return false; };
+            if app.borrow().pending_action.is_some() { return false; }
+            let (selection, note_id) = {
+                let state = app.borrow();
+                let Some(note) = state.active() else { return false; };
+                let Ok(selection) = selected_range(&ui, note) else { return false };
+                if selection.is_caret() { return false; }
+                (selection, note.id.clone())
+            };
+            if !copy_native_rich_selection(&mut app.borrow_mut(), &ui).unwrap_or(false) { return false; }
+            let later_app = app.clone();
+            let later_window = weak.clone();
+            slint::Timer::single_shot(Duration::from_millis(0), move || {
+                let Some(ui) = later_window.upgrade() else { return; };
+                let mut state = later_app.borrow_mut();
+                if state.workspace.active_id != note_id { return; }
+                let result = cut_or_paste_rich_text(&mut state, selection, None);
+                if let Ok(caret) = result.as_ref() { refresh_text_after_clipboard(&ui, &state, *caret); }
+                drop(state);
+                if result.is_ok() { ui.invoke_restore_text_selection(); }
+                set_status(&ui, result.map(|_| ()));
+            });
+            true
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_paste_rich_selection(move || {
+            let Some(ui) = weak.upgrade() else { return false; };
+            if app.borrow().pending_action.is_some() { return false; }
+            let (fragment, selection, note_id) = {
+                let state = app.borrow();
+                let Some(fragment) = state.rich_clipboard.as_ref() else { return false; };
+                let clipboard_text = arboard::Clipboard::new().and_then(|mut clip| clip.get_text());
+                if clipboard_text.ok().as_deref() != Some(fragment.text.as_str()) { return false; }
+                let Some(note) = state.active() else { return false; };
+                let Ok(selection) = selected_range(&ui, note) else { return false };
+                (fragment.clone(), selection, note.id.clone())
+            };
+            let later_app = app.clone();
+            let later_window = weak.clone();
+            slint::Timer::single_shot(Duration::from_millis(0), move || {
+                let Some(ui) = later_window.upgrade() else { return; };
+                let mut state = later_app.borrow_mut();
+                if state.workspace.active_id != note_id { return; }
+                let result = cut_or_paste_rich_text(&mut state, selection, Some(&fragment));
+                if let Ok(caret) = result.as_ref() { refresh_text_after_clipboard(&ui, &state, *caret); }
+                drop(state);
+                if result.is_ok() { ui.invoke_restore_text_selection(); }
+                set_status(&ui, result.map(|_| ()));
+            });
+            true
         });
     }
     {
@@ -1027,7 +1367,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(ui) = weak.upgrade() else { return; };
             if app.borrow().pending_action.is_some() { return; }
             if let Some(note) = app.borrow().active() {
-                ui.set_note_styled_preview(note_styled_preview(note));
+                update_visual_preview(&ui, note);
             }
         });
     }
@@ -1335,6 +1675,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn plain_text_input_reconciliation_uses_explicit_pending_caret_style() {
+        let mut note = Note::create("note");
+        note.body = "hi 🦊!".into();
+        let mut typed = Some(TextStyle {
+            bold: true, color: Some("#AABBCC".into()), size: Some(28),
+            font_family: Some("Serif".into()),
+        });
+        assert!(apply_text_input_edit(&mut note, "hi 🦊X!".into(), typed.take()).unwrap());
+        assert_eq!(note.body, "hi 🦊X!");
+        assert_eq!(note.style_at(4).size, Some(28));
+        assert!(note.style_at(4).bold);
+        assert_eq!(note.style_at(4).font_family.as_deref(), Some("Serif"));
+        assert!(note.style_at(3).is_default());
+        // TextInput external updates identical to local state must not mutate it.
+        let previous = note.rich_text.clone();
+        let unchanged = note.body.clone();
+        assert!(!apply_text_input_edit(&mut note, unchanged, None).unwrap());
+        assert_eq!(note.rich_text, previous);
+    }
+
+    #[test]
+    fn undo_rejects_remote_unsynced_text_without_touching_media() {
+        let root = std::env::temp_dir().join(format!("inkpad-undo-remote-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut gui = App::load(Store::in_folder(root.clone()).unwrap()).unwrap();
+        let original = gui.active().unwrap().clone();
+        gui.text_history.record(&original, EditKind::Typing);
+        gui.active_mut().unwrap().set_body_preserving_format("local editor typing".into()).unwrap();
+        let after = gui.active().unwrap().clone();
+        gui.text_history.commit_after(&after);
+        let agent = Store::in_folder(root.clone()).unwrap();
+        agent.mutate(|workspace| {
+            let note = workspace.notes.iter_mut().find(|note| note.id == original.id).unwrap();
+            note.set_body_preserving_format("remote agent changed text".into())
+                .map_err(io::Error::other)?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(check_editor_history_fresh(&gui).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(gui.active().unwrap().body, "local editor typing");
+        assert_eq!(agent.read_latest().unwrap().notes[0].body, "remote agent changed text");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn rich_text_preview_parses_untrusted_literal_body_safely() {

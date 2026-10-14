@@ -4,7 +4,8 @@ param(
     [string]$AgentExe = 'D:\chat\inkpad\target\release\inkpad-agent.exe',
     [string]$OutputRoot = 'D:\chat\inkpad\dist\rich-text-qa-runs',
     [switch]$RequireRich,
-    [switch]$RequireStyledHtml
+    [switch]$RequireStyledHtml,
+    [switch]$RequireSelectionMcp
 )
 
 $ErrorActionPreference = 'Stop'
@@ -237,6 +238,60 @@ try {
         }
     } else {
         Write-Output 'PENDING richer formatting API not yet present in the agent binary'
+    }
+
+    # Exact selected-text rich clipboard interchange via MCP, not OS clipboard.
+    # Expected_text / expected_body guards deliberately reject stale editing
+    # from another agent, while source font defaults survive across notes.
+    $extendedNames=@('format_text_batch','copy_rich_fragment','paste_rich_fragment')
+    $selectionApi=@($extendedNames | Where-Object { $_ -notin $toolNames }).Count -eq 0
+    if ($RequireSelectionMcp -and !$selectionApi) { throw 'Missing batch-format/rich-fragment MCP tools' }
+    if ($selectionApi) {
+        $srcNote=Tool $s1 'create_note' @{title='Copy source 🦊';body=('A👩‍🚀e'+[char]0x0301+'猫Z')}
+        $targetNote=Tool $s2 'create_note' @{title='Paste target';body='X日Y'}
+        $srcId=[string]$srcNote.id
+        $destId=[string]$targetNote.id
+        $null=Tool $s1 'set_font_size' @{id=$srcId;size=26}
+        $null=Tool $s2 'set_font_choice' @{id=$srcId;choice='Serif'}
+        $null=Tool $s2 'set_font_choice' @{id=$destId;choice='Mono'}
+        $batch=Tool $s1 'format_text_batch' @{id=$srcId;unit='unicode_scalar';expected_body=('A👩‍🚀e'+[char]0x0301+'猫Z');operations=@(
+            @{start=1;end=4;bold=$true;color='#990033'},
+            @{start=4;end=6;size=32}
+        )}
+        Check ($batch.applied -eq 2) 'two approved style patches were not applied atomically'
+        $beforeInvalid=Tool $s2 'read_note' @{id=$srcId}
+        foreach ($badOps in @(
+            @(@{start=1;end=4;bold=$true},@{start=99;end=100;color='#ABCDEF'}),
+            @(@{start=0;end=2;bold=$true}),
+            @(@{start=1;end=4;color='red'})
+        )) {
+            $null=Tool $s1 'format_text_batch' @{id=$srcId;unit='unicode_scalar';operations=@($badOps)} -ExpectError
+        }
+        $null=Tool $s2 'format_text_batch' @{id=$srcId;unit='unicode_scalar';expected_body='stale text';operations=@(@{start=1;end=4;bold=$false})} -ExpectError
+        $afterInvalid=Tool $s2 'read_note' @{id=$srcId}
+        Check (($afterInvalid | ConvertTo-Json -Compress -Depth 30) -ceq ($beforeInvalid | ConvertTo-Json -Compress -Depth 30)) 'malformed/stale batch partially mutated a note'
+        $pass++
+        Write-Output 'PASS selected-range batch formatting is atomic, grapheme safe, stale-version guarded'
+
+        $null=Tool $s2 'copy_rich_fragment' @{id=$srcId;unit='unicode_scalar';start=1;end=2} -ExpectError
+        $null=Tool $s2 'copy_rich_fragment' @{id=$srcId;unit='unicode_scalar';start=4;end=5} -ExpectError
+        $fragment=Tool $s1 'copy_rich_fragment' @{id=$srcId;unit='unicode_scalar';start=1;end=6}
+        Check ($fragment.text -ceq ('👩‍🚀e'+[char]0x0301) -and $fragment.runs.Count -eq 2) 'portable fragment does not preserve styled Unicode'
+        Check ($fragment.defaults.size -eq 26 -and $fragment.defaults.font_family -eq 'Serif') 'cross-note font defaults lost during copy'
+        $originalTarget=Tool $s2 'read_note' @{id=$destId}
+        $null=Tool $s2 'paste_rich_fragment' @{id=$destId;start=1;end=2;unit='unicode_scalar';expected_text='wrong';fragment=$fragment} -ExpectError
+        $wrongFragment=@{format_version=1;unit='unicode_scalar';text='x';runs=@(@{start=0;end=5;style=@{bold=$true}})}
+        $null=Tool $s2 'paste_rich_fragment' @{id=$destId;start=1;end=2;unit='unicode_scalar';expected_text='日';fragment=$wrongFragment} -ExpectError
+        Check (((Tool $s2 'read_note' @{id=$destId}) | ConvertTo-Json -Compress -Depth 30) -ceq ($originalTarget | ConvertTo-Json -Compress -Depth 30)) 'invalid paste changed target note'
+        $pasted=Tool $s2 'paste_rich_fragment' @{id=$destId;unit='unicode_scalar';start=1;end=2;expected_text='日';fragment=$fragment}
+        Check ($pasted.inserted -eq 5) 'MCP paste counted UTF8 bytes instead of Unicode scalars'
+        $dest=Tool $s1 'read_note' @{id=$destId}
+        Check ($dest.body -ceq ('X👩‍🚀e'+[char]0x0301+'Y')) 'cross-note paste did not preserve source/destination body'
+        Check ((Style-At $dest.rich_text 1).bold -and (Style-At $dest.rich_text 1).size -eq 26 -and (Style-At $dest.rich_text 1).font_family -eq 'Serif') 'cross-note paste did not preserve first span formatting and note defaults'
+        Check ((Style-At $dest.rich_text 4).size -eq 32) 'cross-note paste dropped second span font size'
+        Check-Runs $dest.rich_text ([int](Tool $s1 'get_note_formatting' @{id=$destId}).length)
+        $pass++
+        Write-Output 'PASS copy/paste Unicode grapheme protection, styled runs and source defaults, bad fragment atomicity'
     }
 
     # User settings must never be overwritten by MCP note operations. The

@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "rich_text.rs"]
 pub mod rich_text;
-pub use self::rich_text::{TextRun, TextStyle, TextStylePatch};
+pub use self::rich_text::{FragmentDefaults, NoteTextSnapshot, StyledFragment, TextRun, TextSelection,
+    TextStyle, TextStylePatch};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
@@ -113,6 +114,70 @@ impl Note {
 
     pub fn validate_rich_text(&self) -> Result<(), String> {
         rich_text::validate_runs(&self.body, &self.rich_text)
+    }
+
+    /// Derive the style used for typing at a caret or over a selection.
+    pub fn caret_style(&self, selection: TextSelection) -> Result<TextStyle, String> {
+        rich_text::caret_style(&self.body, &self.rich_text, selection)
+    }
+
+    /// Applying formatting with no selection updates a transient toolbar
+    /// override for future typing. For selected text it updates stored runs.
+    /// Returns true if the note itself changed.
+    pub fn format_selection(&mut self, selection: TextSelection, patch: TextStylePatch,
+                            typing_style: &mut Option<TextStyle>) -> Result<bool, String> {
+        let changed = rich_text::format_selection(&self.body, &mut self.rich_text,
+            selection, patch, typing_style)?;
+        if changed { self.touch(); }
+        Ok(changed)
+    }
+
+    /// Replace the selected text or insert at a caret. An explicit transient
+    /// typing style takes precedence over adjacent text. Returns new caret.
+    pub fn replace_selection(&mut self, selection: TextSelection, text: &str,
+                             typing_style: Option<TextStyle>) -> Result<usize, String> {
+        selection.validate(&self.body)?;
+        let (start, end) = selection.range();
+        rich_text::replace_range_with_style(&mut self.body, &mut self.rich_text,
+            start, end, text, typing_style)?;
+        let caret = start.checked_add(text.chars().count())
+            .ok_or_else(|| "Edited caret position exceeds indexable length".to_string())?;
+        self.touch();
+        Ok(caret)
+    }
+
+    /// Copy a user-selected span with its exact styles, relative to character 0.
+    pub fn copy_styled_range(&self, start: usize, end: usize) -> Result<StyledFragment, String> {
+        let mut fragment = rich_text::copy_fragment(&self.body, &self.rich_text, start, end)?;
+        fragment.defaults = Some(FragmentDefaults { size: self.font_size,
+            font_family: self.font_choice.clone() });
+        fragment.validate()?;
+        Ok(fragment)
+    }
+
+    /// Insert a styled clipboard fragment and return the new caret position.
+    pub fn paste_styled_range(&mut self, start: usize, end: usize,
+                              fragment: &StyledFragment) -> Result<usize, String> {
+        rich_text::paste_fragment(&mut self.body, &mut self.rich_text, start, end, fragment)?;
+        self.touch();
+        start.checked_add(fragment.text.chars().count())
+            .ok_or_else(|| "Pasted caret position exceeds indexable length".to_string())
+    }
+
+    /// Snapshots exclude images, drawings and metadata. The caller owns
+    /// transient undo history and should clear it after external remote edits.
+    pub fn snapshot_text(&self) -> NoteTextSnapshot {
+        NoteTextSnapshot { note_id: self.id.clone(), body: self.body.clone(),
+            rich_text: self.rich_text.clone() }
+    }
+
+    pub fn restore_text_snapshot(&mut self, snapshot: &NoteTextSnapshot) -> Result<(), String> {
+        if self.id != snapshot.note_id { return Err("Snapshot belongs to another note".into()); }
+        snapshot.validate()?;
+        self.body.clone_from(&snapshot.body);
+        self.rich_text.clone_from(&snapshot.rich_text);
+        self.touch();
+        Ok(())
     }
 }
 
