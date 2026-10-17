@@ -29,19 +29,26 @@ Inkpad exposes **58 MCP tools**. Destructive changes and access to local image f
 
 ## Download and run
 
-1. Download the **Windows x64 Beta** ZIP from [GitHub Releases](https://github.com/Ticklect/inkpad/releases).
-2. Extract it and run `Inkpad.exe`. Windows may show a SmartScreen warning for an unsigned Beta executable.
-3. To connect an AI agent, add `inkpad-agent.exe` as an **MCP stdio server** with argument `mcp`.
+1. Download the **Windows x64 Beta** ZIP from [GitHub Releases](https://github.com/Ticklect/inkpad/releases). It includes **both** `Inkpad.exe` (desktop) and `inkpad-agent.exe` (MCP server). The MCP server is also available there as a separate download.
+2. Extract the ZIP and run `Inkpad.exe`. Windows may show a SmartScreen warning for an unsigned Beta executable.
+3. In your AI client's MCP settings, add a **local stdio server** with the full path to `inkpad-agent.exe` as the command and `mcp` as its argument. Restart or reconnect the client.
 
 If Windows reports a missing `VCRUNTIME140.dll`, install the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
-For example, a client that accepts an MCP command can launch:
+For clients using an `mcpServers` JSON configuration (such as Claude Desktop), replace the example path with the **actual location** of the downloaded executable:
 
-```powershell
-inkpad-agent.exe mcp
+```json
+{
+  "mcpServers": {
+    "inkpad": {
+      "command": "C:\\path\\to\\Inkpad\\inkpad-agent.exe",
+      "args": ["mcp"]
+    }
+  }
+}
 ```
 
-Both programs use `%LOCALAPPDATA%\Inkpad` by default. Set `INKPAD_DATA_DIR` for both if you want a different notes folder.
+**Chat On Steroids:** add a local MCP server with **Transport: stdio**, **Command: full path to `inkpad-agent.exe`**, **Arguments: `mcp`**. No URL, API key or cloud server is required. The agent and desktop use the same `%LOCALAPPDATA%\Inkpad` notes automatically, even when the desktop is closed. Both programs must run on the PC holding the notes; set `INKPAD_DATA_DIR` on both for a different storage folder. More clients and details: [AGENTS.md](AGENTS.md#mcp-setup).
 
 ## Build from source
 

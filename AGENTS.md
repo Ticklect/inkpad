@@ -4,13 +4,13 @@ Inkpad stores text, formatting, pin state, drawing strokes and inline picture re
 
 ## Build and executable
 
-From `D:\chat\inkpad` run:
+From a source checkout run:
 
 ```powershell
 cargo build --release --bin inkpad-agent
 ```
 
-The agent executable is **`D:\chat\inkpad\target\release\inkpad-agent.exe`** when building from source, or **`D:\chat\inkpad\dist\Inkpad-Beta-Images-Staged\inkpad-agent.exe`** in the ready-to-run Beta package. Run `inkpad-agent.exe mcp` to start its JSON-RPC/MCP stdio server (MCP mode is also the default). A client should launch one process and keep its stdin/stdout pipes open. Inkpad desktop does not need to be running.
+The MCP server is **`target\release\inkpad-agent.exe`** when built from source. You can also download it separately from [GitHub Releases](https://github.com/Ticklect/inkpad/releases), or find it alongside `Inkpad.exe` in the Windows Beta ZIP. Run `inkpad-agent.exe mcp` to start its JSON-RPC/MCP stdio server (MCP mode is also the default). A client should launch one process and keep its stdin/stdout pipes open. Inkpad desktop does not need to be running.
 
 **Windows launch behavior:** `inkpad-agent.exe` is deliberately a **console-subsystem** executable so the MCP client's redirected standard input, output and error streams work reliably. The MCP client should start it as a **stdio child process**, with stdin/stdout/stderr connected to pipes. If that client otherwise shows a brief console flash, its Windows process launcher should pass `CREATE_NO_WINDOW` (`0x08000000`) to `CreateProcessW` (for example, Python `subprocess.Popen(..., creationflags=subprocess.CREATE_NO_WINDOW, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)`). The flag suppresses the console window without switching to the Windows GUI subsystem or breaking MCP pipe communication. Clients that already launch stdio servers hidden need no extra setting. Do not use `start`, `cmd /c start`, or another process-detaching launcher, because MCP needs the child's pipes.
 
@@ -18,13 +18,13 @@ By default, workspace data lives at `%LOCALAPPDATA%\Inkpad\workspace.json`. If u
 
 ## MCP setup
 
-**Chat On Steroids:** Add a local MCP server using the **stdio** transport in your MCP server settings. Set executable/command to `D:\chat\inkpad\target\release\inkpad-agent.exe` and arguments to `mcp`. Enable the server for the AI session where you want note access. If your client offers a hidden/background launch option for MCP stdio child processes, enable it. No browser, window capture or Control API is necessary.
+**Chat On Steroids:** Add a local MCP server using the **stdio** transport in your MCP server settings. Set executable/command to the **absolute path where you extracted `inkpad-agent.exe`** and arguments to `mcp`. Enable the server for the AI session where you want note access. If your client offers a hidden/background launch option for MCP stdio child processes, enable it. No browser, window capture or Control API is necessary.
 
 **Codex:** Put this in your Codex MCP configuration (`%USERPROFILE%\.codex\config.toml` on Windows):
 
 ```toml
 [mcp_servers.inkpad]
-command = 'D:\chat\inkpad\target\release\inkpad-agent.exe'
+command = 'C:\path\to\Inkpad\inkpad-agent.exe'
 args = ["mcp"]
 ```
 
@@ -34,7 +34,7 @@ args = ["mcp"]
 {
   "mcpServers": {
     "inkpad": {
-      "command": "D:\\chat\\inkpad\\target\\release\\inkpad-agent.exe",
+      "command": "C:\\path\\to\\Inkpad\\inkpad-agent.exe",
       "args": ["mcp"]
     }
   }
