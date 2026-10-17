@@ -6,7 +6,7 @@ This is an implementation reference for agents integrating Inkpad's **saved** dr
 
 | Capability | Desktop GUI (current source) | MCP stdio server (current source) |
 | --- | --- | --- |
-| Persistent freehand ink | Pen, eraser; stroke-based canvas | `add_stroke`, confirmed `undo_last_stroke`, confirmed `clear_strokes` |
+| Persistent freehand ink | Pen, eraser; stroke-based canvas | `add_stroke`, atomic `add_strokes_batch` (up to 64 strokes), confirmed `undo_last_stroke`, confirmed `clear_strokes` |
 | Draw new common shapes | Rectangle, ellipse, line; advanced triangle, rounded rectangle and curve tools | `drawing_create_shape`: rectangle, rounded_rectangle, ellipse, circle, line, polygon, cubic_bezier |
 | Select or inspect object | Select tool, pointer hit testing and selection overlay | `drawing_list`; `drawing_pick_object` at canvas `{x,y}` with optional hit tolerance |
 | Move/resize/rotate/flip selected object | Basic selection gestures and advanced controls | `drawing_transform_object` for relative move/resize/rotate/flip |
@@ -19,7 +19,7 @@ This is an implementation reference for agents integrating Inkpad's **saved** dr
 | Drawing preview | Renders canvas in window | `drawing_preview` returns one `image/png` block (max 1 MiB) |
 | Drawing PNG export | GUI export action | `export_note` to new absolute `.png` path, including strokes and editable vectors |
 | Undo/redo drawing operations | Session-local drawing history, bounded; GUI's separate text history | Vector edit `drawing_undo` / `drawing_redo` (same active agent process only, explicit authorization and `confirm:true`) |
-| Bulk or batch drawing API | No requested drawing batching | **Absent by design**; use independent validated calls |
+| Bulk or batch drawing API | GUI editing remains gesture-by-gesture | `drawing_create_batch` adds 1–64 vector objects in one validated transaction (with stable IDs and one session undo step); `add_strokes_batch` paints 1–64 strokes in one save; individual tools remain available |
 | Change open GUI selection/tool/mode | User interaction in desktop window | Not supported by headless MCP |
 
 The **default desktop editor remains simple**. Basic tools are in the drawing toolbar; further appearance and object controls are behind an expandable Advanced section. GUI checks for external changes to saved notes and may delay reloading while there are unsaved local edits. Do not assume a successful MCP write immediately changes the active visual selection.

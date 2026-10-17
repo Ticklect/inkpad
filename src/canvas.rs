@@ -48,7 +48,8 @@ impl Board {
 
     pub fn draw_object(&mut self, object: &DrawObject) {
         if object.validate().is_err() { return; }
-        let (path, closed) = flattened_path(&object.shape);
+        let (path, closed) = flattened_path_for_scale(&object.shape,
+            object.transform.scale_x.max(object.transform.scale_y));
         if path.len() < 2 { return; }
         let transformed: Vec<Point> = path.iter().map(|p| object.transform.apply(*p)).collect();
         let scaled_width = object.style.stroke_width *
@@ -66,17 +67,56 @@ impl Board {
         let y1 = ((bottom + pad).ceil() as i32).clamp(0, HEIGHT as i32 - 1);
         let fill = if closed { object.style.fill.as_ref() } else { None };
         let stroke = object.style.stroke.filter(|_| object.style.stroke_width > 0.0);
+        // Shape validation has already run. Alpha-zero colours are invisible;
+        // this shortcut matters for AI drawings with many hidden paint objects.
+        if object.style.opacity == 0.0 ||
+            (fill.is_none_or(|fill| fill_is_transparent(fill)) &&
+             stroke.is_none_or(|color| color[3] == 0)) { return; }
+
+        // Supersampling still uses the same four locations and blending as the
+        // original renderer. Cache polygon intersections for the two y-samples
+        // of each scanline instead of rescanning/dividing every edge four times
+        // per pixel. The parity of crossings strictly to the right is the
+        // exact even-odd rule used by point_in_polygon.
+        let mut top_crossings = Vec::with_capacity(8);
+        let mut bottom_crossings = Vec::with_capacity(8);
+        // Segment bounds also let us skip almost every ellipse/Bezier edge
+        // when testing a pixel far from the outline.
+        let segments = if stroke.is_some() {
+            prepare_segments(&transformed, closed)
+        } else { Vec::new() };
+        let mut row_segments = Vec::with_capacity(segments.len().min(16));
+        let stroke_radius = scaled_width / 2.0;
+        let stroke_radius_sq = scaled_width * scaled_width / 4.0;
+        let margin = stroke_radius + 0.5;
         for y in y0..=y1 {
+            if fill.is_some() {
+                polygon_scanline_crossings(&transformed, y as f32 - 0.25, &mut top_crossings);
+                polygon_scanline_crossings(&transformed, y as f32 + 0.25, &mut bottom_crossings);
+            }
+            row_segments.clear();
+            if stroke.is_some() {
+                let y = y as f32;
+                row_segments.extend(segments.iter().filter(|segment|
+                    y >= segment.min_y - margin && y <= segment.max_y + margin));
+            }
             for x in x0..=x1 {
+                if fill.is_none() && row_segments.is_empty() { break; }
                 // Four subsamples smooth edges and make thin diagonal lines visible.
                 let samples = [(-0.25,-0.25),(0.25,-0.25),(-0.25,0.25),(0.25,0.25)];
                 let mut fill_hits = 0;
                 let mut stroke_hits = 0;
                 for (ox, oy) in samples {
                     let p = Point::new(x as f32 + ox, y as f32 + oy);
-                    if fill.is_some() && point_in_polygon(p, &transformed) { fill_hits += 1; }
-                    if stroke.is_some() && path_distance_sq(p, &transformed, closed) <=
-                        scaled_width * scaled_width / 4.0 { stroke_hits += 1; }
+                    if fill.is_some() && inside_crossings(p.x,
+                        if oy < 0.0 { &top_crossings } else { &bottom_crossings }) {
+                        fill_hits += 1;
+                    }
+                    if stroke.is_some() && row_segments.iter().any(|segment|
+                        p.x >= segment.min_x - margin && p.x <= segment.max_x + margin &&
+                        segment_distance_sq(p, segment) <= stroke_radius_sq) {
+                        stroke_hits += 1;
+                    }
                 }
                 if fill_hits == 0 && stroke_hits == 0 { continue; }
                 let offset = ((y as u32 * WIDTH + x as u32) * 4) as usize;
@@ -166,6 +206,64 @@ impl Board {
     }
 }
 
+struct PreparedSegment {
+    start: Point,
+    dx: f32,
+    dy: f32,
+    length_sq: f32,
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
+}
+
+fn prepare_segments(path: &[Point], closed: bool) -> Vec<PreparedSegment> {
+    let count = if closed { path.len() } else { path.len() - 1 };
+    (0..count).map(|i| {
+        let a = path[i];
+        let b = path[(i+1) % path.len()];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        PreparedSegment { start:a, dx,dy,length_sq:dx*dx+dy*dy,
+            min_x:a.x.min(b.x), max_x:a.x.max(b.x),
+            min_y:a.y.min(b.y), max_y:a.y.max(b.y) }
+    }).collect()
+}
+
+fn segment_distance_sq(point: Point, segment: &PreparedSegment) -> f32 {
+    let t = if segment.length_sq > 0.000001 {
+        ((point.x-segment.start.x)*segment.dx +
+         (point.y-segment.start.y)*segment.dy) / segment.length_sq
+    } else { 0.0 }.clamp(0.0, 1.0);
+    let px = point.x-segment.start.x - t*segment.dx;
+    let py = point.y-segment.start.y - t*segment.dy;
+    px*px + py*py
+}
+
+fn polygon_scanline_crossings(path: &[Point], y: f32, crossings: &mut Vec<f32>) {
+    crossings.clear();
+    for i in 0..path.len() {
+        let a = path[i];
+        let b = path[(i+1)%path.len()];
+        if (a.y > y) != (b.y > y) {
+            crossings.push((b.x-a.x)*(y-a.y)/(b.y-a.y)+a.x);
+        }
+    }
+    crossings.sort_unstable_by(f32::total_cmp);
+}
+
+fn inside_crossings(x: f32, crossings: &[f32]) -> bool {
+    (crossings.len() - crossings.partition_point(|crossing| *crossing <= x)) % 2 != 0
+}
+
+fn fill_is_transparent(fill: &DrawFill) -> bool {
+    match fill {
+        DrawFill::Solid { color } => color[3] == 0,
+        DrawFill::LinearGradient { stops, .. } | DrawFill::RadialGradient { stops, .. } =>
+            stops.iter().all(|stop| stop.color[3] == 0),
+    }
+}
+
 fn flattened_path(shape: &DrawShape) -> (Vec<Point>, bool) {
     match shape {
         DrawShape::Rectangle { width, height } => (vec![
@@ -206,9 +304,73 @@ fn flattened_path(shape: &DrawShape) -> (Vec<Point>, bool) {
     }
 }
 
+/// Most saved drawings keep their original tessellation and exact PNG pixels.
+/// Exceptionally large curves need more vertices: the original eight rounded
+/// corner steps or 96 ellipse edges can become visibly faceted when an agent
+/// creates a large zoomed shape. Clamp subdivision to bound CPU and memory.
+fn flattened_path_for_scale(shape: &DrawShape, scale: f32) -> (Vec<Point>, bool) {
+    const MAX_CURVE_STEPS: usize = 512;
+    match shape {
+        DrawShape::Circle { radius } if radius * scale > 500.0 => {
+            let steps = ellipse_steps(radius * scale).min(MAX_CURVE_STEPS);
+            (ellipse_path_steps(*radius, *radius, steps), true)
+        }
+        DrawShape::Ellipse { radius_x, radius_y }
+            if radius_x.max(*radius_y) * scale > 500.0 => {
+            let steps = ellipse_steps(radius_x.max(*radius_y) * scale).min(MAX_CURVE_STEPS);
+            (ellipse_path_steps(*radius_x, *radius_y, steps), true)
+        }
+        DrawShape::RoundedRectangle { width, height, radius } if radius * scale > 150.0 => {
+            let steps = ((std::f32::consts::FRAC_PI_2 *
+                (radius * scale / 2.0).sqrt()).ceil() as usize).clamp(8, 64);
+            let mut path = Vec::with_capacity(4 * (steps + 1));
+            for (cx,cy,start) in [
+                (width-radius, *radius, -90.0_f32),
+                (width-radius, height-radius, 0.0),
+                (*radius, height-radius, 90.0),
+                (*radius, *radius, 180.0),
+            ] {
+                for i in 0..=steps {
+                    let angle = (start + i as f32 * 90.0 / steps as f32).to_radians();
+                    path.push(Point::new(cx + radius * angle.cos(), cy + radius * angle.sin()));
+                }
+            }
+            (path, true)
+        }
+        DrawShape::CubicBezier { control1, control2, to } => {
+            let maximum = control1.x.abs().max(control1.y.abs())
+                .max(control2.x.abs()).max(control2.y.abs()).max(to.x.abs()).max(to.y.abs()) * scale;
+            if maximum <= 800.0 { return flattened_path(shape); }
+            let steps = ((maximum / 800.0).sqrt() * 64.0).ceil() as usize;
+            let steps = steps.clamp(64, MAX_CURVE_STEPS);
+            let mut path = Vec::with_capacity(steps+1);
+            for i in 0..=steps {
+                let t = i as f32 / steps as f32;
+                let u = 1.0 - t;
+                path.push(Point::new(
+                    3.0*u*u*t*control1.x + 3.0*u*t*t*control2.x + t*t*t*to.x,
+                    3.0*u*u*t*control1.y + 3.0*u*t*t*control2.y + t*t*t*to.y,
+                ));
+            }
+            (path, false)
+        }
+        _ => flattened_path(shape),
+    }
+}
+
+fn ellipse_steps(screen_radius: f32) -> usize {
+    // Circle sagitta approx PI^2 * radius / (2 * segments^2).
+    // Aim for <=0.2 screen pixels, keeping the original 96-edge minimum.
+    (std::f32::consts::PI * (screen_radius / 0.4).sqrt()).ceil() as usize
+}
+
 fn ellipse_path(radius_x: f32, radius_y: f32) -> Vec<Point> {
-    (0..96).map(|i| {
-        let angle = i as f32 * std::f32::consts::TAU / 96.0;
+    ellipse_path_steps(radius_x, radius_y, 96)
+}
+
+fn ellipse_path_steps(radius_x: f32, radius_y: f32, steps: usize) -> Vec<Point> {
+    (0..steps).map(|i| {
+        let angle = i as f32 * std::f32::consts::TAU / steps as f32;
         Point::new(radius_x * angle.cos(), radius_y * angle.sin())
     }).collect()
 }
@@ -223,7 +385,8 @@ pub fn pick_object(drawing: &DrawingData, at: Point, tolerance: f32) -> Option<S
             o.layer_id == layer.id && o.visible && o.style.opacity > 0.0
         }) {
             if object.validate().is_err() { continue; }
-            let (path, closed) = flattened_path(&object.shape);
+            let (path, closed) = flattened_path_for_scale(&object.shape,
+                object.transform.scale_x.max(object.transform.scale_y));
             let transformed: Vec<Point> = path.iter().map(|p| object.transform.apply(*p)).collect();
             let fill_hit = closed && object.style.fill.as_ref().is_some_and(|fill|
                 sample_fill(fill, object.transform.inverse(at))[3] > 0) &&
@@ -315,7 +478,172 @@ pub fn parse_color(hex: &str) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::drawing::{DrawShape, DrawFill, DrawingHistory, GradientStop};
+    use crate::store::drawing::{DrawShape, DrawFill, DrawingHistory, GradientStop, DrawStyle, Transform, Layer};
+    use std::time::Instant;
+
+    // Keep the pre-optimization rasterizer as an independent, byte-level
+    // reference. This also makes benchmark numbers directly comparable when
+    // changes to clipping, sampling or curves are proposed later.
+    fn reference_draw_object(board: &mut Board, object: &DrawObject) {
+        if object.validate().is_err() { return; }
+        let (path, closed) = flattened_path(&object.shape);
+        if path.len() < 2 { return; }
+        let transformed: Vec<Point> = path.iter().map(|point| object.transform.apply(*point)).collect();
+        let scaled_width = object.style.stroke_width *
+            object.transform.scale_x.max(object.transform.scale_y);
+        let pad = scaled_width / 2.0 + 1.5;
+        let left = transformed.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let right = transformed.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+        let top = transformed.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let bottom = transformed.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+        if left - pad >= WIDTH as f32 || right + pad < 0.0 ||
+            top - pad >= HEIGHT as f32 || bottom + pad < 0.0 { return; }
+        let x0 = ((left - pad).floor() as i32).clamp(0, WIDTH as i32 - 1);
+        let x1 = ((right + pad).ceil() as i32).clamp(0, WIDTH as i32 - 1);
+        let y0 = ((top - pad).floor() as i32).clamp(0, HEIGHT as i32 - 1);
+        let y1 = ((bottom + pad).ceil() as i32).clamp(0, HEIGHT as i32 - 1);
+        let fill = if closed { object.style.fill.as_ref() } else { None };
+        let stroke = object.style.stroke.filter(|_| object.style.stroke_width > 0.0);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let samples = [(-0.25,-0.25),(0.25,-0.25),(-0.25,0.25),(0.25,0.25)];
+                let mut fill_hits = 0;
+                let mut stroke_hits = 0;
+                for (ox, oy) in samples {
+                    let p = Point::new(x as f32 + ox, y as f32 + oy);
+                    if fill.is_some() && point_in_polygon(p, &transformed) { fill_hits += 1; }
+                    if stroke.is_some() && path_distance_sq(p, &transformed, closed) <=
+                        scaled_width * scaled_width / 4.0 { stroke_hits += 1; }
+                }
+                if fill_hits == 0 && stroke_hits == 0 { continue; }
+                let offset = ((y as u32 * WIDTH + x as u32) * 4) as usize;
+                if let Some(fill) = fill {
+                    if fill_hits > 0 {
+                        let p = object.transform.inverse(Point::new(x as f32, y as f32));
+                        let color = sample_fill(fill, p);
+                        board.blend(offset, color, object.style.opacity * (fill_hits as f32 / 4.0));
+                    }
+                }
+                if let Some(color) = stroke {
+                    if stroke_hits > 0 {
+                        board.blend(offset, color, object.style.opacity * (stroke_hits as f32 / 4.0));
+                    }
+                }
+            }
+        }
+    }
+
+    fn synthetic_vector_scene(count: usize) -> DrawingData {
+        let layers = vec![Layer { id: "layer-bench".into(), name: "Benchmark".into(),
+            visible: true, locked: false }];
+        let objects = (0..count).map(|i| {
+            let x = (i % 12) as f32 * 83.0 + 46.0;
+            let y = (i / 12) as f32 * 94.0 + 49.0;
+            let shape = match i % 4 {
+                0 => DrawShape::Ellipse { radius_x: 29.0, radius_y: 35.0 },
+                1 => DrawShape::RoundedRectangle { width: 64.0, height: 48.0, radius: 14.0 },
+                2 => DrawShape::CubicBezier { control1:Point::new(16.0, 51.0),
+                    control2:Point::new(52.0, -30.0), to:Point::new(76.0, 21.0) },
+                _ => DrawShape::Polygon { closed:true, points: vec![Point::new(-30.0, -32.0),
+                    Point::new(30.0,-28.0),Point::new(39.0,8.0),Point::new(0.0,36.0),Point::new(-33.0,19.0)] },
+            };
+            let gradient = DrawFill::LinearGradient { start:Point::new(-29.0, -20.0),
+                end:Point::new(40.0,33.0), stops:vec![
+                    GradientStop {offset:0.0, color:[25,85,155,210]},
+                    GradientStop {offset:1.0, color:[218,42,83,240]}] };
+            DrawObject { id:format!("shape-{i}"),layer_id:"layer-bench".into(),shape,
+                visible:true,group_id:None,
+                style: DrawStyle { stroke:Some([16,33,61,230]),stroke_width:3.0,
+                    fill: if i%4==2 {None} else {Some(gradient)}, opacity:0.9 },
+                transform: Transform { translation:Point::new(x,y), rotation_deg:(i%7) as f32 * 11.0,
+                    ..Transform::default() } }
+        }).collect();
+        DrawingData { layers, objects }
+    }
+
+    #[test]
+    fn optimized_vector_pixels_match_reference_for_layered_agent_scene() {
+        let scene = synthetic_vector_scene(56);
+        scene.validate().unwrap();
+        let mut reference = Board::new(&[]);
+        for object in &scene.objects { reference_draw_object(&mut reference, object); }
+        let optimized = Board::with_drawing(&[], &scene);
+        assert_eq!(optimized.bytes(), reference.bytes(),
+            "Vector raster optimization changed antialiasing, gradients or layer compositing");
+    }
+
+    #[test]
+    fn optimized_vector_pixels_match_legacy_for_clipped_flipped_transparent_and_thin_shapes() {
+        let mut scene = synthetic_vector_scene(12);
+        for (i, object) in scene.objects.iter_mut().enumerate() {
+            match i {
+                0 => object.transform.translation = Point::new(-25.0, -10.0),
+                1 => object.transform.translation = Point::new(WIDTH as f32-20.0, HEIGHT as f32-10.0),
+                2 => {object.transform.flip_x = true; object.transform.flip_y = true;},
+                3 => {object.style.stroke_width = 0.0; object.style.stroke = None;},
+                4 => object.style.stroke_width = 0.25,
+                5 => object.style.opacity = 0.0,
+                6 => object.style.stroke = Some([255,10,0,0]),
+                7 => object.style.fill = Some(DrawFill::Solid {color:[1,2,3,0]}),
+                8 => object.style.fill = Some(DrawFill::RadialGradient {
+                    center:Point::new(0.0,0.0),radius:45.0,
+                    stops:vec![GradientStop{offset:0.0,color:[240,50,90,0]},
+                        GradientStop{offset:1.0,color:[10,150,200,0]}]}),
+                9 => object.transform.rotation_deg = 179.0,
+                10 => {object.transform.scale_x = 0.75; object.transform.scale_y = 1.3;},
+                11 => object.style.stroke_width = 0.001,
+                _ => {}
+            }
+        }
+        scene.validate().unwrap();
+        let mut reference = Board::new(&[]);
+        for object in &scene.objects { reference_draw_object(&mut reference, object); }
+        assert_eq!(Board::with_drawing(&[], &scene).bytes(), reference.bytes());
+    }
+
+    #[test]
+    fn large_agent_curves_adapt_to_subpixel_geometry_without_changing_small_shapes() {
+        let small = DrawShape::Ellipse {radius_x:40.0,radius_y:30.0};
+        assert_eq!(flattened_path_for_scale(&small,1.0), flattened_path(&small));
+        let circle = DrawShape::Circle {radius:1500.0};
+        let (base, _) = flattened_path(&circle);
+        let (refined, _) = flattened_path_for_scale(&circle, 1.0);
+        assert!(refined.len() > base.len() && refined.len() <= 512);
+        let maximum_chord_error = |path: &[Point]| {
+            path.iter().enumerate().map(|(i,a)| {
+                let b = path[(i+1) % path.len()];
+                let x = (a.x + b.x) * 0.5;
+                let y = (a.y + b.y) * 0.5;
+                1500.0 - x.hypot(y)
+            }).fold(0.0_f32, f32::max)
+        };
+        assert!(maximum_chord_error(&base) > 0.7);
+        assert!(maximum_chord_error(&refined) < 0.3);
+        let corner = DrawShape::RoundedRectangle { width:640.0, height:640.0, radius:300.0 };
+        assert!(flattened_path_for_scale(&corner,1.0).0.len() > flattened_path(&corner).0.len());
+        let curve = DrawShape::CubicBezier {control1:Point::new(1800.0,-500.0),
+            control2:Point::new(-1200.0,2100.0),to:Point::new(500.0,800.0)};
+        assert!(flattened_path_for_scale(&curve,1.0).0.len() > flattened_path(&curve).0.len());
+    }
+
+    #[test]
+    #[ignore = "explicit opt-in synthetic render benchmark; no user files"]
+    fn agent_vector_render_benchmark() {
+        for count in [32, 96] {
+            let scene = synthetic_vector_scene(count);
+            let mut reference = Board::new(&[]);
+            let begin = Instant::now();
+            for object in &scene.objects { reference_draw_object(&mut reference, object); }
+            let baseline = begin.elapsed();
+            let begin = Instant::now();
+            let optimized = Board::with_drawing(&[], &scene);
+            let after = begin.elapsed();
+            assert_eq!(reference.bytes(), optimized.bytes());
+            println!("agent_vector_render {count} objects: baseline_ms={:.3} optimized_ms={:.3} speedup={:.2}x",
+                baseline.as_secs_f64()*1000.0, after.as_secs_f64()*1000.0,
+                baseline.as_secs_f64()/after.as_secs_f64());
+        }
+    }
     #[test]
     fn strokes_and_eraser_replay() {
         let black = Stroke { color: [1, 2, 3, 255], width: 11, eraser: false, points: vec![[20, 20], [30, 20]] };

@@ -18,7 +18,7 @@ Inkpad includes a desktop app (`Inkpad.exe`) and an [MCP](https://modelcontextpr
 - **Export notes** — save plain text or complete self-contained HTML with formatting, drawings and embedded pictures.
 - **Manage preferences** — inspect workspace details, switch the app theme and expand/collapse the sidebar.
 
-Inkpad exposes **58 MCP tools**. Destructive changes and access to local image files require explicit user approval. Full tool arguments, limitations and examples are in [AGENTS.md](AGENTS.md).
+Inkpad exposes **60 MCP tools**, including fast multi-shape and multi-stroke drawing batches. Destructive changes and access to local image files require explicit user approval. Full tool arguments, limitations and examples are in [AGENTS.md](AGENTS.md), with an [AI drawing guide](docs/AI_DRAWING_WORKFLOW.md) for producing more polished artwork.
 
 ## Desktop features
 
