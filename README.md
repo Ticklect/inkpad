@@ -29,9 +29,13 @@ Inkpad exposes **58 MCP tools**. Destructive changes and access to local image f
 
 ## Download and run
 
-1. Download the **Windows x64 Beta** ZIP from [GitHub Releases](https://github.com/Ticklect/inkpad/releases). It includes **both** `Inkpad.exe` (desktop) and `inkpad-agent.exe` (MCP server). The MCP server is also available there as a separate download.
-2. Extract the ZIP and run `Inkpad.exe`. Windows may show a SmartScreen warning for an unsigned Beta executable.
-3. In your AI client's MCP settings, add a **local stdio server** with the full path to `inkpad-agent.exe` as the command and `mcp` as its argument. Restart or reconnect the client.
+Choose **one** Windows x64 download from [GitHub Releases](https://github.com/Ticklect/inkpad/releases):
+
+- **Inkpad-Beta-With-MCP-Windows-x64.zip** — desktop app **and** MCP server, so AI agents can access your notes.
+- **Inkpad-Beta-Without-MCP-Windows-x64.zip** — desktop app only, with **no MCP executable**.
+- **Inkpad-MCP-Beta-Windows-x64.zip** — **MCP server only**, for AI access without the desktop app.
+
+Extract the ZIP you choose. Run `Inkpad.exe` for desktop versions. To connect an AI agent, select a package **with MCP** and register `inkpad-agent.exe` as a local **stdio** server with argument `mcp`; restart or reconnect the AI client. The Windows Beta executables are unsigned and may trigger a SmartScreen warning.
 
 If Windows reports a missing `VCRUNTIME140.dll`, install the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
