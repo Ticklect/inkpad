@@ -12,14 +12,15 @@ mod windows_chrome;
 
 use canvas::{parse_color, Board, HEIGHT, WIDTH};
 use editor_session::{EditKind, TextHistory};
-use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, StyledText, VecModel};
+use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, StyledText, VecModel};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use settings::{AppearanceTheme, UiSettings};
-use store::{Note, Store, Stroke, StyledFragment, TextSelection, TextStyle, TextStylePatch, Workspace};
+use store::{DrawFill, DrawObject, DrawShape, DrawingHistory, Note, NoteContentBlock, Point, Store, Stroke, StyledFragment, TextSelection, TextStyle, TextStylePatch, Workspace};
 use std::path::Path;
 
 slint::include_modules!();
@@ -38,12 +39,38 @@ struct App {
     brush_size: u16,
     brush_color: String,
     eraser: bool,
+    draw_tool: String,
+    draw_filled: bool,
+    draw_fill_color: String,
+    draw_opacity: u8,
+    selected_draw_layer_id: Option<String>,
+    selected_draw_object: Option<String>,
+    draw_origin: Option<[u16; 2]>,
+    draw_previous: Option<[u16; 2]>,
+    draw_gesture_changed: bool,
+    drawing_history: DrawingHistory,
+    drawing_undo_order: Vec<DrawingEdit>,
+    drawing_redo_order: Vec<DrawingEdit>,
+    last_canvas_render: Instant,
     ui_settings: UiSettings,
     pending_action: Option<PendingAction>,
     text_history: TextHistory,
     typing_style: Option<TextStyle>,
     selection: TextSelection,
+    /// A newly opened page has no meaningful caret location yet. A real
+    /// selection event makes image insertion use that point; otherwise attach
+    /// at the end of the note instead of unexpectedly before its first word.
+    selection_explicit: bool,
     rich_clipboard: Option<StyledFragment>,
+}
+
+/// Tracks actual cross-tool edit order. Engine snapshots store vector state;
+/// a legacy stroke entry is recorded separately to keep undo predictable
+/// when pen and editable shape tools are used on the same page.
+#[derive(Clone)]
+enum DrawingEdit {
+    Vector,
+    Stroke(Option<Stroke>),
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +90,7 @@ impl PendingAction {
             ),
             Self::ClearDrawing { title, .. } => (
                 "Clear this drawing?".into(),
-                format!("All strokes on “{title}” will be erased. Your text will remain."),
+                format!("All strokes and editable shapes on “{title}” will be erased. Your text will remain."),
                 "Clear drawing".into(),
             ),
             Self::DeletePicture { .. } => (
@@ -105,6 +132,13 @@ fn merge_note(base: &Note, local: &Note, remote: &Note) -> io::Result<Note> {
     } else {
         &base.body
     };
+    let anchor_source_body = if local.inline_media != base.inline_media {
+        &local.body
+    } else if remote.inline_media != base.inline_media {
+        &remote.body
+    } else {
+        &base.body
+    };
     let mut merged = Note {
         id: base.id.clone(),
         title: merge_field(&base.title, &local.title, &remote.title, "the title")?,
@@ -115,16 +149,28 @@ fn merge_note(base: &Note, local: &Note, remote: &Note) -> io::Result<Note> {
         font_choice: merge_field(&base.font_choice, &local.font_choice, &remote.font_choice, "font family")?,
         pinned: merge_field(&base.pinned, &local.pinned, &remote.pinned, "pinned state")?,
         strokes: merge_field(&base.strokes, &local.strokes, &remote.strokes, "drawing strokes")?,
+        drawing: merge_field(&base.drawing, &local.drawing, &remote.drawing, "vector drawing")?,
         images: merge_field(&base.images, &local.images, &remote.images, "picture blocks")?,
+        inline_media: merge_field(&base.inline_media, &local.inline_media, &remote.inline_media, "picture placement")?,
         updated: local.updated.max(remote.updated),
     };
     if style_source_body != &merged.body {
-        let chosen_body = std::mem::replace(&mut merged.body, style_source_body.clone());
-        merged.set_body_preserving_format(chosen_body).map_err(|error|
+        // Rebase typography without also moving inline pictures. Their saved
+        // anchor offsets can originate from a different concurrent revision.
+        let mut styled = merged.clone();
+        styled.inline_media.clear();
+        styled.body = style_source_body.clone();
+        styled.set_body_preserving_format(merged.body.clone()).map_err(|error|
             io::Error::new(io::ErrorKind::WouldBlock, format!("Cannot safely merge formatted note text: {error}")))?;
+        merged.rich_text = styled.rich_text;
+    }
+    if anchor_source_body != &merged.body {
+        merged.rebase_image_placements_for_text_change(anchor_source_body);
     }
     merged.validate_rich_text().map_err(|error|
         io::Error::new(io::ErrorKind::InvalidData, format!("Invalid merged text formatting: {error}")))?;
+    merged.validate_inline_media().map_err(|error|
+        io::Error::new(io::ErrorKind::InvalidData, format!("Invalid merged picture placement: {error}")))?;
     Ok(merged)
 }
 
@@ -165,15 +211,29 @@ fn sync_format_toolbar(ui: &MainWindow, note: &Note, selection: TextSelection,
 /// a specific transient caret style if the toolbar selected one. This also
 /// covers Unicode IME, native text paste, selection replace and Backspace.
 fn apply_text_input_edit(note: &mut Note, edited: String,
-                         typed: Option<TextStyle>) -> io::Result<bool> {
+                         typed: Option<TextStyle>, new_caret: Option<usize>) -> io::Result<bool> {
     if note.body == edited { return Ok(false); }
-    let old_length = note.body.chars().count();
-    let new_length = edited.chars().count();
-    let start = note.body.chars().zip(edited.chars())
-        .take_while(|(old, new)| old == new).count();
-    let suffix = note.body.chars().rev().zip(edited.chars().rev())
-        .take((old_length - start).min(new_length - start))
-        .take_while(|(old, new)| old == new).count();
+    let old = note.body.chars().collect::<Vec<_>>();
+    let new = edited.chars().collect::<Vec<_>>();
+    let old_length = old.len();
+    let new_length = new.len();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let common_suffix = old.iter().rev().zip(new.iter().rev())
+        .take_while(|(a, b)| a == b).count();
+    // Full-buffer TextInput edits have ambiguous splice locations when the
+    // surrounding characters repeat ("aaa" -> "aaaa", for instance). Prefer
+    // the shortest possible edit nearest the native editor's resulting caret;
+    // otherwise formatting can remain on the newly inserted character instead
+    // of following the original characters.
+    let (start, suffix) = (0..=prefix).map(|candidate| {
+        let suffix = common_suffix.min(old_length.min(new_length) - candidate);
+        let inserted_end = new_length - suffix;
+        let unchanged = candidate + suffix;
+        let distance = new_caret.map_or(0, |caret| caret.abs_diff(inserted_end));
+        (candidate, suffix, unchanged, distance)
+    }).max_by(|a, b| a.2.cmp(&b.2).then_with(|| b.3.cmp(&a.3))
+        .then_with(|| a.0.cmp(&b.0)))
+        .map(|(start, suffix, _, _)| (start, suffix)).unwrap();
     let new_start_byte = edited.char_indices().nth(start).map(|(pos,_)| pos)
         .unwrap_or(edited.len());
     let new_end_byte = edited.char_indices().nth(new_length - suffix)
@@ -265,6 +325,111 @@ fn refresh_text_after_clipboard(ui: &MainWindow, app: &App, next_caret: usize) {
     ui.set_selection_caret_byte(offset as i32);
 }
 
+/// Conservative transformed hit rectangle for pointer selection and handles.
+/// Precise shape editing remains in the vector model; bounds are deliberately
+/// slightly generous for reliable mouse selection and touch-sized targets.
+fn drawing_bounds(object: &DrawObject) -> (f32, f32, f32, f32) {
+    let mut points = match &object.shape {
+        DrawShape::Rectangle { width, height } |
+        DrawShape::RoundedRectangle { width, height, .. } =>
+            vec![Point::new(0.0, 0.0), Point::new(*width, 0.0),
+                 Point::new(*width, *height), Point::new(0.0, *height)],
+        DrawShape::Ellipse { radius_x, radius_y } =>
+            vec![Point::new(-radius_x, -radius_y), Point::new(*radius_x, -*radius_y),
+                 Point::new(*radius_x, *radius_y), Point::new(-*radius_x, *radius_y)],
+        DrawShape::Circle { radius } =>
+            vec![Point::new(-radius, -radius), Point::new(*radius, -*radius),
+                 Point::new(*radius, *radius), Point::new(-*radius, *radius)],
+        DrawShape::Line { to } => vec![Point::default(), *to],
+        DrawShape::Polygon { points, .. } => points.clone(),
+        DrawShape::CubicBezier { control1, control2, to } =>
+            vec![Point::default(), *control1, *control2, *to],
+    };
+    if points.is_empty() { points.push(Point::default()); }
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for point in points {
+        let p = object.transform.apply(point);
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
+type PictureKey = (String, String); // (page ID, picture ID)
+
+/// Mirror the media store's 500-Unicode-character caption limit before an
+/// invalid value can enter a debounced save queue.
+const MAX_PICTURE_CAPTION_CHARS: usize = 500;
+
+fn queue_picture_caption(
+    captions: &mut HashMap<PictureKey, String>,
+    key: PictureKey,
+    caption: &str,
+) -> io::Result<()> {
+    if caption.chars().take(MAX_PICTURE_CAPTION_CHARS + 1).count() > MAX_PICTURE_CAPTION_CHARS {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "Picture captions are limited to 500 characters"));
+    }
+    captions.insert(key, caption.to_owned());
+    Ok(())
+}
+
+/// A completed deletion must also remove edits that were queued while the
+/// confirmation sheet was open. Other pages and pictures keep their edits.
+fn discard_deleted_picture_edits(
+    action: &PendingAction,
+    widths: &mut HashMap<PictureKey, u8>,
+    captions: &mut HashMap<PictureKey, String>,
+) {
+    let keep = |(note_id, image_id): &PictureKey| match action {
+        PendingAction::Delete { id, .. } => note_id != id,
+        PendingAction::DeletePicture { note_id: deleted_note, image_id: deleted_image } =>
+            note_id != deleted_note || image_id != deleted_image,
+        PendingAction::ClearDrawing { .. } => true,
+    };
+    widths.retain(|key, _| keep(key));
+    captions.retain(|key, _| keep(key));
+}
+
+/// Keep pending edits for *every* picture when a debounce timer is restarted.
+/// Removal happens only after the store has accepted each individual update.
+/// This can also be called on Save, export, and window shutdown, before any
+/// debounce timer is due.
+fn flush_pending_picture_edits(
+    app: &mut App,
+    widths: &mut HashMap<PictureKey, u8>,
+    captions: &mut HashMap<PictureKey, String>,
+) -> io::Result<bool> {
+    if widths.is_empty() && captions.is_empty() { return Ok(false); }
+    app.persist()?;
+    let mut changed = false;
+    let result = (|| -> io::Result<()> {
+        for key in widths.keys().cloned().collect::<Vec<_>>() {
+            let width = widths[&key];
+            app.storage.update_image(&key.0, &key.1, None, Some(width), None)?;
+            widths.remove(&key);
+            changed = true;
+        }
+        for key in captions.keys().cloned().collect::<Vec<_>>() {
+            let caption = &captions[&key];
+            app.storage.update_image(&key.0, &key.1, Some(caption), None, None)?;
+            captions.remove(&key);
+            changed = true;
+        }
+        Ok(())
+    })();
+    // Refresh after partial success too, keeping the in-memory notebook in
+    // step with each image update that actually reached disk.
+    if changed { app.reload_after_media_change()?; }
+    result?;
+    Ok(changed)
+}
+
 impl App {
     fn load(storage: Store) -> io::Result<Self> {
         let mut workspace = storage.load()?;
@@ -287,10 +452,18 @@ impl App {
             last_seen_preferences: file_stamp(&UiSettings::path_for(storage.data_path())),
             storage, baseline: workspace.clone(), workspace, board: None, drawing: false, edit_mode,
             filter: "all".into(), query: String::new(), brush_size: 6,
-            brush_color: "#263238".into(), eraser: false, ui_settings,
+            brush_color: "#263238".into(), eraser: false,
+            draw_tool: "pen".into(), draw_filled: true, draw_fill_color: "#F0D964".into(),
+            draw_opacity: 100, selected_draw_layer_id: None,
+            selected_draw_object: None, draw_origin: None,
+            draw_previous: None, draw_gesture_changed: false,
+            drawing_history: DrawingHistory::default(), ui_settings,
+            drawing_undo_order: Vec::new(), drawing_redo_order: Vec::new(),
+            last_canvas_render: Instant::now(),
             pending_action: None,
             text_history: TextHistory::default(), typing_style: None,
             selection: TextSelection::caret(0),
+            selection_explicit: false,
             rich_clipboard: None,
         };
         app.reload_board();
@@ -422,7 +595,122 @@ impl App {
 
     fn reload_board(&mut self) {
         self.drawing = false;
-        self.board = self.active().map(|note| Board::new(&note.strokes));
+        self.draw_origin = None;
+        self.draw_previous = None;
+        self.draw_gesture_changed = false;
+        self.selected_draw_object = None;
+        self.selected_draw_layer_id = self.active().and_then(|note|
+            note.drawing.layers.last().map(|layer| layer.id.clone()));
+        self.drawing_history.clear();
+        self.drawing_undo_order.clear();
+        self.drawing_redo_order.clear();
+        // Preserve Inkpad's existing "undo last saved pen stroke" behaviour
+        // after reopening a note, without allowing an untracked vector edit.
+        // Existing strokes are explicitly registered as undoable entries.
+        let legacy_strokes = self.active().map_or(0, |note| note.strokes.len().min(48));
+        self.drawing_undo_order.extend(
+            std::iter::repeat_n(DrawingEdit::Stroke(None), legacy_strokes));
+        self.board = self.active().map(Board::from_note);
+    }
+
+    fn record_vector_edit(&mut self, before: &store::DrawingData) {
+        self.drawing_history.record(before);
+        self.drawing_undo_order.push(DrawingEdit::Vector);
+        if self.drawing_undo_order.len() > 48 { self.drawing_undo_order.remove(0); }
+        self.drawing_redo_order.clear();
+    }
+
+    fn record_stroke_edit(&mut self) {
+        self.drawing_undo_order.push(DrawingEdit::Stroke(None));
+        if self.drawing_undo_order.len() > 48 { self.drawing_undo_order.remove(0); }
+        self.drawing_redo_order.clear();
+    }
+
+    /// Redraw without discarding a selected shape or session history.
+    fn refresh_drawing(&mut self) {
+        self.board = self.active().map(Board::from_note);
+        self.last_canvas_render = Instant::now();
+    }
+
+    fn preview_drawing(&mut self) {
+        // A 1100x700 software render becomes expensive with hundreds of paths.
+        // Pointer events may arrive far faster than a human-visible frame rate.
+        if self.last_canvas_render.elapsed() >= Duration::from_millis(40) {
+            self.refresh_drawing();
+        }
+    }
+
+    fn update_selected_object(&mut self, change: impl FnOnce(&mut DrawObject)) -> io::Result<bool> {
+        let Some(id) = self.selected_draw_object.clone() else { return Ok(false); };
+        let Some(note) = self.active_mut() else { return Ok(false); };
+        let before = note.drawing.snapshot();
+        note.drawing.update_object(&id, change).map_err(io::Error::other)?;
+        if note.drawing == before { return Ok(false); }
+        note.touch();
+        self.record_vector_edit(&before);
+        self.refresh_drawing();
+        self.persist()?;
+        Ok(true)
+    }
+
+    fn duplicate_selected_object(&mut self) -> io::Result<()> {
+        let Some(id) = self.selected_draw_object.clone() else { return Ok(()); };
+        let Some(note) = self.active_mut() else { return Ok(()); };
+        let original = note.drawing.object(&id)
+            .ok_or_else(|| io::Error::other("Selected drawing object no longer exists"))?.clone();
+        let before = note.drawing.snapshot();
+        let next = note.drawing.add_object(original.shape.clone(), Some(&original.layer_id))
+            .map_err(io::Error::other)?;
+        note.drawing.update_object(&next, |obj| {
+            obj.style = original.style.clone();
+            obj.transform = original.transform.clone();
+            obj.transform.translation.x += 12.0;
+            obj.transform.translation.y += 12.0;
+            obj.visible = original.visible;
+        }).map_err(io::Error::other)?;
+        note.touch();
+        self.record_vector_edit(&before);
+        self.selected_draw_object = Some(next);
+        self.refresh_drawing();
+        self.persist()
+    }
+
+    fn delete_selected_object(&mut self) -> io::Result<()> {
+        let Some(id) = self.selected_draw_object.clone() else { return Ok(()); };
+        let Some(note) = self.active_mut() else { return Ok(()); };
+        let before = note.drawing.snapshot();
+        note.drawing.remove_object(&id).map_err(io::Error::other)?;
+        note.touch();
+        self.record_vector_edit(&before);
+        self.selected_draw_object = None;
+        self.refresh_drawing();
+        self.persist()
+    }
+
+    fn add_drawing_layer(&mut self) -> io::Result<()> {
+        let Some(note) = self.active_mut() else { return Ok(()); };
+        let before = note.drawing.snapshot();
+        let name = format!("Layer {}", note.drawing.layers.len() + 1);
+        let new_id = note.drawing.add_layer(&name).map_err(io::Error::other)?;
+        note.touch();
+        self.record_vector_edit(&before);
+        self.selected_draw_layer_id = Some(new_id);
+        self.refresh_drawing();
+        self.persist()
+    }
+
+    fn edit_drawing_layer(
+        &mut self,
+        change: impl FnOnce(&mut store::DrawingData) -> Result<(), String>,
+    ) -> io::Result<()> {
+        let Some(note) = self.active_mut() else { return Ok(()); };
+        let before = note.drawing.snapshot();
+        change(&mut note.drawing).map_err(io::Error::other)?;
+        if note.drawing == before { return Ok(()); }
+        note.touch();
+        self.record_vector_edit(&before);
+        self.refresh_drawing();
+        self.persist()
     }
 
     fn create(&mut self, kind: &str) -> io::Result<()> {
@@ -431,6 +719,7 @@ impl App {
         self.workspace.notes.push(note);
         self.edit_mode = if kind == "board" { "draw" } else { "text" }.to_string();
         self.selection = TextSelection::caret(0);
+        self.selection_explicit = false;
         self.typing_style = None;
         self.text_history.clear_for_other_note(&self.workspace.active_id);
         self.reload_board();
@@ -442,6 +731,7 @@ impl App {
             self.workspace.active_id = id.into();
             self.edit_mode = if self.active().is_some_and(|n| n.kind == "board") { "draw" } else { "text" }.into();
             self.selection = TextSelection::caret(0);
+            self.selection_explicit = false;
             self.typing_style = None;
             self.text_history.clear_for_other_note(&self.workspace.active_id);
             self.reload_board();
@@ -512,10 +802,203 @@ impl App {
 
     fn draw(&mut self, x: i32, y: i32, phase: i32) -> io::Result<bool> {
         if self.active().is_none() { return Ok(false); }
+        if phase == 3 {
+            // Slint pointer capture can be cancelled by focus/window loss.
+            // Cancel is NOT a pointer-up: discard the unfinished gesture
+            // rather than persisting a stray zero-sized shape or stroke.
+            if !self.drawing { return Ok(false); }
+            let was_vector = self.draw_tool != "pen" && self.draw_tool != "eraser";
+            let had_vector_edit = self.draw_tool != "select" || self.draw_gesture_changed;
+            if was_vector && had_vector_edit {
+                let mut history = std::mem::take(&mut self.drawing_history);
+                if let Some(note) = self.active_mut() {
+                    history.cancel_last(&mut note.drawing);
+                }
+                self.drawing_history = history;
+                self.drawing_undo_order.pop();
+            } else if !was_vector {
+                if let Some(note) = self.active_mut() { note.strokes.pop(); }
+                self.drawing_undo_order.pop();
+            }
+            self.drawing = false;
+            self.draw_origin = None;
+            self.draw_previous = None;
+            self.draw_gesture_changed = false;
+            self.selected_draw_object = None;
+            self.refresh_drawing();
+            return Ok(true);
+        }
         let point = [x.clamp(0, WIDTH as i32 - 1) as u16, y.clamp(0, HEIGHT as i32 - 1) as u16];
+        if self.draw_tool == "select" {
+            match phase {
+                0 => {
+                    let (px, py) = (point[0] as f32, point[1] as f32);
+                    self.selected_draw_object = self.active().and_then(|note|
+                        canvas::pick_object(&note.drawing, Point::new(px, py), 7.0));
+                    self.drawing = true;
+                    self.draw_previous = Some(point);
+                    self.draw_gesture_changed = false;
+                    return Ok(true);
+                }
+                1 | 2 if self.drawing => {
+                    if let (Some(previous), Some(id)) = (self.draw_previous, self.selected_draw_object.clone()) {
+                        if previous != point {
+                            let before = self.active().unwrap().drawing.snapshot();
+                            if let Some(note) = self.active_mut() {
+                                note.drawing.move_object(&id,
+                                    point[0] as f32 - previous[0] as f32,
+                                    point[1] as f32 - previous[1] as f32).map_err(io::Error::other)?;
+                                note.touch();
+                            }
+                            if !self.draw_gesture_changed { self.record_vector_edit(&before); }
+                            self.draw_gesture_changed = true;
+                            self.draw_previous = Some(point);
+                            if phase == 2 { self.refresh_drawing(); }
+                            else { self.preview_drawing(); }
+                        }
+                    }
+                    if phase == 2 {
+                        self.drawing = false;
+                        if self.draw_gesture_changed { self.persist()?; }
+                    }
+                    return Ok(true);
+                }
+                _ => return Ok(false),
+            }
+        }
+        if matches!(self.draw_tool.as_str(), "rectangle" | "ellipse" | "line" |
+                   "rounded" | "triangle" | "curve" | "circle") {
+            match phase {
+                0 => {
+                    let shape = match self.draw_tool.as_str() {
+                        "ellipse" => DrawShape::Ellipse { radius_x: 0.5, radius_y: 0.5 },
+                        "circle" => DrawShape::Circle { radius: 0.5 },
+                        "line" => DrawShape::Line { to: Point::new(1.0, 1.0) },
+                        "rounded" => DrawShape::RoundedRectangle { width: 1.0, height: 1.0, radius: 0.2 },
+                        "triangle" => DrawShape::Polygon {
+                            points: vec![Point::new(0.5, 0.0), Point::new(1.0, 1.0),
+                                         Point::new(0.0, 1.0)], closed: true },
+                        "curve" => DrawShape::CubicBezier {
+                            control1: Point::new(0.3, 0.0),
+                            control2: Point::new(0.7, 1.0),
+                            to: Point::new(1.0, 1.0) },
+                        _ => DrawShape::Rectangle { width: 1.0, height: 1.0 },
+                    };
+                    let before = self.active().unwrap().drawing.snapshot();
+                    let stroke = parse_color(&self.brush_color);
+                    let fill = parse_color(&self.draw_fill_color);
+                    let filled = self.draw_filled;
+                    let opacity = self.draw_opacity as f32 / 100.0;
+                    let selected_layer = self.selected_draw_layer_id.clone();
+                    let id = {
+                        let note = self.active_mut().unwrap();
+                        let id = note.drawing.add_object(shape, selected_layer.as_deref())
+                            .map_err(io::Error::other)?;
+                        note.drawing.update_object(&id, |object| {
+                            object.transform.translation = Point::new(point[0] as f32, point[1] as f32);
+                            object.style.stroke = Some(stroke);
+                            object.style.stroke_width = 3.0;
+                            object.style.fill = if filled && !matches!(object.shape,
+                                DrawShape::Line { .. } | DrawShape::CubicBezier { .. }) {
+                                Some(DrawFill::Solid { color: fill })
+                            } else { None };
+                            object.style.opacity = opacity;
+                        }).map_err(io::Error::other)?;
+                        note.touch();
+                        id
+                    };
+                    self.record_vector_edit(&before);
+                    self.selected_draw_object = Some(id);
+                    self.draw_origin = Some(point);
+                    self.drawing = true;
+                    self.refresh_drawing();
+                    return Ok(true);
+                }
+                1 | 2 if self.drawing => {
+                    if let (Some(start), Some(id)) = (self.draw_origin, self.selected_draw_object.clone()) {
+                        let (dx, dy) = (point[0] as f32 - start[0] as f32,
+                                        point[1] as f32 - start[1] as f32);
+                        let tool = self.draw_tool.clone();
+                        if let Some(note) = self.active_mut() {
+                            note.drawing.update_object(&id, |object| {
+                                match tool.as_str() {
+                                    "ellipse" => {
+                                        object.shape = DrawShape::Ellipse {
+                                            radius_x: (dx.abs() / 2.0).max(0.5),
+                                            radius_y: (dy.abs() / 2.0).max(0.5),
+                                        };
+                                        object.transform.translation = Point::new(
+                                            start[0].min(point[0]) as f32 + (dx.abs() / 2.0).max(0.5),
+                                            start[1].min(point[1]) as f32 + (dy.abs() / 2.0).max(0.5));
+                                    }
+                                    "circle" => {
+                                        let radius = ((dx * dx + dy * dy).sqrt() / 2.0).max(0.5);
+                                        object.shape = DrawShape::Circle { radius };
+                                        object.transform.translation = Point::new(
+                                            (start[0] as f32 + point[0] as f32) / 2.0,
+                                            (start[1] as f32 + point[1] as f32) / 2.0);
+                                    }
+                                    "line" => {
+                                        object.shape = DrawShape::Line { to: Point::new(dx, dy) };
+                                        object.transform.translation = Point::new(start[0] as f32, start[1] as f32);
+                                    }
+                                    "curve" => {
+                                        object.shape = DrawShape::CubicBezier {
+                                            control1: Point::new(dx / 3.0, 0.0),
+                                            control2: Point::new(dx * 2.0 / 3.0, dy),
+                                            to: Point::new(dx, dy),
+                                        };
+                                        object.transform.translation = Point::new(start[0] as f32, start[1] as f32);
+                                    }
+                                    "triangle" | "rounded" => {
+                                        let w = dx.abs().max(1.0);
+                                        let h = dy.abs().max(1.0);
+                                        object.shape = if tool == "triangle" {
+                                            DrawShape::Polygon {
+                                                points: vec![Point::new(w / 2.0, 0.0),
+                                                             Point::new(w, h), Point::new(0.0, h)],
+                                                closed: true,
+                                            }
+                                        } else {
+                                            DrawShape::RoundedRectangle {
+                                                width: w, height: h,
+                                                radius: (w.min(h) * 0.15).min(50.0),
+                                            }
+                                        };
+                                        object.transform.translation = Point::new(
+                                            start[0].min(point[0]) as f32,
+                                            start[1].min(point[1]) as f32);
+                                    }
+                                    _ => {
+                                        object.shape = DrawShape::Rectangle {
+                                            width: dx.abs().max(1.0), height: dy.abs().max(1.0),
+                                        };
+                                        object.transform.translation = Point::new(
+                                            start[0].min(point[0]) as f32,
+                                            start[1].min(point[1]) as f32);
+                                    }
+                                }
+                            }).map_err(io::Error::other)?;
+                            note.touch();
+                        }
+                        if phase == 2 { self.refresh_drawing(); }
+                        else { self.preview_drawing(); }
+                    }
+                    if phase == 2 {
+                        self.drawing = false;
+                        self.draw_origin = None;
+                        self.persist()?;
+                    }
+                    return Ok(true);
+                }
+                _ => return Ok(false),
+            }
+        }
+        if self.draw_tool != "pen" && self.draw_tool != "eraser" { return Ok(false); }
         match phase {
             0 => {
                 self.drawing = true;
+                self.record_stroke_edit();
                 let stroke = Stroke {
                     color: parse_color(&self.brush_color), width: self.brush_size,
                     eraser: self.eraser, points: vec![point],
@@ -539,6 +1022,7 @@ impl App {
                 }
                 if phase == 2 {
                     self.drawing = false;
+                    self.refresh_drawing();
                     self.persist()?;
                 }
                 Ok(true)
@@ -549,19 +1033,67 @@ impl App {
 
     fn undo(&mut self) -> io::Result<()> {
         self.drawing = false;
-        if let Some(note) = self.active_mut() {
-            note.strokes.pop(); note.touch();
+        let edit = self.drawing_undo_order.pop();
+        match edit {
+            Some(DrawingEdit::Vector) => {
+                let mut history = std::mem::take(&mut self.drawing_history);
+                let result = if let Some(note) = self.active_mut() {
+                    history.undo(&mut note.drawing)
+                } else { false };
+                self.drawing_history = history;
+                if !result { return Err(io::Error::other("No vector snapshot to undo")); }
+                self.drawing_redo_order.push(DrawingEdit::Vector);
+            }
+            Some(DrawingEdit::Stroke(_)) => {
+                let stroke = self.active_mut().and_then(|note| note.strokes.pop());
+                if let Some(stroke) = stroke {
+                    self.drawing_redo_order.push(DrawingEdit::Stroke(Some(stroke)));
+                }
+            }
+            None => return Ok(()),
         }
-        self.reload_board();
+        self.selected_draw_object = None;
+        if let Some(note) = self.active_mut() { note.touch(); }
+        self.refresh_drawing();
+        self.persist()
+    }
+
+    fn redo_drawing(&mut self) -> io::Result<()> {
+        let Some(edit) = self.drawing_redo_order.pop() else { return Ok(()); };
+        match edit {
+            DrawingEdit::Vector => {
+                let mut history = std::mem::take(&mut self.drawing_history);
+                let result = if let Some(note) = self.active_mut() {
+                    history.redo(&mut note.drawing)
+                } else { false };
+                self.drawing_history = history;
+                if !result { return Err(io::Error::other("No vector snapshot to redo")); }
+                self.drawing_undo_order.push(DrawingEdit::Vector);
+            }
+            DrawingEdit::Stroke(Some(stroke)) => {
+                if let Some(note) = self.active_mut() { note.strokes.push(stroke); }
+                self.drawing_undo_order.push(DrawingEdit::Stroke(None));
+            }
+            DrawingEdit::Stroke(None) => return Err(io::Error::other("Stroke redo snapshot missing")),
+        }
+        self.selected_draw_object = None;
+        if let Some(note) = self.active_mut() { note.touch(); }
+        self.refresh_drawing();
         self.persist()
     }
 
     fn clear(&mut self) -> io::Result<()> {
         self.drawing = false;
         if let Some(note) = self.active_mut() {
-            note.strokes.clear(); note.touch();
+            note.strokes.clear();
+            note.drawing.objects.clear();
+            note.touch();
         }
-        self.reload_board();
+        self.drawing_history.clear();
+        self.drawing_undo_order.clear();
+        self.drawing_redo_order.clear();
+        self.selected_draw_object = None;
+        self.refresh_drawing();
         self.persist()
     }
 
@@ -598,19 +1130,41 @@ impl App {
     fn import_image_file(&mut self, path: &Path) -> io::Result<()> {
         self.persist()?;
         let id = self.workspace.active_id.clone();
-        self.storage.insert_image_from_file(&id, path)?;
-        self.reload_after_media_change()?;
+        let (expected_body, anchor) = self.image_insertion_point()?;
+        let inserted = self.storage.insert_image_from_file(&id, path)?;
+        let placement = self.storage.place_image_at_scalar(&id, &inserted.id,
+            Some(anchor), Some(&expected_body));
+        let refresh = self.reload_after_media_change();
         self.edit_mode = "text".to_string();
+        refresh?;
+        placement?;
         Ok(())
     }
 
     fn import_image_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.persist()?;
         let id = self.workspace.active_id.clone();
-        self.storage.insert_image_bytes(&id, bytes)?;
-        self.reload_after_media_change()?;
+        let (expected_body, anchor) = self.image_insertion_point()?;
+        let inserted = self.storage.insert_image_bytes(&id, bytes)?;
+        let placement = self.storage.place_image_at_scalar(&id, &inserted.id,
+            Some(anchor), Some(&expected_body));
+        let refresh = self.reload_after_media_change();
         self.edit_mode = "text".to_string();
+        refresh?;
+        placement?;
         Ok(())
+    }
+
+    fn image_insertion_point(&self) -> io::Result<(String, usize)> {
+        let note = self.active().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
+            "Select a page before inserting a picture"))?;
+        let scalar_len = note.body.chars().count();
+        let anchor = if self.selection_explicit {
+            self.selection.focus.min(scalar_len)
+        } else {
+            scalar_len
+        };
+        Ok((note.body.clone(), anchor))
     }
 
     fn update_media(&mut self, id: &str, caption: Option<&str>, width: Option<u8>,
@@ -621,7 +1175,19 @@ impl App {
         self.reload_after_media_change()
     }
 
-    fn export_complete_page(&self) -> io::Result<()> {
+    fn place_media_at_caret(&mut self, image_id: &str) -> io::Result<()> {
+        if !self.selection_explicit {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "Click in the writing area where this picture should appear first"));
+        }
+        self.persist()?;
+        let note_id = self.workspace.active_id.clone();
+        let (body, offset) = self.image_insertion_point()?;
+        self.storage.place_image_at_scalar(&note_id, image_id, Some(offset), Some(&body))?;
+        self.reload_after_media_change()
+    }
+
+    fn export_complete_page(&mut self) -> io::Result<()> {
         let Some(note) = self.active() else { return Ok(()); };
         let title: String = note.title.chars().map(|c| {
             if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control() { '_' } else { c }
@@ -630,7 +1196,15 @@ impl App {
             .add_filter("Web page with embedded pictures", &["html"])
             .set_file_name(format!("{}.html", if title.is_empty() { "Inkpad page" } else { &title }))
             .save_file() else { return Ok(()); };
-        self.storage.export_note_html(&note.id, &path)
+        let id = note.id.clone();
+        self.export_complete_page_to(&id, &path)
+    }
+
+    fn export_complete_page_to(&mut self, note_id: &str, path: &Path) -> io::Result<()> {
+        // HTML export reads the on-disk workspace, while the visible editor
+        // may still be inside its 380 ms autosave delay.
+        self.persist()?;
+        self.storage.export_note_html(note_id, path)
     }
 }
 
@@ -692,6 +1266,52 @@ fn board_image(board: &Board) -> Image {
     Image::from_rgba8(frame)
 }
 
+/// Show the text surrounding a body search hit instead of the first line.
+/// Lowercasing can expand a Unicode character (e.g. İ -> i + combining dot),
+/// so map the match back to the original body's character positions before
+/// clipping. Never use offsets from the lowercased copy to slice the original.
+fn body_match_snippet(body: &str, query: &str) -> Option<String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() { return None; }
+    let match_byte = body.to_lowercase().find(&query)?;
+    let mut lower_byte = 0;
+    let mut match_char = 0usize;
+    for ch in body.chars() {
+        let char_bytes = ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+        if lower_byte + char_bytes > match_byte { break; }
+        lower_byte += char_bytes;
+        match_char += 1;
+    }
+
+    const CONTEXT_BEFORE: usize = 18;
+    const MAX_SNIPPET_CHARS: usize = 72;
+    let start = match_char.saturating_sub(CONTEXT_BEFORE);
+    let excerpt: String = body.chars().skip(start).take(MAX_SNIPPET_CHARS).collect();
+    let normalized = excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let clipped_after = body.chars().skip(start + MAX_SNIPPET_CHARS).next().is_some();
+    Some(format!("{}{}{}", if start > 0 { "… " } else { "" }, normalized,
+        if clipped_after { " …" } else { "" }))
+}
+
+fn note_row_subtitle(note: &Note, query: &str) -> String {
+    if let Some(snippet) = body_match_snippet(&note.body, query) {
+        return snippet;
+    }
+    if !note.images.is_empty() {
+        format!("{} picture{} · {}", note.images.len(), if note.images.len() == 1 { "" } else { "s" },
+            note.body.lines().find(|line| !line.trim().is_empty()).unwrap_or("Photo page"))
+            .chars().take(70).collect::<String>()
+    } else if note.kind == "board" {
+        let strokes = note.strokes.len();
+        let shapes = note.drawing.objects.len();
+        format!("Sketch · {strokes} stroke{} · {shapes} shape{}",
+            if strokes == 1 { "" } else { "s" }, if shapes == 1 { "" } else { "s" })
+    } else {
+        let preview = note.body.lines().find(|line| !line.trim().is_empty()).unwrap_or("Empty note");
+        preview.chars().take(58).collect()
+    }
+}
+
 fn update_rows(ui: &MainWindow, app: &App) {
     let query = app.query.trim().to_lowercase();
     let mut notes: Vec<&Note> = app.workspace.notes.iter().filter(|note| {
@@ -701,16 +1321,7 @@ fn update_rows(ui: &MainWindow, app: &App) {
     notes.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| b.updated.cmp(&a.updated)).then_with(|| a.title.cmp(&b.title)));
     let rows = notes.into_iter().map(|note| NoteRow {
         id: note.id.clone().into(), title: note.title.clone().into(),
-        subtitle: if !note.images.is_empty() {
-            format!("{} picture{} · {}", note.images.len(), if note.images.len() == 1 { "" } else { "s" },
-                note.body.lines().find(|line| !line.trim().is_empty()).unwrap_or("Photo page"))
-                .chars().take(70).collect::<String>()
-        } else if note.kind == "board" {
-            format!("Sketch · {} stroke{}", note.strokes.len(), if note.strokes.len() == 1 { "" } else { "s" })
-        } else {
-            let preview = note.body.lines().find(|line| !line.trim().is_empty()).unwrap_or("Empty note");
-            preview.chars().take(58).collect()
-        }.into(),
+        subtitle: note_row_subtitle(note, &query).into(),
         kind: note.kind.clone().into(), active: note.id == app.workspace.active_id,
         pinned: note.pinned,
     }).collect::<Vec<_>>();
@@ -753,6 +1364,105 @@ fn note_styled_preview(note: &Note) -> StyledText {
         .unwrap_or_else(|_| StyledText::from_plain_text(&note.body))
 }
 
+/// Produce a separate, read-only display span for the composed document.
+/// The *single* editable TextInput remains authoritative for caret movement,
+/// native selection, copy/paste and undo. A rendered span must never become an
+/// independent text buffer that could silently overwrite a saved note.
+fn note_visual_slice(note: &Note, start: usize, end: usize) -> Note {
+    let mut part = note.clone();
+    let start_byte = note.body.char_indices().nth(start)
+        .map(|(at, _)| at).unwrap_or(note.body.len());
+    let end_byte = note.body.char_indices().nth(end)
+        .map(|(at, _)| at).unwrap_or(note.body.len());
+    part.body = note.body.get(start_byte..end_byte).unwrap_or("").to_string();
+    part.rich_text = note.rich_text.iter().filter_map(|run| {
+        let lo = run.start.max(start);
+        let hi = run.end.min(end);
+        (lo < hi).then(|| store::TextRun {
+            start: lo - start, end: hi - start, style: run.style.clone()
+        })
+    }).collect();
+    part.images.clear();
+    part.inline_media.clear();
+    part
+}
+
+fn document_paragraph_model(note: &Note) -> (ModelRc<RichPreviewParagraph>, bool) {
+    let Some(paragraphs) = visual_preview::build(note) else {
+        return (ModelRc::from(Rc::new(VecModel::<RichPreviewParagraph>::from(vec![]))), false);
+    };
+    let rows = paragraphs.into_iter().map(|paragraph| {
+        let spans = paragraph.spans.into_iter().map(|span| {
+            let (has_foreground, foreground) = span.foreground
+                .map(|rgb| (true, slint::Color::from_rgb_u8(rgb[0], rgb[1], rgb[2])))
+                .unwrap_or((false, slint::Color::default()));
+            RichPreviewSpan {
+                text: span.layout_text().into(),
+                size: span.font_size,
+                family: span.family.into(),
+                bold: span.bold,
+                foreground,
+                has_foreground,
+                trailing_gap: span.text.chars().last().is_some_and(char::is_whitespace),
+            }
+        }).collect::<Vec<_>>();
+        RichPreviewParagraph { spans: ModelRc::from(Rc::new(VecModel::from(spans))) }
+    }).collect::<Vec<_>>();
+    (ModelRc::from(Rc::new(VecModel::from(rows))), true)
+}
+
+/// Render the persisted text/image order in the same writing workspace.
+/// Picture previews reuse the existing bounded thumbnail model and never read
+/// full-resolution PNGs into the Slint scene. Legacy photos remain after text.
+fn update_document_blocks(ui: &MainWindow, app: &App) {
+    let Some(note) = app.active() else {
+        ui.set_has_rich_formatting(false);
+        ui.set_document_blocks(ModelRc::from(Rc::new(VecModel::<DocumentBlockRow>::from(vec![]))));
+        return;
+    };
+    ui.set_has_rich_formatting(!note.rich_text.is_empty());
+    let media_model = ui.get_media_rows();
+    let media: HashMap<String, MediaRow> = (0..media_model.row_count())
+        .filter_map(|index| media_model.row_data(index))
+        .map(|row| (row.id.to_string(), row)).collect();
+    let order = match note.content_blocks() {
+        Ok(order) => order,
+        Err(error) => {
+            eprintln!("Inkpad document composition unavailable: {error}");
+            vec![NoteContentBlock::Text { start: 0, end: note.body.chars().count() }]
+        }
+    };
+    let blank_paragraphs = || ModelRc::from(Rc::new(VecModel::<RichPreviewParagraph>::from(vec![])));
+    let blank_style = || StyledText::from_plain_text("");
+    let rows = order.into_iter().map(|block| match block {
+        NoteContentBlock::Text { start, end } => {
+            let part = note_visual_slice(note, start, end);
+            let (rich_paragraphs, rich_exact) = document_paragraph_model(&part);
+            DocumentBlockRow {
+                kind: "text".into(), text: note_styled_preview(&part),
+                image_id: "".into(), caption: "".into(), width_percent: 100,
+                position: 0, preview: Image::default(), can_move_up: false,
+                can_move_down: false, rich_paragraphs, rich_exact,
+            }
+        }
+        NoteContentBlock::Image { image_id } => {
+            let row = media.get(&image_id);
+            DocumentBlockRow {
+                kind: "image".into(), text: blank_style(),
+                image_id: image_id.into(),
+                caption: row.map_or("".into(), |it| it.caption.clone()),
+                width_percent: row.map_or(65, |it| it.width_percent),
+                position: row.map_or(0, |it| it.position),
+                preview: row.map_or_else(Image::default, |it| it.preview.clone()),
+                can_move_up: row.is_some_and(|it| it.position > 0),
+                can_move_down: row.is_some_and(|it| (it.position as usize) + 1 < media.len()),
+                rich_paragraphs: blank_paragraphs(), rich_exact: false,
+            }
+        }
+    }).collect::<Vec<_>>();
+    ui.set_document_blocks(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
 fn update_visual_preview(ui: &MainWindow, note: &Note) {
     ui.set_note_styled_preview(note_styled_preview(note));
     if let Some(paragraphs) = visual_preview::build(note) {
@@ -762,12 +1472,13 @@ fn update_visual_preview(ui: &MainWindow, note: &Note) {
                     .map(|rgb| (true, slint::Color::from_rgb_u8(rgb[0], rgb[1], rgb[2])))
                     .unwrap_or((false, slint::Color::default()));
                 RichPreviewSpan {
-                    text: span.text.into(),
+                    text: span.layout_text().into(),
                     size: span.font_size,
                     family: span.family.into(),
                     bold: span.bold,
                     foreground,
                     has_foreground,
+                    trailing_gap: span.text.chars().last().is_some_and(char::is_whitespace),
                 }
             }).collect::<Vec<_>>();
             RichPreviewParagraph {
@@ -804,9 +1515,48 @@ fn append_styled_segment(out: &mut String, text: &str, style: &TextStyle) {
     if style.color.is_some() { out.push_str("</font>"); }
 }
 
+fn update_drawing_ui(ui: &MainWindow, app: &App) {
+    ui.set_draw_tool(app.draw_tool.clone().into());
+    ui.set_can_undo_drawing(!app.drawing_undo_order.is_empty());
+    ui.set_can_redo_drawing(!app.drawing_redo_order.is_empty());
+    ui.set_draw_filled(app.draw_filled);
+    ui.set_draw_fill_color(app.draw_fill_color.clone().into());
+    ui.set_draw_opacity(app.draw_opacity as i32);
+    ui.set_eraser(app.eraser);
+    ui.set_brush_color(app.brush_color.clone().into());
+    ui.set_brush_size(app.brush_size as i32);
+    let drawing = app.active().map(|note| &note.drawing);
+    ui.set_drawing_object_count(drawing.map_or(0, |d| d.objects.len() as i32));
+    ui.set_drawing_layer_count(drawing.map_or(0, |d| d.layers.len() as i32));
+    let layers = drawing.map(|d| d.layers.iter().map(|layer| DrawingLayerRow {
+        id: layer.id.clone().into(),
+        name: layer.name.clone().into(),
+        visible: layer.visible,
+        locked: layer.locked,
+    }).collect::<Vec<_>>()).unwrap_or_default();
+    ui.set_drawing_layers(ModelRc::from(Rc::new(VecModel::from(layers))));
+    let selected_layer = app.selected_draw_layer_id.as_deref().and_then(|id|
+        drawing.and_then(|d| d.layers.iter().find(|l| l.id == id)));
+    ui.set_selected_draw_layer(selected_layer.map_or("", |l| l.id.as_str()).into());
+    ui.set_selected_draw_layer_name(selected_layer.map_or("", |l| l.name.as_str()).into());
+    let selected = app.selected_draw_object.as_deref().and_then(|id|
+        drawing.and_then(|d| d.object(id)));
+    if let Some(object) = selected {
+        let (x0, y0, x1, y1) = drawing_bounds(object);
+        ui.set_selected_draw_object(object.id.clone().into());
+        ui.set_selected_draw_x(x0.max(0.0).min(WIDTH as f32) as i32);
+        ui.set_selected_draw_y(y0.max(0.0).min(HEIGHT as f32) as i32);
+        ui.set_selected_draw_width((x1-x0).max(1.0).min(WIDTH as f32) as i32);
+        ui.set_selected_draw_height((y1-y0).max(1.0).min(HEIGHT as f32) as i32);
+    } else {
+        ui.set_selected_draw_object(SharedString::default());
+    }
+}
+
 fn update_editor(ui: &MainWindow, app: &App) {
     if let Some(note) = app.active() {
         ui.set_has_note(true);
+        ui.set_active_pinned(note.pinned);
         ui.set_note_title(note.title.clone().into());
         ui.set_note_body(note.body.clone().into());
         update_visual_preview(ui, note);
@@ -817,6 +1567,7 @@ fn update_editor(ui: &MainWindow, app: &App) {
         ui.set_active_kind(note.kind.clone().into());
     } else {
         ui.set_has_note(false);
+        ui.set_active_pinned(false);
         ui.set_note_title(SharedString::default());
         ui.set_note_body(SharedString::default());
         ui.set_note_styled_preview(StyledText::from_plain_text(""));
@@ -826,7 +1577,9 @@ fn update_editor(ui: &MainWindow, app: &App) {
     }
     ui.set_edit_mode(app.edit_mode.clone().into());
     if let Some(board) = app.board.as_ref() { ui.set_canvas_image(board_image(board)); }
+    update_drawing_ui(ui, app);
     update_media_rows(ui, app);
+    update_document_blocks(ui, app);
 }
 
 fn update_media_rows(ui: &MainWindow, app: &App) {
@@ -856,6 +1609,68 @@ fn update_media_rows(ui: &MainWindow, app: &App) {
         ui.set_selected_media_id("".into());
     }
     ui.set_media_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
+/// Refresh saved photo metadata in existing repeater rows. Recreating the
+/// gallery on a caption timer destroys the focused caption editor/caret.
+fn sync_visible_picture_rows(ui: &MainWindow, app: &App) {
+    let Some(note) = app.active() else { return; };
+    let rows = ui.get_media_rows();
+    for index in 0..rows.row_count() {
+        let Some(mut row) = rows.row_data(index) else { continue; };
+        let Some(saved) = note.images.iter().find(|image| image.id == row.id.as_str()) else {
+            continue;
+        };
+        if row.width_percent != saved.width_percent as i32 ||
+            row.caption.as_str() != saved.caption
+        {
+            row.width_percent = saved.width_percent as i32;
+            row.caption = saved.caption.clone().into();
+            row.position = saved.position as i32;
+            rows.set_row_data(index, row);
+        }
+    }
+    // The embedded document is another view of the SAME saved image model.
+    // Change existing repeater rows in place so a focused caption LineEdit
+    // does not disappear when a debounced resize or caption save finishes.
+    let documents = ui.get_document_blocks();
+    for index in 0..documents.row_count() {
+        let Some(mut row) = documents.row_data(index) else { continue; };
+        if row.kind.as_str() != "image" { continue; }
+        let Some(saved) = note.images.iter().find(|image| image.id == row.image_id.as_str()) else { continue; };
+        if row.width_percent != saved.width_percent as i32 ||
+            row.caption.as_str() != saved.caption ||
+            row.position != saved.position as i32
+        {
+            row.width_percent = saved.width_percent as i32;
+            row.caption = saved.caption.clone().into();
+            row.position = saved.position as i32;
+            documents.set_row_data(index, row);
+        }
+    }
+}
+
+/// Restore the last accepted caption after an overlong edit. An existing
+/// pending (valid) caption takes precedence over the previously saved value.
+fn restore_rejected_picture_caption(ui: &MainWindow, image_id: &str, caption: &str) {
+    let rows = ui.get_media_rows();
+    for index in 0..rows.row_count() {
+        let Some(mut row) = rows.row_data(index) else { continue; };
+        if row.id.as_str() == image_id {
+            row.caption = caption.into();
+            rows.set_row_data(index, row);
+            break;
+        }
+    }
+    let blocks = ui.get_document_blocks();
+    for index in 0..blocks.row_count() {
+        let Some(mut row) = blocks.row_data(index) else { continue; };
+        if row.image_id.as_str() == image_id {
+            row.caption = caption.into();
+            blocks.set_row_data(index, row);
+            break;
+        }
+    }
 }
 
 fn update_all(ui: &MainWindow, app: &App) {
@@ -916,7 +1731,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some(ui) = weak.upgrade() else { return; };
                 if app.borrow().pending_action.is_some() { return; }
                 let result = app.borrow_mut().import_image_file(&path);
-                if result.is_ok() { update_all(&ui, &app.borrow()); }
+                if result.is_ok() {
+                    update_all(&ui, &app.borrow());
+                    ui.set_pictures_expanded(true);
+                }
                 set_status(&ui, result);
             });
         }
@@ -931,7 +1749,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some(ui) = weak.upgrade() else { return; };
                 if app.borrow().pending_action.is_some() { return; }
                 let result = app.borrow_mut().import_image_bytes(&image_png);
-                if result.is_ok() { update_all(&ui, &app.borrow()); }
+                if result.is_ok() {
+                    update_all(&ui, &app.borrow());
+                    ui.set_pictures_expanded(true);
+                }
                 set_status(&ui, result);
             });
             true
@@ -959,6 +1780,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Coalesce bursts of typing and formatting changes to avoid blocking text
     // entry with a synchronous disk fsync after every keystroke.
     let text_save_timer = Rc::new(slint::Timer::default());
+    let pending_picture_widths: Rc<RefCell<HashMap<PictureKey, u8>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let pending_picture_captions: Rc<RefCell<HashMap<PictureKey, String>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     let refresh_timer = slint::Timer::default();
     {
         let app = app.clone();
@@ -971,7 +1796,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(false) => {}
                 Err(error) => set_status(&ui, Err(error)),
             }
-            match app.borrow_mut().sync_preferences() {
+            // Drop the mutable RefCell borrow before reading settings below.
+            // Matching directly on borrow_mut() keeps its temporary alive
+            // through the match arm and panics when appearance is updated.
+            let preferences_result = { app.borrow_mut().sync_preferences() };
+            match preferences_result {
                 Ok(true) => {
                     let state = app.borrow();
                     ui.set_appearance_theme(state.ui_settings.theme.as_str().into());
@@ -996,7 +1825,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.$event(move |value| {
                 let Some(ui) = weak.upgrade() else { return; };
                 if app.borrow().pending_action.is_some() { return; }
-                let result: io::Result<()> = ($action)(&mut app.borrow_mut(), value);
+                let result: io::Result<()> = ($action)(&mut app.borrow_mut(), value, &ui);
                 let state = app.borrow();
                 update_rows(&ui, &state);
                 // Font buttons emit callbacks rather than two-way bindings;
@@ -1026,7 +1855,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // it would jump the caret. Refresh the editor only if
                         // an agent selected a different page while this edit
                         // was waiting for autosave.
-                        if changed_page { update_editor(&ui, &state); }
+                        if changed_page {
+                            update_editor(&ui, &state);
+                        } else if result.is_ok() {
+                            update_document_blocks(&ui, &state);
+                        }
                         drop(state);
                         set_status(&ui, result);
                     }
@@ -1035,27 +1868,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
 
-    bind_change!(on_rename_note, |app: &mut App, text: SharedString| {
+    bind_change!(on_rename_note, |app: &mut App, text: SharedString, _ui: &MainWindow| {
         if let Some(note) = app.active_mut() {
             note.title = text.to_string(); note.touch();
         }
         Ok(())
     });
-    bind_change!(on_edit_body, |app: &mut App, text: SharedString| {
+    bind_change!(on_edit_body, |app: &mut App, text: SharedString, ui: &MainWindow| {
         let edited = text.to_string();
+        let caret = ui.get_selection_caret_byte();
+        let caret_hint = if caret < 0 { None } else {
+            TextSelection::from_utf8_bytes(&edited, caret as usize, caret as usize)
+                .ok().map(|selection| selection.focus)
+        };
         if let Some(before) = app.active().cloned() {
             if before.body != edited {
                 let typed = app.typing_style.clone();
                 app.text_history.record(&before, EditKind::Typing);
                 if let Some(note) = app.active_mut() {
-                    apply_text_input_edit(note, edited, typed)?;
+                    apply_text_input_edit(note, edited, typed, caret_hint)?;
                 }
                 if let Some(after) = app.active().cloned() { app.text_history.commit_after(&after); }
             }
         }
         Ok(())
     });
-    bind_change!(on_change_font_size, |app: &mut App, size: i32| {
+    bind_change!(on_change_font_size, |app: &mut App, size: i32, _ui: &MainWindow| {
         let size = size.clamp(12, 40);
         if let Some(before) = app.active().cloned() {
             let selection = app.selection;
@@ -1072,7 +1910,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(())
     });
-    bind_change!(on_change_font_choice, |app: &mut App, choice: SharedString| {
+    bind_change!(on_change_font_choice, |app: &mut App, choice: SharedString, _ui: &MainWindow| {
         let choice = choice.to_string();
         if ["Sans", "Serif", "Mono"].contains(&choice.as_str()) {
             if let Some(before) = app.active().cloned() {
@@ -1145,11 +1983,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let app = app.clone(); let weak = ui.as_weak();
+        let widths = pending_picture_widths.clone();
+        let captions = pending_picture_captions.clone();
         ui.on_confirm_delete(move || {
             let Some(ui) = weak.upgrade() else { return; };
+            let pending_action = app.borrow().pending_action.clone();
             let result = app.borrow_mut().confirm_action();
             ui.set_delete_confirm_open(false);
-            if result.is_ok() { update_all(&ui, &app.borrow()); }
+            if result.is_ok() {
+                if let Some(action) = pending_action.as_ref() {
+                    discard_deleted_picture_edits(action, &mut widths.borrow_mut(),
+                        &mut captions.borrow_mut());
+                }
+                update_all(&ui, &app.borrow());
+            }
             set_status(&ui, result);
         });
     }
@@ -1188,6 +2035,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return; // Changes may be transient while the OS IME is composing text.
             };
             state.selection = selection;
+            state.selection_explicit = true;
             // The selection caption displays Unicode *characters*, not UTF-8
             // bytes. Keep the advanced manual range untouched while its input
             // fields are open so selecting text cannot silently overwrite a
@@ -1233,6 +2081,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     update_visual_preview(&ui, note);
                     sync_format_toolbar(&ui, note, state.selection, state.typing_style.as_ref());
                 }
+                update_document_blocks(&ui, &state);
                 drop(state);
                 ui.invoke_restore_text_selection();
             }
@@ -1263,6 +2112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     update_visual_preview(&ui, note);
                     sync_format_toolbar(&ui, note, state.selection, state.typing_style.as_ref());
                 }
+                update_document_blocks(&ui, &state);
                 drop(state);
                 ui.invoke_restore_text_selection();
             }
@@ -1441,7 +2291,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .pick_file();
             if let Some(path) = chosen {
                 let result = app.borrow_mut().import_image_file(&path);
-                if result.is_ok() { update_all(&ui, &app.borrow()); }
+                if result.is_ok() {
+                    update_all(&ui, &app.borrow());
+                    ui.set_pictures_expanded(true);
+                }
                 set_status(&ui, result);
             }
         });
@@ -1452,7 +2305,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(ui) = weak.upgrade() else { return; };
             if app.borrow().pending_action.is_some() { return; }
             let result = png_from_clipboard().and_then(|bytes| app.borrow_mut().import_image_bytes(&bytes));
-            if result.is_ok() { update_all(&ui, &app.borrow()); }
+                if result.is_ok() {
+                    update_all(&ui, &app.borrow());
+                    ui.set_pictures_expanded(true);
+                }
             set_status(&ui, result);
         });
     }
@@ -1472,24 +2328,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let app = app.clone(); let weak = ui.as_weak();
         let timer = image_resize_timer.clone();
+        let widths = pending_picture_widths.clone();
         ui.on_resize_media(move |image_id, width| {
             let Some(ui) = weak.upgrade() else { return; };
             if app.borrow().pending_action.is_some() { return; }
-            let id = image_id.to_string();
-            let page_id = app.borrow().workspace.active_id.clone();
+            let key = (app.borrow().workspace.active_id.clone(), image_id.to_string());
             let width = width.clamp(10, 100) as u8;
+            widths.borrow_mut().insert(key, width);
             ui.set_save_status("Updating picture size…".into());
             let app = app.clone(); let weak = weak.clone();
+            let widths = widths.clone();
             timer.start(slint::TimerMode::SingleShot, Duration::from_millis(180), move || {
                 let Some(ui) = weak.upgrade() else { return; };
-                let current_page = app.borrow().workspace.active_id == page_id;
-                let result = if current_page {
-                    app.borrow_mut().update_media(&id, None, Some(width), None)
-                } else {
-                    app.borrow().storage.update_image(&page_id, &id, None, Some(width), None).map(|_| ())
-                };
-                if current_page && result.is_ok() { update_media_rows(&ui, &app.borrow()); }
-                set_status(&ui, result);
+                let result = flush_pending_picture_edits(&mut app.borrow_mut(),
+                    &mut widths.borrow_mut(), &mut HashMap::new());
+                // Update existing rows without replacing the caption editor
+                // while the user has a pending caption change.
+                if result.as_ref().is_ok_and(|changed| *changed) {
+                    sync_visible_picture_rows(&ui, &app.borrow());
+                }
+                set_status(&ui, result.map(|_| ()));
             });
         });
     }
@@ -1504,33 +2362,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(index) = index {
                 let new_index = (index as i32 + step).max(0) as usize;
                 let result = app.borrow_mut().update_media(image_id.as_str(), None, None, Some(new_index));
-                if result.is_ok() { update_media_rows(&ui, &app.borrow()); }
+                if result.is_ok() {
+                    update_media_rows(&ui, &app.borrow());
+                    update_document_blocks(&ui, &app.borrow());
+                }
                 set_status(&ui, result);
             }
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_place_media_at_caret(move |image_id| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let result = app.borrow_mut().place_media_at_caret(image_id.as_str());
+            if result.is_ok() {
+                update_media_rows(&ui, &app.borrow());
+                update_document_blocks(&ui, &app.borrow());
+            }
+            set_status(&ui, result);
         });
     }
     let image_caption_timer = Rc::new(slint::Timer::default());
     {
         let app = app.clone(); let weak = ui.as_weak();
         let timer = image_caption_timer.clone();
+        let captions = pending_picture_captions.clone();
         ui.on_caption_media(move |image_id, caption| {
             let Some(ui) = weak.upgrade() else { return; };
             if app.borrow().pending_action.is_some() { return; }
-            let id = image_id.to_string();
-            let caption = caption.to_string();
-            let note_id = app.borrow().workspace.active_id.clone();
+            let key = (app.borrow().workspace.active_id.clone(), image_id.to_string());
+            if let Err(error) = queue_picture_caption(&mut captions.borrow_mut(),
+                key.clone(), caption.as_str())
+            {
+                let last_accepted = captions.borrow().get(&key).cloned().or_else(|| {
+                    app.borrow().active().and_then(|note| {
+                        note.images.iter().find(|image| image.id == image_id.as_str())
+                            .map(|image| image.caption.clone())
+                    })
+                });
+                if let Some(previous) = last_accepted {
+                    restore_rejected_picture_caption(&ui, image_id.as_str(), &previous);
+                }
+                ui.set_save_status(format!("Caption not saved: {error}. Extra text rejected.").into());
+                return;
+            }
             ui.set_save_status("Saving picture caption…".into());
             let app = app.clone(); let weak = weak.clone();
+            let captions = captions.clone();
             timer.start(slint::TimerMode::SingleShot, Duration::from_millis(420), move || {
                 let Some(ui) = weak.upgrade() else { return; };
-                let result = if app.borrow().workspace.active_id == note_id {
-                    app.borrow_mut().update_media(&id, Some(&caption), None, None)
-                } else {
-                    app.borrow().storage.update_image(&note_id, &id, Some(&caption), None, None).map(|_| ())
-                };
-                // Don't recreate the gallery on each keystroke. The caption
-                // text input already reflects the user's current edits.
-                set_status(&ui, result);
+                let result = flush_pending_picture_edits(&mut app.borrow_mut(),
+                    &mut HashMap::new(), &mut captions.borrow_mut());
+                if result.as_ref().is_ok_and(|changed| *changed) {
+                    sync_visible_picture_rows(&ui, &app.borrow());
+                }
+                set_status(&ui, result.map(|_| ()));
             });
         });
     }
@@ -1549,10 +2436,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let app = app.clone(); let weak = ui.as_weak();
+        let widths = pending_picture_widths.clone();
+        let captions = pending_picture_captions.clone();
         ui.on_export_page(move || {
             let Some(ui) = weak.upgrade() else { return; };
             if app.borrow().pending_action.is_some() { return; }
-            set_status(&ui, app.borrow().export_complete_page());
+            let result = (|| -> io::Result<()> {
+                flush_pending_picture_edits(&mut app.borrow_mut(),
+                    &mut widths.borrow_mut(), &mut captions.borrow_mut())?;
+                app.borrow_mut().export_complete_page()
+            })();
+            set_status(&ui, result);
         });
     }
     {
@@ -1569,7 +2463,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (result, changed)
             };
             if changed_page { update_all(&ui, &app.borrow()); }
-            else { update_rows(&ui, &app.borrow()); }
+            else {
+                update_rows(&ui, &app.borrow());
+                ui.set_active_pinned(app.borrow().active().is_some_and(|note| note.pinned));
+            }
             set_status(&ui, result);
         });
     }
@@ -1587,6 +2484,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         update_all(&ui, &state);
                     } else {
                         if let Some(board) = state.board.as_ref() { ui.set_canvas_image(board_image(board)); }
+                        update_drawing_ui(&ui, &state);
                         if phase == 2 {
                             update_rows(&ui, &state);
                             ui.set_save_status("All changes saved on this device".into());
@@ -1596,6 +2494,208 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(false) => {}
                 Err(error) => set_status(&ui, Err(error)),
             }
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_change_draw_tool(move |tool| {
+            if app.borrow().pending_action.is_some() { return; }
+            let name = tool.to_string();
+            if !matches!(name.as_str(), "select"|"pen"|"eraser"|"rectangle"|"ellipse"|
+                "line"|"triangle"|"rounded"|"curve"|"circle") { return; }
+            let mut state = app.borrow_mut();
+            state.draw_tool = name.clone();
+            state.eraser = name == "eraser";
+            state.drawing = false;
+            if let Some(ui) = weak.upgrade() { update_drawing_ui(&ui, &state); }
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_change_draw_fill_color(move |value| {
+            let name = value.to_string();
+            let valid = name.len() == 7 && name.starts_with('#') &&
+                name[1..].bytes().all(|c| c.is_ascii_hexdigit());
+            let Some(ui) = weak.upgrade() else { return; };
+            if !valid {
+                set_status(&ui, Err(io::Error::new(io::ErrorKind::InvalidInput,
+                    "Fill colour must be #RRGGBB")));
+                return;
+            }
+            let mut state = app.borrow_mut();
+            state.draw_fill_color = name.clone();
+            let filled = state.draw_filled;
+            let rgba = parse_color(&name);
+            let result = state.update_selected_object(|object| {
+                object.style.fill = if filled { Some(DrawFill::Solid { color: rgba }) } else { None };
+            });
+            update_editor(&ui, &state);
+            set_status(&ui, result.map(|_| ()));
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_change_draw_filled(move |filled| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let mut state = app.borrow_mut();
+            state.draw_filled = filled;
+            let rgba = parse_color(&state.draw_fill_color);
+            let result = state.update_selected_object(|object| {
+                object.style.fill = if filled { Some(DrawFill::Solid { color: rgba }) } else { None };
+            });
+            update_drawing_ui(&ui, &state);
+            if let Some(board) = state.board.as_ref() { ui.set_canvas_image(board_image(board)); }
+            set_status(&ui, result.map(|_| ()));
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_change_draw_opacity(move |percent| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let mut state = app.borrow_mut();
+            state.draw_opacity = percent.clamp(10, 100) as u8;
+            let opacity = state.draw_opacity as f32 / 100.0;
+            let result = state.update_selected_object(|object| object.style.opacity = opacity);
+            update_drawing_ui(&ui, &state);
+            if let Some(board) = state.board.as_ref() { ui.set_canvas_image(board_image(board)); }
+            set_status(&ui, result.map(|_| ()));
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_move_selected_draw_object(move |dx, dy| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let mut state = app.borrow_mut();
+            let Some(id) = state.selected_draw_object.clone() else { return; };
+            let result = state.update_selected_object(|object| {
+                if object.id == id {
+                    object.transform.translation.x += dx as f32;
+                    object.transform.translation.y += dy as f32;
+                }
+            });
+            update_drawing_ui(&ui, &state);
+            if let Some(board) = state.board.as_ref() { ui.set_canvas_image(board_image(board)); }
+            set_status(&ui, result.map(|_| ()));
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_delete_selected_draw_object(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            let result = app.borrow_mut().delete_selected_object();
+            update_all(&ui, &app.borrow());
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_duplicate_selected_draw_object(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            let result = app.borrow_mut().duplicate_selected_object();
+            update_all(&ui, &app.borrow());
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_add_draw_layer(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            let result = app.borrow_mut().add_drawing_layer();
+            update_all(&ui, &app.borrow());
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_select_draw_layer(move |id| {
+            let id = id.to_string();
+            let Some(ui) = weak.upgrade() else { return; };
+            let mut state = app.borrow_mut();
+            if state.active().is_some_and(|n| n.drawing.layers.iter().any(|l| l.id == id)) {
+                state.selected_draw_layer_id = Some(id);
+                update_drawing_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_rename_draw_layer(move |id, name| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let result = app.borrow_mut().edit_drawing_layer(|drawing|
+                drawing.rename_layer(&id, &name));
+            update_all(&ui, &app.borrow());
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_set_draw_layer_visible(move |id, visible| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let result = app.borrow_mut().edit_drawing_layer(|drawing|
+                drawing.set_layer_visibility(&id, visible));
+            update_all(&ui, &app.borrow());
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_set_draw_layer_locked(move |id, locked| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let result = app.borrow_mut().edit_drawing_layer(|drawing|
+                drawing.set_layer_locked(&id, locked));
+            update_all(&ui, &app.borrow());
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_move_draw_layer(move |id, delta| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let id = id.to_string();
+            let result = app.borrow_mut().edit_drawing_layer(|drawing| {
+                let old = drawing.layers.iter().position(|l| l.id == id)
+                    .ok_or_else(|| "Drawing layer no longer exists".to_string())?;
+                let next = (old as i32 + delta).clamp(0,
+                    drawing.layers.len().saturating_sub(1) as i32) as usize;
+                if next == old { return Ok(()); }
+                drawing.move_layer(&id, next)
+            });
+            update_all(&ui, &app.borrow());
+            set_status(&ui, result);
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_transform_selected_draw_object(move |command| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let command = command.to_string();
+            let mut state = app.borrow_mut();
+            let result = state.update_selected_object(|object| match command.as_str() {
+                "larger" => {
+                    object.transform.scale_x *= 1.1;
+                    object.transform.scale_y *= 1.1;
+                }
+                "smaller" => {
+                    object.transform.scale_x *= 0.9;
+                    object.transform.scale_y *= 0.9;
+                }
+                "rotate" => object.transform.rotation_deg += 15.0,
+                "flip" => object.transform.flip_x = !object.transform.flip_x,
+                _ => {},
+            });
+            update_drawing_ui(&ui, &state);
+            if let Some(board) = state.board.as_ref() { ui.set_canvas_image(board_image(board)); }
+            set_status(&ui, result.map(|_| ()));
+        });
+    }
+    {
+        let app = app.clone(); let weak = ui.as_weak();
+        ui.on_redo_board(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            if app.borrow().pending_action.is_some() { return; }
+            let result = app.borrow_mut().redo_drawing();
+            update_all(&ui, &app.borrow());
+            set_status(&ui, result);
         });
     }
     {
@@ -1643,12 +2743,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let app = app.clone(); let weak = ui.as_weak();
+        let widths = pending_picture_widths.clone();
+        let captions = pending_picture_captions.clone();
         ui.on_save_now(move || {
             let Some(ui) = weak.upgrade() else { return; };
             if app.borrow().pending_action.is_some() { return; }
             let mut state = app.borrow_mut();
             let selected_before = state.workspace.active_id.clone();
-            let result = state.persist();
+            let result = state.persist().and_then(|_| {
+                flush_pending_picture_edits(&mut state, &mut widths.borrow_mut(),
+                    &mut captions.borrow_mut()).map(|_| ())
+            });
             if result.is_ok() && selected_before != state.workspace.active_id {
                 update_all(&ui, &state);
             }
@@ -1678,7 +2783,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ui.run()?;
     // Flush even if the window was closed during an in-progress brush stroke.
-    app.borrow_mut().persist()?;
+    let mut state = app.borrow_mut();
+    state.persist()?;
+    flush_pending_picture_edits(&mut state, &mut pending_picture_widths.borrow_mut(),
+        &mut pending_picture_captions.borrow_mut())?;
     Ok(())
 }
 
@@ -1688,6 +2796,58 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn search_sidebar_preview_shows_deep_body_hit_not_first_line() {
+        let mut note = Note::create("Travel journal");
+        note.body = format!("First line with no useful context\n{}\nAfter a long gap, the\tNEEDLE\n appears here.",
+            "unrelated details ".repeat(35));
+        let subtitle = note_row_subtitle(&note, "needle");
+        assert!(subtitle.contains("NEEDLE"), "search hit missing: {subtitle}");
+        assert!(!subtitle.contains("First line"), "incorrect first-line preview: {subtitle}");
+        assert!(subtitle.starts_with("… "), "deep match should show clipping: {subtitle}");
+        assert!(!subtitle.contains('\n') && !subtitle.contains('\t'));
+        assert!(!subtitle.contains("  "), "whitespace was not normalized: {subtitle}");
+        assert!(subtitle.chars().count() <= 76);
+    }
+
+    #[test]
+    fn search_sidebar_preview_preserves_unicode_and_safe_character_boundaries() {
+        let mut note = Note::create("Unicode");
+        note.body = format!("{}\n  Café 🦊 İstanbul\t follows", "猫🦊".repeat(45));
+        let accented = note_row_subtitle(&note, "CAFÉ");
+        assert!(accented.contains("Café 🦊"), "accents/emoji missing: {accented}");
+        assert!(accented.starts_with("… "));
+        assert!(accented.chars().count() <= 76);
+        // Turkish uppercase dotted I expands to two lowercase scalars.
+        // The position in the lowercased body cannot be used as a byte
+        // offset into the original UTF-8 text.
+        let dotted_i = note_row_subtitle(&note, "i\u{307}stanbul");
+        assert!(dotted_i.contains("İstanbul"), "Unicode case expansion lost: {dotted_i}");
+        assert!(!dotted_i.contains('\n') && !dotted_i.contains('\t'));
+    }
+
+    #[test]
+    fn search_sidebar_empty_or_unmatched_query_keeps_picture_and_sketch_summaries() {
+        let mut image_note = Note::create("Photos");
+        image_note.body = "A first line\nThe hidden word".into();
+        image_note.images.push(store::MediaBlock {
+            id: "img".into(), filename: "img.png".into(),
+            caption: String::new(), width_percent: 65, position: 0,
+        });
+        let original_photo_summary = "1 picture · A first line";
+        assert_eq!(note_row_subtitle(&image_note, ""), original_photo_summary);
+        assert_eq!(note_row_subtitle(&image_note, "   "), original_photo_summary);
+        assert_eq!(note_row_subtitle(&image_note, "Photos"), original_photo_summary);
+        assert!(note_row_subtitle(&image_note, "hidden").contains("hidden word"));
+
+        let mut board = Note::create("Sketch");
+        board.kind = "board".into();
+        board.body = "First line\nSecret drawing label".into();
+        assert_eq!(note_row_subtitle(&board, ""), "Sketch · 0 strokes · 0 shapes");
+        assert_eq!(note_row_subtitle(&board, "absent"), "Sketch · 0 strokes · 0 shapes");
+        assert!(note_row_subtitle(&board, "secret").contains("Secret drawing label"));
+    }
+
+    #[test]
     fn plain_text_input_reconciliation_uses_explicit_pending_caret_style() {
         let mut note = Note::create("note");
         note.body = "hi 🦊!".into();
@@ -1695,7 +2855,7 @@ mod tests {
             bold: true, color: Some("#AABBCC".into()), size: Some(28),
             font_family: Some("Serif".into()),
         });
-        assert!(apply_text_input_edit(&mut note, "hi 🦊X!".into(), typed.take()).unwrap());
+        assert!(apply_text_input_edit(&mut note, "hi 🦊X!".into(), typed.take(), Some(5)).unwrap());
         assert_eq!(note.body, "hi 🦊X!");
         assert_eq!(note.style_at(4).size, Some(28));
         assert!(note.style_at(4).bold);
@@ -1704,8 +2864,142 @@ mod tests {
         // TextInput external updates identical to local state must not mutate it.
         let previous = note.rich_text.clone();
         let unchanged = note.body.clone();
-        assert!(!apply_text_input_edit(&mut note, unchanged, None).unwrap());
+        assert!(!apply_text_input_edit(&mut note, unchanged, None, Some(5)).unwrap());
         assert_eq!(note.rich_text, previous);
+    }
+
+    #[test]
+    fn repeated_characters_use_actual_editor_caret_for_rich_text_splice() {
+        let mut prepended = Note::create("note");
+        prepended.body = "aaa".into();
+        prepended.format_text_range(0, 1, TextStylePatch {
+            bold: Some(true), ..Default::default()
+        }).unwrap();
+        apply_text_input_edit(&mut prepended, "aaaa".into(), Some(TextStyle::default()), Some(1)).unwrap();
+        assert_eq!(prepended.body, "aaaa");
+        assert!(!prepended.style_at(0).bold, "new leading 'a' must not inherit old formatting");
+        assert!(prepended.style_at(1).bold, "bold old leading 'a' must shift right");
+
+        let mut appended = Note::create("note");
+        appended.body = "aaa".into();
+        appended.format_text_range(2, 3, TextStylePatch {
+            bold: Some(true), ..Default::default()
+        }).unwrap();
+        apply_text_input_edit(&mut appended, "aaaa".into(), Some(TextStyle::default()), Some(4)).unwrap();
+        assert!(appended.style_at(2).bold, "appending must preserve original final 'a' style");
+        assert!(!appended.style_at(3).bold);
+
+        let mut deleted = Note::create("note");
+        deleted.body = "aaaa".into();
+        deleted.format_text_range(3, 4, TextStylePatch {
+            bold: Some(true), ..Default::default()
+        }).unwrap();
+        apply_text_input_edit(&mut deleted, "aaa".into(), None, Some(0)).unwrap();
+        assert_eq!(deleted.body, "aaa");
+        assert!(deleted.style_at(2).bold, "backspace/delete at beginning should shift old end style");
+    }
+
+    #[test]
+    fn picture_debounce_keeps_both_images_and_flushes_before_close() {
+        use image::ImageEncoder;
+        let folder = std::env::temp_dir().join(format!("inkpad-picture-debounce-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        let note_id = app.workspace.active_id.clone();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[10, 40, 60, 255], 1, 1, image::ExtendedColorType::Rgba8).unwrap();
+        let first = app.storage.insert_image_bytes(&note_id, &png).unwrap();
+        let second = app.storage.insert_image_bytes(&note_id, &png).unwrap();
+        app.reload_after_media_change().unwrap();
+
+        // Each successive text/slider event replaces its own picture key,
+        // while preserving edits for every other photo in the same notebook.
+        let mut widths = HashMap::new();
+        let mut captions = HashMap::new();
+        widths.insert((note_id.clone(), first.id.clone()), 30);
+        widths.insert((note_id.clone(), second.id.clone()), 60);
+        widths.insert((note_id.clone(), first.id.clone()), 45);
+        captions.insert((note_id.clone(), first.id.clone()), "first draft".into());
+        captions.insert((note_id.clone(), second.id.clone()), "second caption".into());
+        captions.insert((note_id.clone(), first.id.clone()), "first final".into());
+        assert!(flush_pending_picture_edits(&mut app, &mut widths, &mut captions).unwrap());
+        assert!(widths.is_empty() && captions.is_empty());
+        let stored = app.storage.read_latest().unwrap();
+        let page = stored.notes.iter().find(|n| n.id == note_id).unwrap();
+        let a = page.images.iter().find(|img| img.id == first.id).unwrap();
+        let b = page.images.iter().find(|img| img.id == second.id).unwrap();
+        assert_eq!((a.width_percent, a.caption.as_str()), (45, "first final"));
+        assert_eq!((b.width_percent, b.caption.as_str()), (60, "second caption"));
+
+        // A user can delete a picture while an edit debounce is outstanding.
+        // Confirmed deletion discards only that picture's queued changes;
+        // unrelated pictures must still save instead of hitting NotFound.
+        widths.insert((note_id.clone(), first.id.clone()), 20);
+        widths.insert((note_id.clone(), second.id.clone()), 80);
+        captions.insert((note_id.clone(), first.id.clone()), "deleted caption".into());
+        captions.insert((note_id.clone(), second.id.clone()), "kept caption".into());
+        app.storage.delete_image(&note_id, &first.id).unwrap();
+        app.reload_after_media_change().unwrap();
+        discard_deleted_picture_edits(&PendingAction::DeletePicture {
+            note_id: note_id.clone(), image_id: first.id.clone(),
+        }, &mut widths, &mut captions);
+        assert!(!widths.contains_key(&(note_id.clone(), first.id.clone())));
+        assert!(!captions.contains_key(&(note_id.clone(), first.id.clone())));
+        assert!(flush_pending_picture_edits(&mut app, &mut widths, &mut captions).unwrap());
+        assert!(widths.is_empty() && captions.is_empty());
+        let stored = app.storage.read_latest().unwrap();
+        let remaining = &stored.notes.iter().find(|n| n.id == note_id).unwrap().images;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, second.id);
+        assert_eq!((remaining[0].width_percent, remaining[0].caption.as_str()),
+            (80, "kept caption"));
+
+        // A rejected 501-character edit must not replace the valid queued
+        // caption or poison later Save/export/close flushes. Count Unicode
+        // scalar characters, matching Store::update_image validation.
+        let key = (note_id.clone(), second.id.clone());
+        let accepted = "🦆".repeat(500);
+        assert!(queue_picture_caption(&mut captions, key.clone(), &accepted).is_ok());
+        let rejected = format!("{accepted}!");
+        assert!(queue_picture_caption(&mut captions, key.clone(), &rejected).is_err());
+        assert_eq!(captions.get(&key), Some(&accepted));
+        assert!(flush_pending_picture_edits(&mut app, &mut widths, &mut captions).unwrap());
+        assert!(captions.is_empty());
+        let stored = app.storage.read_latest().unwrap();
+        let caption = &stored.notes.iter().find(|n| n.id == note_id).unwrap().images[0].caption;
+        assert_eq!(caption, &accepted);
+
+        assert!(queue_picture_caption(&mut captions, key.clone(), &rejected).is_err());
+        assert!(captions.is_empty(), "a new overlong caption must not enter the save queue");
+        assert!(!flush_pending_picture_edits(&mut app, &mut widths, &mut captions).unwrap());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn html_export_uses_unsaved_current_note_and_does_not_override_remote_conflicts() {
+        let folder = std::env::temp_dir().join(format!("inkpad-html-fresh-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        let note_id = app.workspace.active_id.clone();
+        app.active_mut().unwrap().body = "Unflushed <fresh> Unicode 🦊".into();
+        app.active_mut().unwrap().title = "New local title".into();
+        let target = folder.join("fresh.html");
+        app.export_complete_page_to(&note_id, &target).unwrap();
+        let html = fs::read_to_string(&target).unwrap();
+        assert!(html.contains("Unflushed &lt;fresh&gt; Unicode 🦊"));
+        assert!(html.contains("New local title"));
+        let remote = Store::in_folder(folder.clone()).unwrap();
+        remote.mutate(|ws| {
+            ws.notes.iter_mut().find(|n| n.id == note_id).unwrap().body = "remote edit".into();
+            Ok(())
+        }).unwrap();
+        app.active_mut().unwrap().body = "conflicting local edit".into();
+        let rejected = app.export_complete_page_to(&note_id, &target).unwrap_err();
+        assert_eq!(rejected.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read_to_string(&target).unwrap(), html,
+            "failed export must not overwrite previous valid exported copy");
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]
@@ -2056,6 +3350,258 @@ mod tests {
         let note = restored.notes.iter().find(|n| n.id == saved_id).unwrap();
         assert_eq!(note.strokes.len(), 0);
         assert_eq!(note.body, "Keep this text");
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn editable_shape_gesture_select_move_duplicate_undo_redo_and_restart() {
+        let folder = std::env::temp_dir().join(format!("inkpad-vector-gui-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        app.draw_tool = "rectangle".into();
+        assert!(app.draw(100, 100, 0).unwrap());
+        assert!(app.draw(250, 190, 1).unwrap());
+        assert!(app.draw(250, 190, 2).unwrap());
+        let id = app.active().unwrap().drawing.objects[0].id.clone();
+        assert_eq!(app.active().unwrap().drawing.layers.len(), 1);
+        assert_eq!(app.active().unwrap().drawing.objects.len(), 1);
+        let original_position = app.active().unwrap().drawing.object(&id).unwrap().transform.translation;
+
+        app.draw_tool = "select".into();
+        assert!(app.draw(150, 150, 0).unwrap());
+        assert_eq!(app.selected_draw_object.as_deref(), Some(id.as_str()));
+        assert!(app.draw(170, 160, 1).unwrap());
+        assert!(app.draw(170, 160, 2).unwrap());
+        let moved = app.active().unwrap().drawing.object(&id).unwrap().transform.translation;
+        assert_eq!(moved.x, original_position.x + 20.0);
+        assert_eq!(moved.y, original_position.y + 10.0);
+
+        app.duplicate_selected_object().unwrap();
+        assert_eq!(app.active().unwrap().drawing.objects.len(), 2);
+        app.undo().unwrap();
+        assert_eq!(app.active().unwrap().drawing.objects.len(), 1);
+        app.redo_drawing().unwrap();
+        assert_eq!(app.active().unwrap().drawing.objects.len(), 2);
+        drop(app);
+        let reopened = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        assert_eq!(reopened.active().unwrap().drawing.objects.len(), 2);
+        assert_eq!(reopened.active().unwrap().drawing.object(&id).unwrap().transform.translation, moved);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn gui_agent_three_way_merge_keeps_drawing_and_text_but_rejects_same_field_conflicts() {
+        let base = Note::create("note");
+        let mut text_change = base.clone();
+        text_change.set_body_preserving_format("Writing while agent draws".into()).unwrap();
+        let mut vector_change = base.clone();
+        vector_change.drawing.add_object(DrawShape::Circle { radius: 22.0 }, None).unwrap();
+        let merged = merge_note(&base, &text_change, &vector_change).unwrap();
+        assert_eq!(merged.body, "Writing while agent draws");
+        assert_eq!(merged.drawing.objects.len(), 1);
+        let mut second_vector_change = base.clone();
+        second_vector_change.drawing.add_object(DrawShape::Rectangle { width: 33.0, height: 44.0 }, None).unwrap();
+        assert_eq!(merge_note(&base, &second_vector_change, &vector_change)
+            .unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn drawing_undo_redo_respects_pen_shape_pen_sequence() {
+        let folder = std::env::temp_dir().join(format!("inkpad-undo-mixed-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        app.draw(5, 5, 0).unwrap();
+        app.draw(20, 20, 2).unwrap();
+        app.draw_tool = "rectangle".into();
+        app.draw(100, 100, 0).unwrap();
+        app.draw(160, 150, 2).unwrap();
+        app.draw_tool = "pen".into();
+        app.draw(40, 40, 0).unwrap();
+        app.draw(65, 65, 2).unwrap();
+        assert_eq!(app.active().unwrap().strokes.len(), 2);
+        assert_eq!(app.active().unwrap().drawing.objects.len(), 1);
+        app.undo().unwrap(); // Latest pen stroke only
+        assert_eq!(app.active().unwrap().strokes.len(), 1);
+        assert_eq!(app.active().unwrap().drawing.objects.len(), 1);
+        app.undo().unwrap(); // Shape
+        assert_eq!(app.active().unwrap().strokes.len(), 1);
+        assert!(app.active().unwrap().drawing.objects.is_empty());
+        app.redo_drawing().unwrap(); // Shape restored
+        app.redo_drawing().unwrap(); // Pen restored
+        assert_eq!(app.active().unwrap().strokes.len(), 2);
+        assert_eq!(app.active().unwrap().drawing.objects.len(), 1);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn pointer_cancel_reverts_unfinished_shape_and_stroke_without_saving() {
+        let folder = std::env::temp_dir().join(format!("inkpad-pointer-cancel-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        let initial = app.storage.read_latest().unwrap();
+        app.draw_tool = "rectangle".into();
+        app.draw(200, 200, 0).unwrap();
+        app.draw(300, 260, 1).unwrap();
+        app.draw(300, 260, 3).unwrap();
+        assert!(app.active().unwrap().drawing.objects.is_empty());
+        assert!(app.drawing_undo_order.is_empty());
+        app.draw_tool = "pen".into();
+        app.draw(20, 30, 0).unwrap();
+        app.draw(50, 60, 1).unwrap();
+        app.draw(50, 60, 3).unwrap();
+        assert!(app.active().unwrap().strokes.is_empty());
+        assert_eq!(app.storage.read_latest().unwrap().notes, initial.notes);
+        app.undo().unwrap();
+        assert!(app.active().unwrap().strokes.is_empty());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn reopening_legacy_note_retains_undo_last_stroke_without_untracked_deletes() {
+        let folder = std::env::temp_dir().join(format!("inkpad-legacy-drawing-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        app.draw(10, 15, 0).unwrap();
+        app.draw(50, 65, 2).unwrap();
+        drop(app);
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        assert_eq!(app.drawing_undo_order.len(), 1);
+        app.undo().unwrap();
+        assert!(app.active().unwrap().strokes.is_empty());
+        assert!(app.drawing_undo_order.is_empty());
+        app.undo().unwrap(); // No further history: must remain a no-op.
+        assert!(app.active().unwrap().strokes.is_empty());
+        app.redo_drawing().unwrap();
+        assert_eq!(app.active().unwrap().strokes.len(), 1);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn inserted_photo_uses_explicit_unicode_caret_and_survives_reopen_export() {
+        use image::ImageEncoder;
+        let folder = std::env::temp_dir().join(format!("inkpad-inline-writing-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        let body = "BEFORE 🚀\nAFTER 猫".to_string();
+        app.active_mut().unwrap().set_body_preserving_format(body.clone()).unwrap();
+        app.persist().unwrap();
+        let boundary = "BEFORE 🚀\n".chars().count();
+        app.selection = TextSelection::caret(boundary);
+        app.selection_explicit = true;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[12, 56, 90, 255], 1, 1, image::ExtendedColorType::Rgba8).unwrap();
+        app.import_image_bytes(&png).unwrap();
+        let note = app.active().unwrap();
+        assert_eq!(note.body, body, "placing an image must never insert placeholder text");
+        assert_eq!(note.images.len(), 1);
+        assert_eq!(note.image_anchor(&note.images[0].id).unwrap(), Some(boundary));
+        let id = note.id.clone();
+        drop(app);
+
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        app.select(&id).unwrap();
+        assert_eq!(app.active().unwrap().inline_media[0].char_offset, boundary);
+        let html = folder.join("inline-order.html");
+        app.export_complete_page_to(&id, &html).unwrap();
+        let rendered = fs::read_to_string(&html).unwrap();
+        let before = rendered.find("BEFORE").unwrap();
+        let image = rendered.find("data:image/png;base64,").unwrap();
+        let after = rendered.find("AFTER").unwrap();
+        assert!(before < image && image < after, "export should reflect picture's text caret");
+        let image_id = app.active().unwrap().images[0].id.clone();
+        let no_cursor = app.place_media_at_caret(&image_id).unwrap_err();
+        assert_eq!(no_cursor.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(app.active().unwrap().inline_media[0].char_offset, boundary);
+        app.selection = TextSelection::caret(0);
+        app.selection_explicit = true;
+        app.place_media_at_caret(&image_id).unwrap();
+        assert_eq!(app.active().unwrap().image_anchor(&image_id).unwrap(), Some(0));
+        let moved_html = folder.join("moved-inline-order.html");
+        app.export_complete_page_to(&id, &moved_html).unwrap();
+        let moved = fs::read_to_string(moved_html).unwrap();
+        assert!(moved.find("data:image/png;base64,").unwrap() < moved.find("BEFORE").unwrap());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn photo_insertion_defaults_to_end_and_text_undo_rebases_anchor() {
+        use image::ImageEncoder;
+        let folder = std::env::temp_dir().join(format!("inkpad-inline-undo-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        app.active_mut().unwrap().set_body_preserving_format("猫 🚀".into()).unwrap();
+        app.persist().unwrap();
+        assert_eq!(app.image_insertion_point().unwrap().1, 3);
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[12, 34, 56, 255], 1, 1, image::ExtendedColorType::Rgba8).unwrap();
+        app.import_image_bytes(&png).unwrap();
+        assert_eq!(app.active().unwrap().inline_media[0].char_offset, 3);
+        let before = app.active().unwrap().clone();
+        app.text_history.record(&before, EditKind::Typing);
+        app.active_mut().unwrap().replace_text_range(0, 0, "Hi ").unwrap();
+        let after = app.active().unwrap().clone();
+        app.text_history.commit_after(&after);
+        assert_eq!(after.inline_media[0].char_offset, 6);
+        let App { workspace, text_history, .. } = &mut app;
+        let note = workspace.notes.iter_mut().find(|n| n.id == workspace.active_id).unwrap();
+        assert!(text_history.undo_before(note).unwrap());
+        assert_eq!(note.inline_media[0].char_offset, 3);
+        assert!(text_history.redo(note).unwrap());
+        assert_eq!(note.inline_media[0].char_offset, 6);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn concurrent_note_text_and_picture_placement_rebase_without_duplication() {
+        let mut base = Note::create("note");
+        base.body = "Start 🦊 End".into();
+        base.images.push(store::MediaBlock {
+            id: "photoA".into(), filename: "photoA.png".into(),
+            caption: "Test".into(), width_percent: 65, position: 0,
+        });
+        let mut local = base.clone();
+        local.replace_text_range(0, 0, "Intro ").unwrap();
+        let mut remote = base.clone();
+        remote.set_image_anchor("photoA", Some(6)).unwrap();
+        let merged = merge_note(&base, &local, &remote).unwrap();
+        assert_eq!(merged.body, "Intro Start 🦊 End");
+        assert_eq!(merged.images.len(), 1);
+        assert_eq!(merged.image_anchor("photoA").unwrap(), Some(12));
+        assert_eq!(merged.content_blocks().unwrap().len(), 3);
+        let mut other = remote.clone();
+        other.set_image_anchor("photoA", Some(3)).unwrap();
+        assert!(merge_note(&base, &remote, &other).is_err(),
+            "two concurrent edits to picture placement must not silently win");
+    }
+
+    #[test]
+    fn gui_layer_selection_controls_shape_assignment_lock_and_visibility() {
+        let folder = std::env::temp_dir().join(format!("inkpad-layer-gui-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        app.add_drawing_layer().unwrap();
+        let layer = app.selected_draw_layer_id.clone().unwrap();
+        app.draw_tool = "circle".into();
+        app.draw(100, 100, 0).unwrap();
+        app.draw(160, 160, 2).unwrap();
+        assert_eq!(app.active().unwrap().drawing.objects[0].layer_id, layer);
+        app.edit_drawing_layer(|d| d.rename_layer(&layer, "Duck wings")).unwrap();
+        app.edit_drawing_layer(|d| d.set_layer_visibility(&layer, false)).unwrap();
+        assert_eq!(app.active().unwrap().drawing.layers[0].name, "Duck wings");
+        assert!(!app.active().unwrap().drawing.layers[0].visible);
+        app.edit_drawing_layer(|d| d.set_layer_locked(&layer, true)).unwrap();
+        let before = app.storage.read_latest().unwrap();
+        assert!(app.draw(200, 200, 0).is_err(), "A locked layer must reject new shapes");
+        assert_eq!(app.storage.read_latest().unwrap().notes, before.notes);
+        app.edit_drawing_layer(|d| d.set_layer_locked(&layer, false)).unwrap();
+        app.edit_drawing_layer(|d| d.set_layer_visibility(&layer, true)).unwrap();
+        drop(app);
+        let reopened = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        assert_eq!(reopened.active().unwrap().drawing.objects.len(), 1);
+        assert!(reopened.active().unwrap().drawing.layers[0].visible);
+        assert_eq!(reopened.active().unwrap().drawing.layers[0].name, "Duck wings");
         fs::remove_dir_all(folder).unwrap();
     }
 }

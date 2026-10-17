@@ -18,7 +18,15 @@ export struct MediaRow {
     preview: image,
 }
 
-// The native host pre-splits rich text into Unicode-safe word/whitespace spans.
+export struct DrawingLayerRow {
+    id: string,
+    name: string,
+    visible: bool,
+    locked: bool,
+}
+
+// The native host pre-splits rich text into Unicode-safe word/whitespace spans
+// and gives ordinary spaces measurable NBSP glyph widths for Flexbox layout.
 // Flexbox wraps at span boundaries; the host must fall back to StyledText for
 // complex shaping/bidirectional text or exceptionally large notes.
 export struct RichPreviewSpan {
@@ -28,10 +36,27 @@ export struct RichPreviewSpan {
     bold: bool,
     foreground: color,
     has_foreground: bool,
+    trailing-gap: bool,
 }
 
 export struct RichPreviewParagraph {
     spans: [RichPreviewSpan],
+}
+
+// Ordered segments of the composed document. Text is pre-styled by the Rust
+// host; images retain their existing media identity and editing callbacks.
+export struct DocumentBlockRow {
+    kind: string,
+    text: styled-text,
+    rich-paragraphs: [RichPreviewParagraph],
+    rich-exact: bool,
+    image-id: string,
+    caption: string,
+    width-percent: int,
+    position: int,
+    preview: image,
+    can-move-up: bool,
+    can-move-down: bool,
 }
 
 // Palette shared by the notebook chrome, controls, pictures and dialogs.
@@ -229,6 +254,7 @@ component StepButton inherits Rectangle {
     private property <bool> repeating: false;
     private property <bool> focus-active: hit.has-focus;
     callback clicked();
+    callback released();
     changed enabled => {
         if (!root.enabled) {
             root.held = false;
@@ -310,6 +336,7 @@ component StepButton inherits Rectangle {
             if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
                 root.held = false;
                 root.repeating = false;
+                root.released();
             }
         }
     }
@@ -328,23 +355,16 @@ component DeleteRowButton inherits Rectangle {
     accessible-label: "Delete " + root.note-name;
     accessible-action-default => { root.clicked(); }
     forward-focus: hit;
-    Rectangle {
-        width: 14px;
-        height: 1.5px;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        border-radius: 1px;
-        transform-rotation: 45deg;
-        background: #ba5348;
-    }
-    Rectangle {
-        width: 14px;
-        height: 1.5px;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        border-radius: 1px;
-        transform-rotation: -45deg;
-        background: #ba5348;
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: "×";
+        font-family: "Segoe UI";
+        font-size: 20px;
+        font-weight: 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: hit.has-hover || hit.has-focus ? #ba5348 : InkTheme.muted;
     }
     hit := KeyboardTarget {
         width: parent.width;
@@ -402,6 +422,8 @@ component ChromeButton inherits Rectangle {
     callback clicked();
     width: 44px;
     height: 40px;
+    border-width: hit.has-focus ? 1px : 0px;
+    border-color: #d8aa55;
     background: root.enabled && hit.has-hover ? (root.close-button ? #c8574e : InkTheme.dark ? #363f4d : #e8e5de) : transparent;
     accessible-role: button;
     accessible-label: root.action-name;
@@ -497,8 +519,8 @@ component ColorDot inherits Rectangle {
     width: 29px;
     height: 29px;
     border-radius: 15px;
-    border-width: root.selected ? 2px : 1px;
-    border-color: root.selected ? #e1b558 : InkTheme.line;
+    border-width: hit.has-focus ? 3px : root.selected ? 2px : 1px;
+    border-color: hit.has-focus ? #bd892b : root.selected ? #e1b558 : InkTheme.line;
     background: InkTheme.paper;
     accessible-role: button;
     accessible-label: root.label + " " + root.category;
@@ -531,12 +553,13 @@ component MediaCard inherits Rectangle {
     callback chosen(string);
     callback resized(string, int);
     callback moved(string, int);
+    callback placed(string);
     callback removed(string);
     callback caption-changed(string, string);
 
-    // Scaling a picture changes the page's vertical footprint as well as its width.
-    // Keep 192px for the header, resize controls, caption and spacing.
-    height: 272px + min(100, max(10, root.width-percent)) * 1.3px;
+    // The document pane stays beside the editor, even in a compact window.
+    // Two action rows fit narrow widths without clipping buttons.
+    height: 326px + min(100, max(10, root.width-percent)) * 1.0px;
     border-radius: 13px;
     border-width: root.selected ? 2px : 1px;
     border-color: root.selected ? #d6a645 : InkTheme.line;
@@ -568,7 +591,7 @@ component MediaCard inherits Rectangle {
             }
         }
         Rectangle {
-            height: 80px + min(100, max(10, root.width-percent)) * 1.3px;
+            height: 94px + min(100, max(10, root.width-percent)) * 1.0px;
             background: InkTheme.secondary;
             border-radius: 8px;
             clip: true;
@@ -592,19 +615,31 @@ component MediaCard inherits Rectangle {
         }
         HorizontalLayout {
             height: 33px;
-            spacing: 5px;
-            ToolLabel { width: 42px; label: "SIZE"; ink: InkTheme.muted; }
+            spacing: 4px;
+            ToolLabel { width: 39px; label: "SIZE"; ink: InkTheme.muted; }
             for size in [25, 50, 75, 100]: ActionButton {
-                width: 43px;
+                horizontal-stretch: 1;
                 height: 30px;
                 label: size + "%";
                 accessible-name: "Show image at " + size + " percent of page width";
                 selected: root.width-percent == size;
                 clicked => { root.resized(root.media-id, size); }
             }
+        }
+        HorizontalLayout {
+            height: 33px;
+            spacing: 5px;
+            ToolLabel { width: 42px; label: "PLACE"; ink: InkTheme.muted; }
             Rectangle { horizontal-stretch: 1; background: transparent; }
             ActionButton {
-                width: 43px;
+                width: 87px;
+                height: 30px;
+                label: "At cursor";
+                accessible-name: "Place this image at the writing cursor";
+                clicked => { root.placed(root.media-id); }
+            }
+            ActionButton {
+                width: 33px;
                 height: 30px;
                 label: "↑";
                 accessible-name: "Move photo up";
@@ -612,7 +647,7 @@ component MediaCard inherits Rectangle {
                 clicked => { root.moved(root.media-id, -1); }
             }
             ActionButton {
-                width: 43px;
+                width: 33px;
                 height: 30px;
                 label: "↓";
                 accessible-name: "Move photo down";
@@ -620,7 +655,7 @@ component MediaCard inherits Rectangle {
                 clicked => { root.moved(root.media-id, 1); }
             }
             ActionButton {
-                width: 71px;
+                width: 64px;
                 height: 30px;
                 label: "Remove";
                 accessible-name: "Remove this photo from page";
@@ -634,6 +669,7 @@ component MediaCard inherits Rectangle {
             ToolLabel { width: 59px; label: "RESIZE"; ink: InkTheme.muted; }
             Slider {
                 horizontal-stretch: 1;
+                min-width: 0px;
                 height: 28px;
                 minimum: 10;
                 maximum: 100;
@@ -657,6 +693,7 @@ component MediaCard inherits Rectangle {
             ToolLabel { width: 59px; label: "CAPTION"; ink: InkTheme.muted; }
             LineEdit {
                 horizontal-stretch: 1;
+                min-width: 0px;
                 height: 33px;
                 text: root.caption;
                 placeholder-text: "Add a caption…";
@@ -682,6 +719,8 @@ export component MainWindow inherits Window {
 
     in property <[NoteRow]> rows: [];
     in property <[MediaRow]> media-rows: [];
+    in property <[DocumentBlockRow]> document-blocks: [];
+    in property <bool> has-rich-formatting: false;
     in-out property <string> selected-media-id: "";
     in-out property <string> appearance-theme: "light";
     in property <bool> system-dark: false;
@@ -693,6 +732,8 @@ export component MainWindow inherits Window {
     in property <[RichPreviewParagraph]> rich-preview-paragraphs: [];
     // Set by the host ONLY when wrapping per-run spans is appropriate.
     in property <bool> rich-preview-exact: false;
+    // Kept for compatibility with the existing Rust bridge. The text input is
+    // always the editable surface; the visual document never replaces it.
     in-out property <bool> formatted-preview: false;
     in-out property <int> format-start: 0;
     in-out property <int> format-end: 0;
@@ -704,8 +745,12 @@ export component MainWindow inherits Window {
     in-out property <string> custom-text-color: "#292927";
     private property <bool> text-editor-focused: false;
     private property <int> restore-editor-token: 0;
+    private property <int> focus-search-token: 0;
+    private property <bool> focus-search-pending: false;
     in-out property <string> note-title: "";
     in-out property <string> note-body: "";
+    in-out property <bool> active-pinned: false;
+    in-out property <bool> pictures-expanded: false;
     in-out property <int> font-size: 17;
     in-out property <string> font-choice: "Sans";
     in-out property <string> active-kind: "note";
@@ -717,6 +762,24 @@ export component MainWindow inherits Window {
     in-out property <int> brush-size: 6;
     in-out property <string> brush-color: "#263238";
     in-out property <bool> eraser: false;
+    // Draw controls are isolated from the ordinary note editor.
+    in-out property <string> draw-tool: "pen";
+    in-out property <bool> advanced-draw: false;
+    in-out property <bool> draw-filled: true;
+    in-out property <string> draw-fill-color: "#F0D964";
+    in-out property <int> draw-opacity: 100;
+    in-out property <string> selected-draw-object: "";
+    in-out property <int> selected-draw-x: 0;
+    in-out property <int> selected-draw-y: 0;
+    in-out property <int> selected-draw-width: 0;
+    in-out property <int> selected-draw-height: 0;
+    in-out property <int> drawing-object-count: 0;
+    in-out property <int> drawing-layer-count: 1;
+    in-out property <[DrawingLayerRow]> drawing-layers: [];
+    in-out property <string> selected-draw-layer: "";
+    in-out property <string> selected-draw-layer-name: "";
+    in-out property <bool> can-undo-drawing: false;
+    in-out property <bool> can-redo-drawing: false;
     in-out property <string> save-status: "Ready";
     in-out property <int> note-count: 0;
     in-out property <bool> sidebar-collapsed: false;
@@ -739,7 +802,22 @@ export component MainWindow inherits Window {
     callback set-brush-size(int);
     callback set-brush-color(string);
     callback set-eraser(bool);
+    callback change-draw-tool(string);
+    callback change-draw-fill-color(string);
+    callback change-draw-filled(bool);
+    callback change-draw-opacity(int);
+    callback delete-selected-draw-object();
+    callback duplicate-selected-draw-object();
+    callback move-selected-draw-object(int, int);
+    callback add-draw-layer();
+    callback select-draw-layer(string);
+    callback rename-draw-layer(string, string);
+    callback set-draw-layer-visible(string, bool);
+    callback set-draw-layer-locked(string, bool);
+    callback move-draw-layer(string, int);
     callback undo-board();
+    callback redo-board();
+    callback transform-selected-draw-object(string);
     callback clear-board();
     callback export-current();
     callback save-now();
@@ -758,6 +836,7 @@ export component MainWindow inherits Window {
     callback select-media(string);
     callback resize-media(string, int);
     callback move-media(string, int);
+    callback place-media-at-caret(string);
     callback delete-media(string);
     callback caption-media(string, string);
     callback export-page();
@@ -773,10 +852,17 @@ export component MainWindow inherits Window {
     callback copy-rich-selection() -> bool;
     callback cut-rich-selection() -> bool;
     callback paste-rich-selection() -> bool;
+    public function focus-page-search() {
+        if (!root.delete-confirm-open) {
+            root.focus-search-pending = true;
+            root.focus-search-token += 1;
+            if (root.sidebar-collapsed) { root.toggle-sidebar(); }
+        }
+    }
     public function restore-text-selection() {
         // Body TextInput lives inside the note view's conditional tree. It watches
         // this token locally so the root need not reference a scoped child id.
-        if (!root.advanced-text-range && !root.formatted-preview) {
+        if (!root.advanced-text-range) {
             root.restore-editor-token += 1;
         }
     }
@@ -786,6 +872,16 @@ export component MainWindow inherits Window {
     private property <color> line: InkTheme.line;
     private property <string> active-text-family: root.selected-text-family == "" ? root.font-choice : root.selected-text-family;
     private property <bool> renaming: false;
+    private property <string> draft-note-title: "";
+    public function commit-title-rename() {
+        if (root.renaming) {
+            if (root.draft-note-title != root.note-title) {
+                root.rename-note(root.draft-note-title);
+                root.note-title = root.draft-note-title;
+            }
+            root.renaming = false;
+        }
+    }
     changed appearance-theme => {
         InkTheme.dark = root.appearance-theme == "dark" || (root.appearance-theme == "system" && root.system-dark);
     }
@@ -803,7 +899,44 @@ export component MainWindow inherits Window {
         // The main window must not accept focus or actions while a modal is open.
         enabled: !root.delete-confirm-open;
         KeyBinding {
+            keys: @keys(Control + N);
+            activated => {
+                if (!root.delete-confirm-open) {
+                    root.renaming = false;
+                    root.pictures-expanded = false;
+                    root.new-note("note");
+                }
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + F);
+            activated => { root.focus-page-search(); }
+        }
+        KeyBinding {
+            keys: @keys(Control + S);
+            activated => {
+                if (!root.delete-confirm-open && root.has-note) { root.save-now(); }
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + Shift + I);
+            activated => {
+                if (!root.delete-confirm-open && root.has-note && root.edit-mode == "text") {
+                    root.insert-image-file();
+                }
+            }
+        }
+        KeyBinding {
             keys: @keys(Control + B);
+            activated => {
+                if (!root.delete-confirm-open && root.has-note && root.edit-mode == "text" && root.text-editor-focused) {
+                    root.apply-text-format("bold");
+                    root.restore-text-selection();
+                }
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + Shift + B);
             activated => {
                 if (!root.delete-confirm-open) { root.toggle-sidebar(); }
             }
@@ -811,7 +944,7 @@ export component MainWindow inherits Window {
         KeyBinding {
             keys: @keys(Control + Alt + B);
             activated => {
-                if (!root.delete-confirm-open && root.has-note && root.edit-mode == "text" && root.text-editor-focused && !root.formatted-preview) {
+                if (!root.delete-confirm-open && root.has-note && root.edit-mode == "text" && root.text-editor-focused) {
                     root.apply-text-format("bold");
                     root.restore-text-selection();
                 }
@@ -821,6 +954,7 @@ export component MainWindow inherits Window {
             keys: @keys(Escape);
             activated => {
                 if (root.delete-confirm-open) { root.cancel-delete(); }
+                else if (root.renaming) { root.renaming = false; }
             }
         }
     VerticalLayout {
@@ -883,7 +1017,7 @@ export component MainWindow inherits Window {
                             height: 30px;
                             label: "Light";
                             selected: root.appearance-theme == "light";
-                            accessible-name: "Use light appearance";
+                            accessible-name: root.appearance-theme == "light" ? "Light appearance selected" : "Use light appearance";
                             enabled: !root.delete-confirm-open;
                             clicked => { root.appearance-theme = "light"; root.change-appearance-theme("light"); }
                         }
@@ -892,7 +1026,7 @@ export component MainWindow inherits Window {
                             height: 30px;
                             label: "Dark";
                             selected: root.appearance-theme == "dark";
-                            accessible-name: "Use dark appearance";
+                            accessible-name: root.appearance-theme == "dark" ? "Dark appearance selected" : "Use dark appearance";
                             enabled: !root.delete-confirm-open;
                             clicked => { root.appearance-theme = "dark"; root.change-appearance-theme("dark"); }
                         }
@@ -901,7 +1035,7 @@ export component MainWindow inherits Window {
                             height: 30px;
                             label: "Auto";
                             selected: root.appearance-theme == "system";
-                            accessible-name: "Follow system appearance";
+                            accessible-name: root.appearance-theme == "system" ? "Automatic appearance selected" : "Follow system appearance";
                             enabled: !root.delete-confirm-open;
                             clicked => { root.appearance-theme = "system"; root.change-appearance-theme("system"); }
                         }
@@ -996,7 +1130,7 @@ export component MainWindow inherits Window {
                         horizontal-stretch: 1;
                         height: 44px;
                         enabled: !root.delete-confirm-open;
-                        clicked => { if (!root.delete-confirm-open) { root.new-note("note"); } }
+                        clicked => { if (!root.delete-confirm-open) { root.pictures-expanded = false; root.new-note("note"); } }
                     }
                 }
 
@@ -1006,7 +1140,7 @@ export component MainWindow inherits Window {
                     height: 41px;
                     border-radius: 9px;
                     border-width: 1px;
-                    border-color: #e4e0d8;
+                    border-color: search-editor.has-focus ? InkTheme.accent : InkTheme.line;
                     background: InkTheme.paper;
                     HorizontalLayout {
                         padding-left: 12px;
@@ -1026,18 +1160,42 @@ export component MainWindow inherits Window {
                             horizontal-stretch: 1;
                             height: 41px;
                             background: transparent;
-                            search-editor := LineEdit {
-                                width: parent.width;
+                            // The standard LineEdit paints an independent
+                            // native dark background, even in light mode.
+                            // TextInput lets the surrounding themed panel
+                            // own the entire search field surface.
+                            search-editor := TextInput {
+                                private property <int> focus-request: root.focus-search-token;
+                                init => {
+                                    if (root.focus-search-pending) {
+                                        self.focus();
+                                        root.focus-search-pending = false;
+                                    }
+                                }
+                                changed focus-request => {
+                                    if (root.focus-search-pending) {
+                                        self.focus();
+                                        root.focus-search-pending = false;
+                                    }
+                                }
+                                x: 8px;
+                                width: parent.width - 12px;
                                 height: 33px;
                                 y: (parent.height - self.height) / 2;
                                 font-size: 13px;
-                                placeholder-text: "";
+                                font-family: "Segoe UI";
+                                color: InkTheme.ink;
+                                selection-background-color: InkTheme.dark ? #52657d : #e9d5a5;
+                                selection-foreground-color: InkTheme.ink;
+                                vertical-alignment: center;
+                                single-line: true;
+                                accessible-label: "Search pages";
                                 text <=> root.search-query;
-                                edited(value) => { root.search(value); }
+                                edited => { root.search(self.text); }
                             }
                             if root.search-query == "" && !search-editor.has-focus: Text {
-                                x: 13px;
-                                width: parent.width - 26px;
+                                x: 8px;
+                                width: parent.width - 20px;
                                 height: parent.height;
                                 text: "Search pages";
                                 color: InkTheme.muted;
@@ -1047,10 +1205,22 @@ export component MainWindow inherits Window {
                                 accessible-role: none;
                             }
                         }
+                        if root.search-query != "": ActionButton {
+                            width: 29px;
+                            height: 28px;
+                            subtle: true;
+                            label: "×";
+                            accessible-name: "Clear search";
+                            clicked => {
+                                root.search-query = "";
+                                root.search("");
+                                search-editor.focus();
+                            }
+                        }
                     }
                 }
 
-                Rectangle { height: 25px; background: transparent; }
+                Rectangle { height: 19px; background: transparent; }
 
                 HorizontalLayout {
                     height: 21px;
@@ -1078,7 +1248,7 @@ export component MainWindow inherits Window {
                         Text {
                             width: parent.width;
                             height: parent.height;
-                            text: root.note-count + " items";
+                            text: root.search-query != "" || root.filter-kind != "all" ? (root.rows.length + " shown") : (root.note-count + " pages");
                             font-size: 11px;
                             color: root.muted;
                             horizontal-alignment: right;
@@ -1087,7 +1257,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                Rectangle { height: 9px; background: transparent; }
+                Rectangle { height: 7px; background: transparent; }
                 if root.filter-kind != "all": ActionButton {
                     width: 106px;
                     height: 28px;
@@ -1095,7 +1265,7 @@ export component MainWindow inherits Window {
                     label: "Show all pages";
                     clicked => { root.set-filter("all"); }
                 }
-                Rectangle { height: 8px; background: transparent; }
+                Rectangle { height: 6px; background: transparent; }
 
                 ScrollView {
                     vertical-stretch: 1;
@@ -1105,9 +1275,17 @@ export component MainWindow inherits Window {
                         for entry in root.rows: Rectangle {
                             height: 67px;
                             border-radius: 9px;
-                            background: entry.active ? (InkTheme.dark ? #463c2d : #fbe9b9) : item-hit.has-hover ? (InkTheme.dark ? #303947 : #ece9e2) : transparent;
-                            border-width: item-hit.has-focus ? 1px : 0px;
-                            border-color: #c18b24;
+                            background: entry.active ? (InkTheme.dark ? #38372f : #fbf4e4) : item-hit.has-hover ? (InkTheme.dark ? #303947 : #ebe7df) : transparent;
+                            border-width: entry.active || item-hit.has-focus ? 1px : 0px;
+                            border-color: item-hit.has-focus ? #c18b24 : (InkTheme.dark ? #625641 : #eadbbd);
+                            Rectangle {
+                                x: 0px;
+                                y: 10px;
+                                width: 3px;
+                                height: parent.height - 20px;
+                                border-radius: 2px;
+                                background: entry.active ? InkTheme.accent : transparent;
+                            }
                             HorizontalLayout {
                                 padding-left: 6px;
                                 padding-right: 7px;
@@ -1118,8 +1296,8 @@ export component MainWindow inherits Window {
                                     horizontal-stretch: 1;
                                     background: transparent;
                                     accessible-role: tab;
-                                    accessible-label: entry.title + ", page";
-                                    accessible-action-default => { root.select-note(entry.id); root.renaming = false; }
+                                    accessible-label: entry.title + (entry.pinned ? ", pinned page" : ", page");
+                                    accessible-action-default => { root.select-note(entry.id); root.renaming = false; root.pictures-expanded = false; }
                                     forward-focus: item-hit;
                                     HorizontalLayout {
                                         spacing: 9px;
@@ -1132,12 +1310,13 @@ export component MainWindow inherits Window {
                                             DocumentMark {
                                                 x: (parent.width - self.width) / 2;
                                                 y: (parent.height - self.height) / 2;
-                                                ink: entry.active ? #9f7422 : #a29a8a;
+                                                ink: entry.active ? (InkTheme.dark ? #eec36b : #9f7422) : InkTheme.muted;
                                             }
                                         }
                                         VerticalLayout {
-                                            spacing: 4px;
+                                            spacing: 3px;
                                             Text {
+                                                height: 18px;
                                                 text: entry.title == "" ? "Untitled" : entry.title;
                                                 color: InkTheme.ink;
                                                 font-weight: entry.active ? 700 : 600;
@@ -1146,9 +1325,11 @@ export component MainWindow inherits Window {
                                                 horizontal-stretch: 1;
                                             }
                                             Text {
+                                                height: 29px;
                                                 text: entry.subtitle == "" ? (entry.kind == "board" ? "Drawing" : "Empty page") : entry.subtitle;
                                                 color: InkTheme.muted;
                                                 font-size: 11px;
+                                                wrap: word-wrap;
                                                 overflow: elide;
                                             }
                                         }
@@ -1168,7 +1349,7 @@ export component MainWindow inherits Window {
                                     item-hit := KeyboardTarget {
                                         width: parent.width;
                                         height: parent.height;
-                                        clicked => { root.select-note(entry.id); root.renaming = false; }
+                                        clicked => { root.select-note(entry.id); root.renaming = false; root.pictures-expanded = false; }
                                     }
                                 }
                                 Rectangle {
@@ -1296,7 +1477,7 @@ export component MainWindow inherits Window {
                     accessible-name: "New page";
                     prominent: true;
                     enabled: !root.delete-confirm-open;
-                    clicked => { if (!root.delete-confirm-open) { root.new-note("note"); } }
+                    clicked => { if (!root.delete-confirm-open) { root.pictures-expanded = false; root.new-note("note"); } }
                 }
                 Rectangle {
                     width: 44px;
@@ -1305,7 +1486,7 @@ export component MainWindow inherits Window {
                     background: search-hit.has-hover ? (InkTheme.dark ? #343c49 : #e7e3dc) : transparent;
                     accessible-role: button;
                     accessible-label: "Expand sidebar to search pages";
-                    accessible-action-default => { root.toggle-sidebar(); }
+                    accessible-action-default => { root.focus-page-search(); }
                     SearchMark {
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
@@ -1313,7 +1494,7 @@ export component MainWindow inherits Window {
                     search-hit := KeyboardTarget {
                         width: parent.width;
                         height: parent.height;
-                        clicked => { root.toggle-sidebar(); }
+                        clicked => { root.focus-page-search(); }
                     }
                 }
                 Rectangle {
@@ -1363,13 +1544,13 @@ export component MainWindow inherits Window {
                 spacing: 0px;
 
                 Rectangle {
-                    height: 47px;
+                    height: 42px;
                     background: InkTheme.toolbar;
                     HorizontalLayout {
                         padding-left: 24px;
                         padding-right: 24px;
-                        padding-top: 6px;
-                        padding-bottom: 6px;
+                        padding-top: 4px;
+                        padding-bottom: 4px;
                         spacing: 9px;
                         Rectangle {
                             width: 77px;
@@ -1440,6 +1621,7 @@ export component MainWindow inherits Window {
                                 height: 34px;
                                 y: (parent.height - self.height) / 2;
                                 label: "Save";
+                                accessible-name: "Save current page, Control S";
                                 clicked => { root.save-now(); }
                             }
                         }
@@ -1450,15 +1632,17 @@ export component MainWindow inherits Window {
                 if root.has-note: VerticalLayout {
                     spacing: 0px;
                     Rectangle {
-                        height: 106px;
+                        // Draw mode needs vertical room for the actual canvas,
+                        // especially at the supported minimum window height.
+                        height: root.edit-mode == "draw" ? 57px : 82px;
                         background: InkTheme.paper;
                         VerticalLayout {
                             padding-left: 24px;
                             padding-right: 24px;
-                            padding-top: 13px;
-                            padding-bottom: 11px;
-                            spacing: 7px;
-                            Text {
+                            padding-top: root.edit-mode == "draw" ? 5px : 7px;
+                            padding-bottom: root.edit-mode == "draw" ? 5px : 6px;
+                            spacing: root.edit-mode == "draw" ? 0px : 2px;
+                            if root.edit-mode != "draw": Text {
                                 text: "YOUR PAGE";
                                 color: InkTheme.muted;
                                 font-size: 10px;
@@ -1476,20 +1660,21 @@ export component MainWindow inherits Window {
                                         height: parent.height;
                                         text: root.note-title == "" ? "Untitled page" : root.note-title;
                                         color: InkTheme.ink;
-                                        font-size: 26px;
+                                        font-size: root.edit-mode == "draw" ? 18px : 26px;
                                         font-weight: 700;
                                         overflow: elide;
                                         vertical-alignment: center;
                                     }
-                                    if root.renaming: LineEdit {
+                                    title-editor := LineEdit {
+                                        visible: root.renaming;
                                         width: parent.width;
                                         height: parent.height;
                                         font-family: "Segoe UI";
                                         font-size: 20px;
                                         placeholder-text: "Page title";
-                                        text <=> root.note-title;
-                                        edited(value) => { root.rename-note(value); }
-                                        accepted => { root.renaming = false; }
+                                        accessible-label: "Page title";
+                                        text <=> root.draft-note-title;
+                                        accepted => { root.commit-title-rename(); }
                                     }
                                 }
                                 Rectangle {
@@ -1501,30 +1686,41 @@ export component MainWindow inherits Window {
                                         height: 34px;
                                         y: (parent.height - self.height) / 2;
                                         label: root.renaming ? "Done" : "Rename";
-                                        clicked => { root.renaming = !root.renaming; }
+                                        clicked => {
+                                            if (root.renaming) {
+                                                root.commit-title-rename();
+                                            } else {
+                                                root.draft-note-title = root.note-title;
+                                                root.renaming = true;
+                                                title-editor.focus();
+                                            }
+                                        }
                                     }
                                 }
                                 Rectangle {
-                                    width: 54px;
+                                    width: 64px;
                                     height: 45px;
                                     background: transparent;
                                     ActionButton {
                                         width: parent.width;
                                         height: 34px;
                                         y: (parent.height - self.height) / 2;
-                                        label: "Pin";
+                                        label: root.active-pinned ? "Unpin" : "Pin";
+                                        selected: root.active-pinned;
+                                        accessible-name: root.active-pinned ? "Unpin this page" : "Pin this page";
                                         clicked => { root.toggle-pin(); }
                                     }
                                 }
                                 Rectangle {
-                                    width: 71px;
+                                    width: 96px;
                                     height: 45px;
                                     background: transparent;
                                     ActionButton {
                                         width: parent.width;
                                         height: 34px;
                                         y: (parent.height - self.height) / 2;
-                                        label: "Export";
+                                        label: root.edit-mode == "draw" ? "Export PNG" : "Export TXT";
+                                        accessible-name: root.edit-mode == "draw" ? "Export drawing as PNG" : "Export note text as TXT";
                                         clicked => { root.export-current(); }
                                     }
                                 }
@@ -1546,13 +1742,13 @@ export component MainWindow inherits Window {
                     }
                     Rectangle { height: 1px; background: root.line; }
                     Rectangle {
-                        height: 50px;
+                        height: 44px;
                         background: InkTheme.paper;
                         HorizontalLayout {
                             padding-left: 24px;
                             padding-right: 24px;
-                            padding-top: 8px;
-                            padding-bottom: 8px;
+                            padding-top: 5px;
+                            padding-bottom: 5px;
                             spacing: 8px;
                             ActionButton {
                                 width: 85px;
@@ -1590,13 +1786,13 @@ export component MainWindow inherits Window {
                     if root.edit-mode == "text": VerticalLayout {
                         spacing: 0px;
                         Rectangle {
-                            height: 54px;
+                            height: 48px;
                             background: InkTheme.toolbar;
                             HorizontalLayout {
                                 padding-left: 24px;
                                 padding-right: 24px;
-                                padding-top: 10px;
-                                padding-bottom: 10px;
+                                padding-top: 7px;
+                                padding-bottom: 7px;
                                 spacing: 6px;
                                 ToolLabel {
                                     width: 43px;
@@ -1652,6 +1848,7 @@ export component MainWindow inherits Window {
                                     enabled: (root.selected-text-size > 0 && root.selected-text-size > 12) ||
                                              (root.selected-text-size <= 0 && root.font-size > 12);
                                     clicked => { root.change-font-size(max(12, (root.selected-text-size > 0 ? root.selected-text-size : root.font-size) - 1)); }
+                                    released => { root.restore-text-selection(); }
                                 }
                                 Rectangle {
                                     width: 30px;
@@ -1676,40 +1873,28 @@ export component MainWindow inherits Window {
                                     enabled: (root.selected-text-size > 0 && root.selected-text-size < 40) ||
                                              (root.selected-text-size <= 0 && root.font-size < 40);
                                     clicked => { root.change-font-size(min(40, (root.selected-text-size > 0 ? root.selected-text-size : root.font-size) + 1)); }
+                                    released => { root.restore-text-selection(); }
                                 }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 ToolLabel {
-                                    width: 72px;
-                                    label: root.formatted-preview ? "PREVIEWING" : "EDITING";
+                                    width: 80px;
+                                    label: "EDITING";
                                     ink: root.muted;
-                                }
-                                ActionButton {
-                                    width: 76px;
-                                    height: 34px;
-                                    label: root.formatted-preview ? "Edit text" : "Preview";
-                                    selected: root.formatted-preview;
-                                    accessible-name: root.formatted-preview ? "Return to text editing" : "Preview formatted note";
-                                    clicked => {
-                                        if (!root.formatted-preview) {
-                                            root.request-formatted-preview();
-                                        }
-                                        root.formatted-preview = !root.formatted-preview;
-                                    }
                                 }
                             }
                         }
                         Rectangle { height: 1px; background: root.line; }
-                        if !root.formatted-preview: Rectangle {
+                        Rectangle {
                             // Two deliberate 34px baselines prevent the colour swatches
                             // and editing actions from compressing one another at 1010px.
-                            height: 90px;
+                            height: 82px;
                             background: InkTheme.toolbar;
                             VerticalLayout {
                                 padding-left: 24px;
                                 padding-right: 24px;
-                                padding-top: 8px;
-                                padding-bottom: 8px;
-                                spacing: 6px;
+                                padding-top: 4px;
+                                padding-bottom: 4px;
+                                spacing: 4px;
                                 HorizontalLayout {
                                     height: 34px;
                                     spacing: 8px;
@@ -1717,7 +1902,7 @@ export component MainWindow inherits Window {
                                         width: 70px;
                                         height: 34px;
                                         label: "Bold";
-                                        accessible-name: "Bold selected text or typing style, Control Alt B";
+                                        accessible-name: "Bold selected text or typing style, Control B";
                                         selected: root.selection-bold;
                                         clicked => { root.apply-text-format("bold"); root.restore-text-selection(); }
                                     }
@@ -1741,7 +1926,7 @@ export component MainWindow inherits Window {
                                     Text {
                                         horizontal-stretch: 1;
                                         text: root.selection-anchor-byte == root.selection-caret-byte ?
-                                            "Choose formatting to continue typing" :
+                                            "Formatting applies to the next text you type" :
                                             "Selected " + (max(root.format-start, root.format-end) - min(root.format-start, root.format-end)) + " characters";
                                         overflow: elide;
                                         font-size: 11px;
@@ -1794,7 +1979,7 @@ export component MainWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; background: transparent; }
                                     Text {
                                         width: 170px;
-                                        text: "Select text to change its colour";
+                                        text: "Select text or change typing colour";
                                         color: root.muted;
                                         font-size: 11px;
                                         horizontal-alignment: right;
@@ -1804,7 +1989,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-                        if !root.formatted-preview && root.advanced-text-range: Rectangle {
+                        if root.advanced-text-range: Rectangle {
                             height: 80px;
                             background: InkTheme.secondary;
                             VerticalLayout {
@@ -1859,7 +2044,13 @@ export component MainWindow inherits Window {
                         Rectangle {
                             vertical-stretch: 1;
                             background: InkTheme.paper;
-                            Rectangle {
+                            HorizontalLayout {
+                                spacing: 0px;
+                                Rectangle {
+                                    horizontal-stretch: 5;
+                                    min-width: 0px;
+                                    background: InkTheme.paper;
+                                    Rectangle {
                                 x: (parent.width - self.width) / 2;
                                 y: 0px;
                                 width: min(parent.width - 32px, 900px);
@@ -1868,7 +2059,6 @@ export component MainWindow inherits Window {
                                 // Direct TextInput avoids the styled TextEdit's implicit sizing:
                                 // its geometry and ink colour are fixed relative to this page.
                                 body-scroll := ScrollView {
-                                    visible: !root.formatted-preview;
                                     x: 36px;
                                     y: 25px;
                                     width: parent.width - 72px;
@@ -1880,7 +2070,7 @@ export component MainWindow inherits Window {
                                         private property <int> restore-request: root.restore-editor-token;
                                         changed has-focus => { root.text-editor-focused = self.has-focus; }
                                         changed restore-request => {
-                                            if (root.edit-mode == "text" && !root.formatted-preview) {
+                                            if (root.edit-mode == "text") {
                                                 self.focus();
                                                 self.set-selection-offsets(root.selection-anchor-byte, root.selection-caret-byte);
                                             }
@@ -1893,7 +2083,8 @@ export component MainWindow inherits Window {
                                         font-size: root.font-size * 1px;
                                         font-family: root.font-choice == "Serif" || root.font-choice == "Georgia" ? "Georgia" : root.font-choice == "Mono" || root.font-choice == "Consolas" ? "Consolas" : "Segoe UI";
                                         color: InkTheme.ink;
-                                        selection-background-color: #f2d889;
+                                        accessible-label: "Page body";
+                                        selection-background-color: InkTheme.dark ? #52657d : #f2d889;
                                         selection-foreground-color: InkTheme.ink;
                                         vertical-alignment: top;
                                         key-pressed(event) => {
@@ -1933,7 +2124,7 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                 }
-                                if !root.formatted-preview && root.note-body == "": Text {
+                                if root.note-body == "": Text {
                                     x: 36px;
                                     y: 25px;
                                     width: parent.width - 72px;
@@ -1943,84 +2134,172 @@ export component MainWindow inherits Window {
                                     vertical-alignment: top;
                                     accessible-role: none;
                                 }
-                                if root.formatted-preview && (!root.rich-preview-exact || root.rich-preview-paragraphs.length == 0): ScrollView {
-                                    x: 36px;
-                                    y: 25px;
-                                    width: parent.width - 72px;
-                                    height: parent.height - 50px;
-                                    content-width: self.visible-width;
-                                    content-height: max(self.visible-height, rich-render.preferred-height + 12px);
-                                    rich-render := StyledText {
-                                        width: parent.width;
-                                        height: max(parent.height, self.preferred-height + 12px);
-                                        text: root.note-styled-preview;
-                                        default-font-family: root.font-choice == "Serif" || root.font-choice == "Georgia" ? "Georgia" : root.font-choice == "Mono" || root.font-choice == "Consolas" ? "Consolas" : "Segoe UI";
-                                        default-font-size: root.font-size * 1px;
-                                        default-color: InkTheme.ink;
-                                        link-color: InkTheme.dark ? #a8c8ff : #285bb2;
-                                        vertical-alignment: top;
                                     }
                                 }
-                                if root.formatted-preview && root.rich-preview-exact && root.rich-preview-paragraphs.length > 0: ScrollView {
-                                    x: 36px;
-                                    y: 25px;
-                                    width: parent.width - 72px;
-                                    height: parent.height - 50px;
-                                    content-width: self.visible-width;
-                                    content-height: max(self.visible-height, rich-visual-body.preferred-height + 12px);
-                                    rich-visual-body := VerticalLayout {
-                                        width: parent.visible-width;
+                                if root.has-rich-formatting || root.media-rows.length > 0: Rectangle {
+                                    // Keep the live writing area comfortably wide at the
+                                    // minimum Windows size. A styled-image preview must not
+                                    // squeeze the actual editor to a narrow text column.
+                                    width: 355px;
+                                    background: InkTheme.secondary;
+                                    border-width: 1px;
+                                    border-color: InkTheme.line;
+                                    VerticalLayout {
                                         spacing: 0px;
-                                        for paragraph in root.rich-preview-paragraphs: FlexboxLayout {
-                                            width: parent.width;
-                                            height: max(self.preferred-height, root.font-size * 1.45px);
-                                            flex-wrap: wrap;
-                                            spacing-horizontal: 0px;
-                                            spacing-vertical: 0px;
-                                            cross-axis-alignment: end;
-                                            for span in paragraph.spans: Text {
-                                                text: span.text;
-                                                font-size: max(8, span.size) * 1px;
-                                                font-family: span.family;
-                                                font-weight: span.bold ? 700 : 400;
-                                                color: span.has_foreground ? span.foreground : InkTheme.ink;
-                                                width: min(self.preferred-width, parent.width);
-                                                height: self.preferred-height;
-                                                wrap: word-wrap;
-                                                vertical-alignment: bottom;
+                                        Rectangle {
+                                            height: 51px;
+                                            background: InkTheme.toolbar;
+                                            VerticalLayout {
+                                                padding-left: 15px;
+                                                padding-right: 15px;
+                                                padding-top: 7px;
+                                                padding-bottom: 5px;
+                                                spacing: 2px;
+                                                Text {
+                                                    height: 17px;
+                                                    text: "VISUAL DOCUMENT";
+                                                    color: InkTheme.ink;
+                                                    font-size: 11px;
+                                                    font-weight: 700;
+                                                    letter-spacing: 0.8px;
+                                                    vertical-alignment: center;
+                                                }
+                                                Text {
+                                                    height: 18px;
+                                                    text: "Read-only layout. Edit words on the left; adjust pictures here.";
+                                                    color: InkTheme.muted;
+                                                    font-size: 10px;
+                                                    overflow: elide;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                        Rectangle { height: 1px; background: InkTheme.line; }
+                                        visual-scroll := ScrollView {
+                                            vertical-stretch: 1;
+                                            content-width: self.visible-width;
+                                            content-height: max(self.visible-height, visual-document.preferred-height + 18px);
+                                            visual-document := VerticalLayout {
+                                                width: visual-scroll.visible-width;
+                                                padding-left: 13px;
+                                                padding-right: 13px;
+                                                padding-top: 15px;
+                                                padding-bottom: 18px;
+                                                spacing: 9px;
+                                                for block in root.document-blocks: VerticalLayout {
+                                                    width: parent.width;
+                                                    spacing: 0px;
+                                                    if block.kind == "text" && (!block.rich-exact || block.rich-paragraphs.length == 0): StyledText {
+                                                        width: parent.width;
+                                                        height: max(self.preferred-height + 10px, root.font-size * 1.45px);
+                                                        text: block.text;
+                                                        default-font-family: root.font-choice == "Serif" || root.font-choice == "Georgia" ? "Georgia" : root.font-choice == "Mono" || root.font-choice == "Consolas" ? "Consolas" : "Segoe UI";
+                                                        default-font-size: root.font-size * 1px;
+                                                        default-color: InkTheme.ink;
+                                                        link-color: InkTheme.dark ? #a8c8ff : #285bb2;
+                                                        vertical-alignment: top;
+                                                    }
+                                                    if block.kind == "text" && block.rich-exact && block.rich-paragraphs.length > 0: VerticalLayout {
+                                                        width: parent.width;
+                                                        spacing: 0px;
+                                                        for paragraph in block.rich-paragraphs: FlexboxLayout {
+                                                            width: parent.width;
+                                                            height: max(self.preferred-height, root.font-size * 1.45px);
+                                                            flex-wrap: wrap;
+                                                            spacing-horizontal: 0px;
+                                                            spacing-vertical: 0px;
+                                                            cross-axis-alignment: end;
+                                                            for span in paragraph.spans: Text {
+                                                                text: span.text;
+                                                                font-size: max(8, span.size) * 1px;
+                                                                font-family: span.family;
+                                                                font-weight: span.bold ? 700 : 400;
+                                                                color: span.has_foreground ? span.foreground : InkTheme.ink;
+                                                                // Slint's preferred-width drops trailing spaces in
+                                                                // word-wrapped Text; preserve their visual advance.
+                                                                width: min(self.preferred-width + (span.trailing-gap ? max(3, span.size / 4) * 1px : 0px), parent.width);
+                                                                height: self.preferred-height;
+                                                                wrap: word-wrap;
+                                                                vertical-alignment: bottom;
+                                                            }
+                                                        }
+                                                    }
+                                                    if block.kind == "image": MediaCard {
+                                                        width: parent.width;
+                                                        media-id: block.image-id;
+                                                        caption: block.caption;
+                                                        width-percent: block.width-percent;
+                                                        position: block.position;
+                                                        preview: block.preview;
+                                                        selected: root.selected-media-id == block.image-id;
+                                                        can-move-up: block.can-move-up;
+                                                        can-move-down: block.can-move-down;
+                                                        chosen(id) => { root.selected-media-id = id; root.select-media(id); }
+                                                        resized(id, size) => { root.resize-media(id, size); }
+                                                        moved(id, direction) => { root.move-media(id, direction); }
+                                                        placed(id) => { root.place-media-at-caret(id); }
+                                                        removed(id) => { root.delete-media(id); }
+                                                        caption-changed(id, value) => { root.caption-media(id, value); }
+                                                    }
+                                                }
+                                                // Older hosts can still show the saved attachments
+                                                // before the ordered block model is populated.
+                                                if root.document-blocks.length == 0 && root.has-rich-formatting: StyledText {
+                                                    width: parent.width;
+                                                    height: max(self.preferred-height + 10px, root.font-size * 1.45px);
+                                                    text: root.note-styled-preview;
+                                                    default-font-family: root.font-choice == "Serif" || root.font-choice == "Georgia" ? "Georgia" : root.font-choice == "Mono" || root.font-choice == "Consolas" ? "Consolas" : "Segoe UI";
+                                                    default-font-size: root.font-size * 1px;
+                                                    default-color: InkTheme.ink;
+                                                    link-color: InkTheme.dark ? #a8c8ff : #285bb2;
+                                                    vertical-alignment: top;
+                                                }
+                                                for media in root.media-rows: VerticalLayout {
+                                                    visible: root.document-blocks.length == 0;
+                                                    height: root.document-blocks.length == 0 ? self.preferred-height : 0px;
+                                                    width: parent.width;
+                                                    if root.document-blocks.length == 0: MediaCard {
+                                                        width: parent.width;
+                                                        media-id: media.id;
+                                                        caption: media.caption;
+                                                        width-percent: media.width-percent;
+                                                        position: media.position;
+                                                        preview: media.preview;
+                                                        selected: root.selected-media-id == media.id;
+                                                        can-move-up: media.position > 0;
+                                                        can-move-down: media.position < root.media-rows.length - 1;
+                                                        chosen(id) => { root.selected-media-id = id; root.select-media(id); }
+                                                        resized(id, size) => { root.resize-media(id, size); }
+                                                        moved(id, direction) => { root.move-media(id, direction); }
+                                                        placed(id) => { root.place-media-at-caret(id); }
+                                                        removed(id) => { root.delete-media(id); }
+                                                        caption-changed(id, value) => { root.caption-media(id, value); }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                if root.formatted-preview: Text {
-                                    x: 36px;
-                                    y: 3px;
-                                    width: parent.width - 72px;
-                                    height: 16px;
-                                    text: root.rich-preview-exact && root.rich-preview-paragraphs.length > 0
-                                        ? "Formatted preview · individual fonts and sizes; line wrapping may differ from the editor."
-                                        : "Preview shows emphasis and colour. Inline font and size use page defaults.";
-                                    color: InkTheme.subtle;
-                                    font-size: 10px;
-                                    overflow: elide;
-                                    vertical-alignment: center;
                                 }
                             }
                         }
                         Rectangle { height: 1px; background: root.line; }
                         Rectangle {
-                            height: 54px;
+                            height: 46px;
                             background: InkTheme.toolbar;
                             HorizontalLayout {
                                 padding-left: 24px;
                                 padding-right: 24px;
+                                // All picture actions stay available while writing.
+                                padding-top: 6px;
+                                padding-bottom: 6px;
                                 spacing: 8px;
                                 ToolLabel {
-                                    width: 93px;
-                                    label: "PICTURES";
+                                    width: 70px;
+                                    label: "IMAGES";
                                     ink: InkTheme.muted;
                                 }
                                 Text {
+                                    height: 34px;
                                     text: root.media-rows.length + " on page";
                                     color: root.muted;
                                     font-size: 11px;
@@ -2039,48 +2318,15 @@ export component MainWindow inherits Window {
                                     height: 33px;
                                     prominent: true;
                                     label: "Add picture";
-                                    accessible-name: "Insert image file";
+                                    accessible-name: "Insert image file, Control Shift I";
                                     clicked => { root.insert-image-file(); }
                                 }
                                 ActionButton {
                                     width: 100px;
                                     height: 33px;
-                                    label: "Export page";
-                                    accessible-name: "Export page with pictures";
+                                    label: "Export HTML";
+                                    accessible-name: "Export complete page with text, drawings and pictures as HTML";
                                     clicked => { root.export-page(); }
-                                }
-                            }
-                        }
-                        if root.media-rows.length > 0: Rectangle {
-                            vertical-stretch: 1;
-                            background: InkTheme.secondary;
-                            ScrollView {
-                                x: (parent.width - self.width) / 2;
-                                y: 0px;
-                                width: min(parent.width - 36px, 910px);
-                                height: parent.height;
-                                VerticalLayout {
-                                    padding-left: 12px;
-                                    padding-right: 12px;
-                                    padding-top: 13px;
-                                    padding-bottom: 18px;
-                                    spacing: 11px;
-                                    for media in root.media-rows: MediaCard {
-                                        horizontal-stretch: 1;
-                                        media-id: media.id;
-                                        caption: media.caption;
-                                        width-percent: media.width-percent;
-                                        position: media.position;
-                                        preview: media.preview;
-                                        selected: root.selected-media-id == media.id;
-                                        can-move-up: media.position > 0;
-                                        can-move-down: media.position < root.media-rows.length - 1;
-                                        chosen(id) => { root.selected-media-id = id; root.select-media(id); }
-                                        resized(id, size) => { root.resize-media(id, size); }
-                                        moved(id, direction) => { root.move-media(id, direction); }
-                                        removed(id) => { root.delete-media(id); }
-                                        caption-changed(id, value) => { root.caption-media(id, value); }
-                                    }
                                 }
                             }
                         }
@@ -2097,70 +2343,69 @@ export component MainWindow inherits Window {
                                 height: 52px;
                                 padding-left: 23px;
                                 padding-right: 23px;
-                                spacing: 7px;
+                                spacing: 5px;
+                                ActionButton {
+                                    width: 60px;
+                                    height: 34px;
+                                    selected: root.draw-tool == "select";
+                                    label: "Select";
+                                    clicked => { root.draw-tool = "select"; root.change-draw-tool("select"); }
+                                }
+                                ActionButton {
+                                    width: 55px;
+                                    height: 34px;
+                                    selected: root.draw-tool == "pen";
+                                    label: "Pen";
+                                    clicked => { root.draw-tool = "pen"; root.set-eraser(false); root.change-draw-tool("pen"); }
+                                }
                                 ActionButton {
                                     width: 62px;
                                     height: 34px;
-                                    selected: !root.eraser;
-                                    label: "Pen";
-                                    clicked => { root.set-eraser(false); }
+                                    selected: root.draw-tool == "eraser";
+                                    label: "Eraser";
+                                    clicked => { root.draw-tool = "eraser"; root.set-eraser(true); root.change-draw-tool("eraser"); }
                                 }
                                 ActionButton {
                                     width: 64px;
                                     height: 34px;
-                                    selected: root.eraser;
-                                    label: "Eraser";
-                                    clicked => { root.set-eraser(true); }
+                                    selected: root.draw-tool == "rectangle";
+                                    label: "Rect";
+                                    accessible-name: "Draw editable rectangle";
+                                    clicked => { root.draw-tool = "rectangle"; root.change-draw-tool("rectangle"); }
+                                }
+                                ActionButton {
+                                    width: 66px;
+                                    height: 34px;
+                                    selected: root.draw-tool == "ellipse";
+                                    label: "Ellipse";
+                                    clicked => { root.draw-tool = "ellipse"; root.change-draw-tool("ellipse"); }
+                                }
+                                ActionButton {
+                                    width: 54px;
+                                    height: 34px;
+                                    selected: root.draw-tool == "line";
+                                    label: "Line";
+                                    clicked => { root.draw-tool = "line"; root.change-draw-tool("line"); }
+                                }
+                                ActionButton {
+                                    width: 69px;
+                                    height: 34px;
+                                    selected: root.advanced-draw;
+                                    label: "More";
+                                    accessible-name: "Show or hide advanced drawing options";
+                                    clicked => { root.advanced-draw = !root.advanced-draw; }
                                 }
                                 Rectangle {
                                     width: 1px;
-                                    height: 34px;
-                                    background: transparent;
-                                    Rectangle { y: 5px; width: 1px; height: 24px; background: root.line; }
-                                }
-                                StepButton {
-                                    width: 29px;
-                                    height: 34px;
-                                    target-name: "brush";
-                                    hold-mode: true;
-                                    enabled: root.brush-size > 1;
-                                    clicked => { root.set-brush-size(max(1, root.brush-size - 1)); }
-                                }
-                                Rectangle {
-                                    width: 35px;
-                                    height: 34px;
-                                    background: transparent;
-                                    Text {
-                                        width: parent.width;
-                                        height: parent.height;
-                                        text: root.brush-size + " px";
-                                        color: root.ink;
-                                        font-size: 12px;
-                                        font-weight: 600;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                }
-                                StepButton {
-                                    width: 29px;
-                                    height: 34px;
-                                    add: true;
-                                    target-name: "brush";
-                                    hold-mode: true;
-                                    enabled: root.brush-size < 40;
-                                    clicked => { root.set-brush-size(min(40, root.brush-size + 1)); }
-                                }
-                                Rectangle {
-                                    width: 1px;
-                                    height: 34px;
-                                    background: transparent;
-                                    Rectangle { y: 5px; width: 1px; height: 24px; background: root.line; }
+                                    height: 24px;
+                                    background: root.line;
                                 }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 ActionButton {
                                     width: 55px;
                                     height: 34px;
                                     label: "Undo";
+                                    enabled: root.can-undo-drawing;
                                     clicked => { root.undo-board(); }
                                 }
                                 ActionButton {
@@ -2207,21 +2452,35 @@ export component MainWindow inherits Window {
                                         value: color.code;
                                         paint: color.paint;
                                         selected: !root.eraser && root.brush-color == color.code;
-                                        picked(value) => { root.set-eraser(false); root.set-brush-color(value); }
+                                        picked(value) => {
+                                            if (root.eraser) {
+                                                root.draw-tool = "pen";
+                                                root.change-draw-tool("pen");
+                                                root.set-eraser(false);
+                                            }
+                                            root.set-brush-color(value);
+                                        }
                                     }
                                 }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                               }
+
                             }
                         }
                         Rectangle { height: 1px; background: root.line; }
+
+
                         Rectangle {
                             vertical-stretch: 1;
                             background: InkTheme.secondary;
                             board-sheet := Rectangle {
-                                width: min(parent.width - 72px, (parent.height - 62px) * 11 / 7);
+                                width: root.advanced-draw ?
+                                    min(parent.width - 308px, (parent.height - 62px) * 11 / 7) :
+                                    min(parent.width - 72px, (parent.height - 62px) * 11 / 7);
                                 height: self.width * 7 / 11;
-                                x: (parent.width - self.width) / 2;
+                                x: root.advanced-draw ?
+                                    270px + (parent.width - 270px - self.width) / 2 :
+                                    (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
                                 background: #ffffff;
                                 border-color: #e1ddd3;
@@ -2233,10 +2492,28 @@ export component MainWindow inherits Window {
                                     width: parent.width;
                                     height: parent.height;
                                 }
+                                if root.selected-draw-object != "": Rectangle {
+                                    x: parent.width * root.selected-draw-x / 1100;
+                                    y: parent.height * root.selected-draw-y / 700;
+                                    width: max(6px, parent.width * root.selected-draw-width / 1100);
+                                    height: max(6px, parent.height * root.selected-draw-height / 700);
+                                    border-width: 2px;
+                                    border-color: #268ddd;
+                                    background: transparent;
+                                    Rectangle {
+                                        x: -4px; y: -4px; width: 8px; height: 8px;
+                                        background: #ffffff; border-width: 1px; border-color: #268ddd;
+                                    }
+                                    Rectangle {
+                                        x: parent.width - 4px; y: parent.height - 4px;
+                                        width: 8px; height: 8px; background: #ffffff;
+                                        border-width: 1px; border-color: #268ddd;
+                                    }
+                                }
                                 board-hit := TouchArea {
                                     width: parent.width;
                                     height: parent.height;
-                                    mouse-cursor: crosshair;
+                                    mouse-cursor: root.draw-tool == "select" ? pointer : crosshair;
                                     pointer-event(event) => {
                                         if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
                                             root.draw-at(Math.round((self.mouse-x / self.width) * 1100), Math.round((self.mouse-y / self.height) * 700), 0);
@@ -2245,11 +2522,252 @@ export component MainWindow inherits Window {
                                             root.draw-at(Math.round((self.mouse-x / self.width) * 1100), Math.round((self.mouse-y / self.height) * 700), 2);
                                         }
                                         if (event.kind == PointerEventKind.cancel) {
-                                            root.draw-at(Math.round((self.mouse-x / self.width) * 1100), Math.round((self.mouse-y / self.height) * 700), 2);
+                                            root.draw-at(Math.round((self.mouse-x / self.width) * 1100), Math.round((self.mouse-y / self.height) * 700), 3);
                                         }
                                     }
                                     moved => {
                                         root.draw-at(Math.round((self.mouse-x / self.width) * 1100), Math.round((self.mouse-y / self.height) * 700), 1);
+                                    }
+                                }
+                            }
+                            if root.advanced-draw: Rectangle {
+                                // A fixed-width scrollable inspector does not steal the
+                                // canvas's vertical space at the minimum window height.
+                                x: 12px;
+                                y: 10px;
+                                width: 244px;
+                                height: parent.height - 20px;
+                                border-radius: 10px;
+                                border-width: 1px;
+                                border-color: InkTheme.line;
+                                background: InkTheme.toolbar;
+                                ScrollView {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    VerticalLayout {
+                                        padding: 10px;
+                                        spacing: 7px;
+                                        Text {
+                                            height: 23px;
+                                            text: "DRAWING OPTIONS";
+                                            font-size: 11px;
+                                            font-weight: 700;
+                                            letter-spacing: 0.5px;
+                                            color: InkTheme.ink;
+                                            vertical-alignment: center;
+                                        }
+                                        HorizontalLayout {
+                                            height: 32px;
+                                            spacing: 6px;
+                                            ToolLabel { width: 44px; label: "SIZE"; }
+                                            StepButton {
+                                                width: 29px; height: 31px;
+                                                enabled: root.brush-size > 1;
+                                                target-name: "brush";
+                                                clicked => { root.set-brush-size(max(1, root.brush-size - 1)); }
+                                            }
+                                            Text {
+                                                width: 45px; height: 31px;
+                                                text: root.brush-size + " px";
+                                                font-size: 12px; color: InkTheme.ink;
+                                                horizontal-alignment: center; vertical-alignment: center;
+                                            }
+                                            StepButton {
+                                                width: 29px; height: 31px; add: true;
+                                                target-name: "brush";
+                                                enabled: root.brush-size < 40;
+                                                clicked => { root.set-brush-size(min(40, root.brush-size + 1)); }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 6px;
+                                            ActionButton {
+                                                width: 77px; height: 31px;
+                                                label: root.draw-filled ? "Fill on" : "Fill off";
+                                                selected: root.draw-filled;
+                                                clicked => { root.draw-filled = !root.draw-filled; root.change-draw-filled(root.draw-filled); }
+                                            }
+                                            Rectangle {
+                                                width: 119px; height: 31px;
+                                                background: InkTheme.paper;
+                                                border-width: 1px;
+                                                border-color: InkTheme.line;
+                                                border-radius: 6px;
+                                                TextInput {
+                                                    x: 8px; y: 3px;
+                                                    width: parent.width - 16px;
+                                                    height: parent.height - 6px;
+                                                    text <=> root.draw-fill-color;
+                                                    color: InkTheme.ink;
+                                                    font-size: 12px;
+                                                    single-line: true;
+                                                    accessible-label: "Fill colour HEX; press Enter to apply";
+                                                    accepted => { root.change-draw-fill-color(self.text); }
+                                                }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 6px;
+                                            ToolLabel { width: 55px; label: "OPACITY"; }
+                                            StepButton {
+                                                width: 29px; height: 31px;
+                                                enabled: root.draw-opacity > 10;
+                                                clicked => { root.draw-opacity = max(10, root.draw-opacity - 10); root.change-draw-opacity(root.draw-opacity); }
+                                            }
+                                            Text {
+                                                width: 46px; height: 31px;
+                                                text: root.draw-opacity + "%";
+                                                color: InkTheme.ink; font-size: 12px;
+                                                vertical-alignment: center; horizontal-alignment: center;
+                                            }
+                                            StepButton {
+                                                width: 29px; height: 31px; add: true;
+                                                enabled: root.draw-opacity < 100;
+                                                clicked => { root.draw-opacity = min(100, root.draw-opacity + 10); root.change-draw-opacity(root.draw-opacity); }
+                                            }
+                                        }
+                                        Rectangle { height: 1px; background: InkTheme.line; }
+                                        ToolLabel { height: 20px; label: "MORE SHAPES"; }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 6px;
+                                            ActionButton {
+                                                width: 103px; height: 31px; label: "Triangle";
+                                                selected: root.draw-tool == "triangle";
+                                                clicked => { root.draw-tool = "triangle"; root.change-draw-tool("triangle"); }
+                                            }
+                                            ActionButton {
+                                                width: 103px; height: 31px; label: "Rounded";
+                                                selected: root.draw-tool == "rounded";
+                                                clicked => { root.draw-tool = "rounded"; root.change-draw-tool("rounded"); }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 6px;
+                                            ActionButton {
+                                                width: 103px; height: 31px; label: "Circle";
+                                                selected: root.draw-tool == "circle";
+                                                clicked => { root.draw-tool = "circle"; root.change-draw-tool("circle"); }
+                                            }
+                                            ActionButton {
+                                                width: 103px; height: 31px; label: "Curve";
+                                                selected: root.draw-tool == "curve";
+                                                clicked => { root.draw-tool = "curve"; root.change-draw-tool("curve"); }
+                                            }
+                                        }
+                                        Rectangle { height: 1px; background: InkTheme.line; }
+                                        ToolLabel { height: 20px; label: "SELECTED OBJECT"; }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 5px;
+                                            ActionButton {
+                                                width: 50px; height: 31px; label: "Scale +";
+                                                enabled: root.selected-draw-object != "";
+                                                clicked => { root.transform-selected-draw-object("larger"); }
+                                            }
+                                            ActionButton {
+                                                width: 50px; height: 31px; label: "Scale -";
+                                                enabled: root.selected-draw-object != "";
+                                                clicked => { root.transform-selected-draw-object("smaller"); }
+                                            }
+                                            ActionButton {
+                                                width: 50px; height: 31px; label: "Rotate";
+                                                enabled: root.selected-draw-object != "";
+                                                clicked => { root.transform-selected-draw-object("rotate"); }
+                                            }
+                                            ActionButton {
+                                                width: 50px; height: 31px; label: "Flip";
+                                                enabled: root.selected-draw-object != "";
+                                                clicked => { root.transform-selected-draw-object("flip"); }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 5px;
+                                            ActionButton {
+                                                width: 101px; height: 31px; label: "Duplicate";
+                                                enabled: root.selected-draw-object != "";
+                                                clicked => { root.duplicate-selected-draw-object(); }
+                                            }
+                                            ActionButton {
+                                                width: 49px; height: 31px; label: "Left";
+                                                enabled: root.selected-draw-object != "";
+                                                clicked => { root.move-selected-draw-object(-10, 0); }
+                                            }
+                                            ActionButton {
+                                                width: 49px; height: 31px; label: "Right";
+                                                enabled: root.selected-draw-object != "";
+                                                clicked => { root.move-selected-draw-object(10, 0); }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 6px;
+                                            ActionButton {
+                                                width: 103px; height: 31px;
+                                                label: "Delete object"; danger: true;
+                                                enabled: root.selected-draw-object != "";
+                                                clicked => { root.delete-selected-draw-object(); }
+                                            }
+                                            ActionButton {
+                                                width: 103px; height: 31px; label: "Redo";
+                                                enabled: root.can-redo-drawing;
+                                                clicked => { root.redo-board(); }
+                                            }
+                                        }
+                                        Rectangle { height: 1px; background: InkTheme.line; }
+                                        ToolLabel { height: 20px; label: "LAYERS"; }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 6px;
+                                            ActionButton {
+                                                width: 103px; height: 31px; label: "New layer";
+                                                clicked => { root.add-draw-layer(); }
+                                            }
+                                            Text {
+                                                width: 103px; height: 31px;
+                                                text: root.drawing-layer-count + " layers";
+                                                font-size: 11px; color: InkTheme.muted;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        for layer in root.drawing-layers: HorizontalLayout {
+                                            height: 32px;
+                                            spacing: 5px;
+                                            ActionButton {
+                                                width: 106px; height: 31px;
+                                                label: layer.name;
+                                                selected: root.selected-draw-layer == layer.id;
+                                                accessible-name: "Select drawing layer " + layer.name;
+                                                clicked => { root.select-draw-layer(layer.id); }
+                                            }
+                                            ActionButton {
+                                                width: 50px; height: 31px;
+                                                label: layer.visible ? "Hide" : "Show";
+                                                selected: layer.visible;
+                                                accessible-name: layer.visible ? "Hide layer " + layer.name : "Show layer " + layer.name;
+                                                clicked => { root.set-draw-layer-visible(layer.id, !layer.visible); }
+                                            }
+                                            ActionButton {
+                                                width: 54px; height: 31px;
+                                                label: layer.locked ? "Unlock" : "Lock";
+                                                selected: layer.locked;
+                                                accessible-name: layer.locked ? "Unlock layer " + layer.name : "Lock layer " + layer.name;
+                                                clicked => { root.set-draw-layer-locked(layer.id, !layer.locked); }
+                                            }
+                                        }
+                                        if root.selected-draw-layer != "": HorizontalLayout {
+                                            height: 32px; spacing: 5px;
+                                            LineEdit {
+                                                width: 100px; height: 31px;
+                                                text <=> root.selected-draw-layer-name;
+                                                accessible-label: "Rename selected layer; press Enter";
+                                                accepted => { root.rename-draw-layer(root.selected-draw-layer, self.text); }
+                                            }
+                                            ActionButton {
+                                                width: 50px; height: 31px; label: "Up";
+                                                clicked => { root.move-draw-layer(root.selected-draw-layer, -1); }
+                                            }
+                                            ActionButton {
+                                                width: 50px; height: 31px; label: "Down";
+                                                clicked => { root.move-draw-layer(root.selected-draw-layer, 1); }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2270,7 +2788,10 @@ export component MainWindow inherits Window {
                                 }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 Text {
-                                    text: root.eraser ? "Erase on canvas" : "Drag on canvas to draw";
+                                    text: root.draw-tool == "select" ? ("Objects: " + root.drawing-object-count + " · select & drag") :
+                                        root.draw-tool == "pen" ? "Draw with pen" :
+                                        root.draw-tool == "eraser" ? "Erase strokes" :
+                                        ("Drag to draw " + root.draw-tool);
                                     font-size: 11px;
                                     color: InkTheme.subtle;
                                     vertical-alignment: center;
@@ -2369,8 +2890,10 @@ export component MainWindow inherits Window {
             if (event.text == Key.Tab) {
                 if (modal-cancel.has-keyboard-focus) {
                     modal-confirm.focus-button();
-                } else {
+                } else if (modal-confirm.has-keyboard-focus || !event.modifiers.shift) {
                     modal-cancel.focus-button();
+                } else {
+                    modal-confirm.focus-button();
                 }
                 return accept;
             }
@@ -2384,8 +2907,10 @@ export component MainWindow inherits Window {
             if (event.text == Key.Tab) {
                 if (modal-cancel.has-keyboard-focus) {
                     modal-confirm.focus-button();
-                } else {
+                } else if (modal-confirm.has-keyboard-focus || !event.modifiers.shift) {
                     modal-cancel.focus-button();
+                } else {
+                    modal-confirm.focus-button();
                 }
                 return accept;
             }
@@ -2417,16 +2942,22 @@ export component MainWindow inherits Window {
                 padding-right: 28px;
                 spacing: 10px;
                 Text {
+                    height: 31px;
                     text: root.delete-confirm-title == "" ? "Delete this page?" : root.delete-confirm-title;
                     font-size: 21px;
                     font-weight: 700;
                     color: InkTheme.ink;
+                    overflow: elide;
+                    vertical-alignment: center;
                 }
                 Text {
+                    height: 69px;
                     text: root.delete-confirm-body == "" ? "This page will be permanently deleted." : root.delete-confirm-body;
                     font-size: 13px;
                     color: InkTheme.muted;
                     wrap: word-wrap;
+                    overflow: elide;
+                    vertical-alignment: top;
                 }
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 HorizontalLayout {

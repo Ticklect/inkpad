@@ -2,6 +2,7 @@
 //! Storage mutations use the cross-process transaction lock in `Store`.
 
 use crate::canvas::{Board, HEIGHT, WIDTH};
+use crate::store::{DrawShape, DrawStyle, DrawingData, Point, Transform};
 use crate::settings::{AppearanceTheme, UiSettings};
 use crate::store::{Note, Store, Stroke, TextRun, TextStylePatch, Workspace};
 use base64::Engine as _;
@@ -10,12 +11,16 @@ use serde_json::{json, Map, Value};
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_TITLE_CHARS: usize = 200;
 const MAX_SEARCH_CHARS: usize = 1000;
 const MAX_RESULTS: usize = 200;
+const MAX_SEARCH_WITH_BODY_RESULTS: usize = 10;
+const MAX_SEARCH_BODY_CHARS: usize = 16_000;
 const MAX_STROKE_POINTS: usize = 512;
 const MAX_STROKES_PER_NOTE: usize = 2_000;
 const MAX_STROKE_JSON_BYTES: usize = 128 * 1024;
@@ -23,8 +28,144 @@ const MAX_IMAGE_FILE_BYTES: u64 = 12 * 1024 * 1024;
 const MAX_IMAGE_BASE64_BYTES: usize = 1024 * 1024;
 const MAX_IMAGE_CAPTION_CHARS: usize = 500;
 const MAX_BATCH_FORMAT_OPS: usize = 32;
+const MAX_BATCH_NOTE_OPS: usize = 32;
 const MAX_FRAGMENT_TEXT_BYTES: usize = 256 * 1024;
 const MAX_FRAGMENT_RUNS: usize = 2048;
+const MAX_DRAWING_PREVIEW_BYTES: usize = 1024 * 1024;
+const DRAWING_HISTORY_LIMIT: usize = 48;
+
+/// Stdio-session history is guarded against another process changing the saved
+/// drawing. The snapshots are deliberately not written into workspace.json.
+#[derive(Default)]
+struct DrawingSession {
+    expected: Option<DrawingData>,
+    undo: Vec<DrawingData>,
+    redo: Vec<DrawingData>,
+}
+static DRAWING_SESSIONS: OnceLock<Mutex<HashMap<String, DrawingSession>>> = OnceLock::new();
+fn drawing_sessions() -> &'static Mutex<HashMap<String, DrawingSession>> {
+    DRAWING_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn drawing_session_key(store: &Store, note_id: &str) -> String {
+    format!("{}|{note_id}", store.data_path().display())
+}
+fn record_drawing_change(store: &Store, id: &str, before: DrawingData, after: DrawingData) {
+    if before == after { return; }
+    let Ok(mut sessions) = drawing_sessions().lock() else { return; };
+    let session = sessions.entry(drawing_session_key(store, id)).or_default();
+    if session.expected.as_ref().is_some_and(|previous| *previous != before) {
+        session.undo.clear();
+        session.redo.clear();
+    }
+    session.undo.push(before);
+    if session.undo.len() > DRAWING_HISTORY_LIMIT { session.undo.remove(0); }
+    session.redo.clear();
+    session.expected = Some(after);
+}
+
+fn drawing_change(store: &Store, args: &Map<String, Value>,
+    change: impl FnOnce(&mut DrawingData) -> Result<Value, String>) -> Result<Value, String> {
+    let (by_title, key) = selector(args, "title")?;
+    let (result, id, before, after) = mutate(store, |workspace| {
+        let index = find_note_index(workspace, by_title, &key)?;
+        let note = &mut workspace.notes[index];
+        let before = note.drawing.snapshot();
+        let result = change(&mut note.drawing)?;
+        note.drawing.validate()?;
+        let after = note.drawing.snapshot();
+        if before != after { note.touch(); }
+        Ok((result, note.id.clone(), before, after))
+    })?;
+    record_drawing_change(store, &id, before, after);
+    Ok(result)
+}
+
+fn drawing_id<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
+    let id = required_string(args, key)?;
+    if id.is_empty() || id.len() > 128 || !id.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-' || ch == b'_') {
+        return Err(format!("{key} must be a valid drawing ID (1–128 ASCII letters, digits, hyphens, underscores)"));
+    }
+    Ok(id)
+}
+
+fn drawing_value<T: serde::de::DeserializeOwned>(args: &Map<String, Value>, key: &str) -> Result<Option<T>, String> {
+    args.get(key).map(|value| serde_json::from_value(value.clone())
+        .map_err(|e| format!("Invalid {key}: {e}"))).transpose()
+}
+
+fn draw_shape(args: &Map<String, Value>, key: &str) -> Result<DrawShape, String> {
+    let value = args.get(key).ok_or_else(|| format!("{key} is required"))?;
+    let map = value.as_object().ok_or_else(|| format!("{key} must be a shape object"))?;
+    let kind = map.get("type").and_then(Value::as_str).ok_or_else(|| invalid("shape.type is required"))?;
+    let allowed: &[&str] = match kind {
+        "rectangle" => &["type", "width", "height"],
+        "rounded_rectangle" => &["type", "width", "height", "radius"],
+        "ellipse" => &["type", "radius_x", "radius_y"],
+        "circle" => &["type", "radius"],
+        "line" => &["type", "to"],
+        "polygon" => &["type", "points", "closed"],
+        "cubic_bezier" => &["type", "control1", "control2", "to"],
+        _ => return Err(invalid("shape.type must be rectangle, rounded_rectangle, ellipse, circle, line, polygon or cubic_bezier")),
+    };
+    if let Some(unknown) = map.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("Unknown shape property: {unknown}"));
+    }
+    serde_json::from_value(value.clone()).map_err(|e| format!("Invalid shape: {e}"))
+}
+
+fn optional_draw_style(args: &Map<String, Value>) -> Result<Option<DrawStyle>, String> {
+    if let Some(value) = args.get("style") {
+        let map = value.as_object().ok_or_else(|| invalid("style must be an object"))?;
+        if let Some(unknown) = map.keys().find(|key| !["stroke", "stroke_width", "fill", "opacity"].contains(&key.as_str())) {
+            return Err(format!("Unknown style property: {unknown}"));
+        }
+    }
+    let style: Option<DrawStyle> = drawing_value(args, "style")?;
+    if let Some(style) = &style { style.validate()?; }
+    Ok(style)
+}
+
+fn optional_draw_transform(args: &Map<String, Value>) -> Result<Option<Transform>, String> {
+    if let Some(value) = args.get("transform") {
+        let map = value.as_object().ok_or_else(|| invalid("transform must be an object"))?;
+        if let Some(unknown) = map.keys().find(|key| !["translation", "scale_x", "scale_y", "rotation_deg", "flip_x", "flip_y"].contains(&key.as_str())) {
+            return Err(format!("Unknown transform property: {unknown}"));
+        }
+    }
+    let transform: Option<Transform> = drawing_value(args, "transform")?;
+    if let Some(transform) = &transform { transform.validate()?; }
+    Ok(transform)
+}
+
+fn draw_number(args: &Map<String, Value>, key: &str, min: f64, max: f64) -> Result<f32, String> {
+    let value = args.get(key).and_then(Value::as_f64)
+        .filter(|x| x.is_finite() && *x >= min && *x <= max)
+        .ok_or_else(|| format!("{key} must be a finite number between {min} and {max}"))?;
+    Ok(value as f32)
+}
+
+fn drawing_capabilities() -> Value {
+    json!({
+        "agent_transport":"local_stdio_mcp", "agent_drawing_model":"editable_vector_objects_v1",
+        "canvas":{"width":WIDTH,"height":HEIGHT,"coordinates":"pixels"},
+        "model":{"shapes":["rectangle","rounded_rectangle","ellipse","circle","line","polygon","cubic_bezier"],
+            "style":["rgba_stroke","stroke_width","solid_fill","linear_gradient","radial_gradient","opacity"],
+            "transforms":["move","resize","rotate","flip","group_move","group_resize","group_rotate","group_flip"],
+            "layers":["create","rename","reorder","visibility","lock","delete_empty"],
+            "object_management":["create","edit","reorder","delete","group","ungroup"],
+            "history":"last 48 MCP drawing edits in this stdio process only; rejects undo/redo after external drawing changes"},
+        "mcp":{"drawing_tools":["drawing_list","drawing_create_shape","drawing_edit_shape","drawing_transform_object",
+            "drawing_reorder_object","drawing_delete_object","drawing_group_objects","drawing_ungroup_objects",
+            "drawing_create_layer","drawing_edit_layer","drawing_move_layer","drawing_delete_layer",
+            "drawing_transform_group","drawing_pick_object","drawing_preview","drawing_undo","drawing_redo"],
+            "batch_drawing_commands":false,"operates_on_saved_workspace":true,"opens_gui":false},
+        "gui":{"drawing_model_shared":true,"interactive_acceptance":"requires GUI verification",
+            "mcp_cannot_control":["active_tool","editor_view","selection","open_dialogs"]},
+        "legacy":{"freehand_strokes_preserved":true,"inline_images_preserved":true,"rich_text_preserved":true,
+            "stroke_undo":"undo_last_stroke with explicit confirmation; separate from object undo"},
+        "destructive_actions":"Human authorization required. Deletions and drawing history undo/redo require confirm:true."
+    })
+}
 
 /// In-memory rich fragment for a client-owned clipboard. Never reads or writes
 /// the OS clipboard and never stores an undo history beside the workspace.
@@ -225,8 +366,10 @@ pub fn run() -> io::Result<()> {
 
 /// Parse one bounded line at a time. A malformed or oversized client message
 /// cannot crash the server or make it allocate arbitrarily large buffers.
-fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Result<Value, String>>> {
-    let mut bytes = Vec::new();
+fn read_message<R: BufRead>(reader: &mut R, bytes: &mut Vec<u8>) -> io::Result<Option<Result<Value, String>>> {
+    // Most MCP requests are small. Reuse the input allocation across a
+    // persistent connection instead of allocating for every round trip.
+    bytes.clear();
     let mut overflow = false;
     let mut saw_data = false;
     loop {
@@ -251,7 +394,8 @@ fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Result<Value, S
 }
 
 fn serve_mcp<R: BufRead, W: Write>(store: &Store, mut input: R, mut output: W) -> io::Result<()> {
-    while let Some(message) = read_message(&mut input)? {
+    let mut message_bytes = Vec::with_capacity(8 * 1024);
+    while let Some(message) = read_message(&mut input, &mut message_bytes)? {
         let response = match message {
             Ok(request) => handle_rpc(store, request),
             Err(error) => Some(rpc_error(Value::Null, -32700, &format!("Parse error: {error}"))),
@@ -335,25 +479,40 @@ fn tool_result(value: Value) -> Value {
                 "structuredContent":metadata,"isError":false});
         }
     }
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".into());
+    // MCP returns the same machine-readable structuredContent. A compact text
+    // mirror avoids a second expensive pretty-print and cuts pipe traffic.
+    let text = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
     json!({"content":[{"type":"text","text":text}],"structuredContent":value,"isError":false})
 }
 
-fn tool_definitions() -> Vec<Value> {
-    vec![
+fn tool_definitions() -> &'static Vec<Value> {
+    static TOOL_DEFINITIONS: OnceLock<Vec<Value>> = OnceLock::new();
+    TOOL_DEFINITIONS.get_or_init(build_tool_definitions)
+}
+
+fn build_tool_definitions() -> Vec<Value> {
+    let batch_note_operation_schema = json!({"oneOf":[
+        {"type":"object","properties":{"op":{"const":"create"},"title":{"type":"string","minLength":1,"maxLength":200},"body":{"type":"string"}},"required":["op"],"additionalProperties":false},
+        {"type":"object","properties":{"op":{"const":"append"},"id":{"type":"string"},"title":{"type":"string"},"text":{"type":"string","minLength":1},"expected_body":{"type":"string"}},"required":["op","text"],"additionalProperties":false},
+        {"type":"object","properties":{"op":{"const":"rename"},"id":{"type":"string"},"match_title":{"type":"string"},"new_title":{"type":"string","minLength":1,"maxLength":200}},"required":["op","new_title"],"additionalProperties":false},
+        {"type":"object","properties":{"op":{"const":"update"},"id":{"type":"string"},"match_title":{"type":"string"},"title":{"type":"string","minLength":1,"maxLength":200},"body":{"type":"string"},"expected_body":{"type":"string"},"confirm":{"type":"boolean","const":true}},"required":["op"],"additionalProperties":false},
+        {"type":"object","properties":{"op":{"const":"pin"},"id":{"type":"string"},"title":{"type":"string"},"pinned":{"type":"boolean"}},"required":["op","pinned"],"additionalProperties":false}
+    ]});
+    let mut tools = vec![
         json!({"name":"list_notes","description":"List Inkpad notes with titles, text previews, drawing counts and IDs; sorted pinned-first and recently updated.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":200}},"additionalProperties":false}}),
-        json!({"name":"search_notes","description":"Search note titles and full text content, case-insensitively. Returns note IDs and drawing counts.","inputSchema":{"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":200}},"required":["query"],"additionalProperties":false}}),
-        json!({"name":"read_note","description":"Read a complete note including text, formatting, and all drawing strokes. Provide an ID or an exact, unique title.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"}},"additionalProperties":false}}),
+        json!({"name":"search_notes","description":"Search titles and full note text, case-insensitively. Default returns compact summaries using the fast in-memory index. Set include_body:true with limit 1–10 to retrieve bounded note text in the same call (body_truncated flags long notes). Experimental sqlite_index:true enables a durable SQLite FTS mirror for benchmarking; it can be slower than the default and adds a first-build cost.","inputSchema":{"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":200},"include_body":{"type":"boolean"},"sqlite_index":{"type":"boolean"}},"required":["query"],"additionalProperties":false}}),
+        json!({"name":"read_note","description":"Read a note by ID or unique title. Set compact:true for text and basic metadata without transferring potentially large drawings, images or formatting; default returns the complete note.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"compact":{"type":"boolean"}},"additionalProperties":false}}),
         json!({"name":"create_note","description":"Create a new Inkpad page with optional title and body. The current desktop page remains selected.","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string"}},"additionalProperties":false}}),
         json!({"name":"append_to_note","description":"Append text to an existing page without touching its drawings. Provide an ID or an exact, unique title.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"text":{"type":"string","minLength":1}},"required":["text"],"additionalProperties":false}}),
         json!({"name":"update_note","description":"Replace the supplied title and/or body of an existing note. Unspecified fields and all drawing strokes are preserved. Select by ID or exact match_title.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"match_title":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"}},"additionalProperties":false}}),
         json!({"name":"rename_note","description":"Rename a note without touching its text or drawing. Select by ID or exact match_title.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"match_title":{"type":"string"},"new_title":{"type":"string","minLength":1,"maxLength":200}},"required":["new_title"],"additionalProperties":false}}),
         json!({"name":"set_note_pin","description":"Pin or unpin a note. Set pinned=true or false. Select by ID or exact title.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"pinned":{"type":"boolean"}},"required":["pinned"],"additionalProperties":false}}),
+        json!({"name":"note_batch","description":"Apply 1–32 create, append, rename, update or pin note changes in request order, atomically under one workspace lock. For append/pin select by id or exact unique title, for rename/update by id or match_title. Replacing a body with update requires explicit human authorization plus confirm:true; optional expected_body on append/update rejects stale text. An invalid operation rolls back the whole batch. Returns one compact result per operation. No delete, clear or undo operation is supported.","inputSchema":{"type":"object","properties":{"operations":{"type":"array","minItems":1,"maxItems":32,"items":batch_note_operation_schema}},"required":["operations"],"additionalProperties":false}}),
         json!({"name":"set_font_size","description":"Set a note's font size in the supported 12–40 pixel range.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"size":{"type":"integer","minimum":12,"maximum":40}},"required":["size"],"additionalProperties":false}}),
         json!({"name":"set_font_choice","description":"Set a note's font family preference to Sans, Serif or Mono.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"choice":{"type":"string","enum":["Sans","Serif","Mono"]}},"required":["choice"],"additionalProperties":false}}),
-        json!({"name":"get_active_note","description":"Return the complete saved active page, including text and drawing strokes, or null if no page is selected.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+        json!({"name":"get_active_note","description":"Return the saved active page or null. Set compact:true to retrieve text and basic metadata without large drawing, image, and formatting arrays; default returns the full note.","inputSchema":{"type":"object","properties":{"compact":{"type":"boolean"}},"additionalProperties":false}}),
         json!({"name":"set_active_note","description":"Update the saved active page preference. An already-open GUI may keep its locally selected page; GUI Text/Draw mode is transient and cannot be set here.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"}},"additionalProperties":false}}),
-        json!({"name":"export_note","description":"Save a note's plain UTF-8 text as .txt or its drawing strokes as a 1100x700 .png file at an explicit absolute path. Never overwrites an existing file. Select by ID or exact title.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"format":{"type":"string","enum":["txt","png"]},"path":{"type":"string"}},"required":["format","path"],"additionalProperties":false}}),
+        json!({"name":"export_note","description":"Save a note's UTF-8 plain body text as .txt or its complete 1100x700 drawing (legacy strokes plus editable objects) as PNG at an explicit absolute path. Existing files are never overwritten. Select by ID or exact title.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"format":{"type":"string","enum":["txt","png"]},"path":{"type":"string"}},"required":["format","path"],"additionalProperties":false}}),
         json!({"name":"add_stroke","description":"Append one validated drawing stroke to an existing page without altering text. Coordinates are canvas pixels (x:0-1099,y:0-699), 1–512 points, width 1–40, color #RRGGBB, optional eraser.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"points":{"type":"array","minItems":1,"maxItems":512,"items":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"integer","minimum":0}}},"width":{"type":"integer","minimum":1,"maximum":40},"color":{"type":"string","pattern":"^#[0-9a-fA-F]{6}$"},"eraser":{"type":"boolean"}},"required":["points","width"],"additionalProperties":false}}),
         json!({"name":"undo_last_stroke","description":"Remove one most-recent drawing stroke; destructive operation requiring the user's explicit authorization and confirm=true.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"confirm":{"type":"boolean","const":true}},"required":["confirm"],"additionalProperties":false}}),
         json!({"name":"clear_strokes","description":"Remove ALL drawing strokes from one page, preserving body text. Requires explicit human authorization and confirm=true.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"confirm":{"type":"boolean","const":true}},"required":["confirm"],"additionalProperties":false}}),
@@ -364,6 +523,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"name":"image_list","description":"List the ordered inline image IDs, captions, display width percentages and positions for a note. Returns metadata only, never raw image bytes or private absolute paths.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"}},"additionalProperties":false}}),
         json!({"name":"image_resize","description":"Resize an existing inline note image. Set width_percent to 10–100. Image stays in the note and keeps its original pixels.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"width_percent":{"type":"integer","minimum":10,"maximum":100}},"required":["image_id","width_percent"],"additionalProperties":false}}),
         json!({"name":"image_move","description":"Move an image to an integer zero-based position within the same note (0 means first). No files are modified; image order is saved.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"position":{"type":"integer","minimum":0}},"required":["image_id","position"],"additionalProperties":false}}),
+        json!({"name":"image_place","description":"Place an existing image between Unicode scalar characters in its note text, without modifying Note.body or rich-text style offsets. Supply char_offset 0..text length and unit=unicode_scalar. Supply null to restore legacy after-text gallery placement. Optional expected_body rejects stale caret positions if another editor changed the text.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"unit":{"type":"string","const":"unicode_scalar"},"char_offset":{"type":["integer","null"],"minimum":0},"expected_body":{"type":"string"}},"required":["image_id","unit","char_offset"],"additionalProperties":false}}),
         json!({"name":"image_caption","description":"Change an image's caption (up to 500 characters). An empty caption removes the caption. Image bytes and size are preserved.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"caption":{"type":"string","maxLength":500}},"required":["image_id","caption"],"additionalProperties":false}}),
         json!({"name":"image_delete","description":"Remove the selected image from the note. Only call when the human explicitly authorizes removal of that image; requires confirm:true. Text, strokes and other images remain. The private PNG may be retained for backup recovery rather than erased from disk.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"image_id":{"type":"string"},"confirm":{"type":"boolean","const":true}},"required":["image_id","confirm"],"additionalProperties":false}}),
         json!({"name":"image_export_html","description":"Export a complete self-contained note as HTML with escaped text and inline embedded images at a human-approved absolute .html path. Contains private note content; do not export without user_approved=true. Refuses overwrite and never opens a GUI dialog.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"path":{"type":"string"},"user_approved":{"type":"boolean","const":true}},"required":["path","user_approved"],"additionalProperties":false}}),
@@ -379,7 +539,59 @@ fn tool_definitions() -> Vec<Value> {
         json!({"name":"format_text_batch","description":"Atomically apply 1–32 ordered rich-text style patches in ONE cross-process transaction. Each operation uses [start,end) Unicode scalar offsets; overlaps are applied sequentially. By default grapheme_safe rejects splitting combining marks or emoji clusters; boundary_policy=scalar opts into exact scalar boundaries. Optional expected_body must match the complete current note body before any change, guarding against stale offsets. Preserves all other note content.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"unit":{"type":"string","const":"unicode_scalar"},"boundary_policy":{"type":"string","enum":["grapheme_safe","scalar"]},"expected_body":{"type":"string"},"operations":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":1},"bold":{"type":"boolean"},"color":{"type":"string","pattern":"^#[0-9a-fA-F]{6}$"},"size":{"type":"integer","minimum":12,"maximum":40},"font_family":{"type":"string","enum":["Sans","Serif","Mono"]},"reset_color":{"type":"boolean"},"reset_size":{"type":"boolean"},"reset_font_family":{"type":"boolean"}},"required":["start","end"],"additionalProperties":false}}},"required":["unit","operations"],"additionalProperties":false}}),
         json!({"name":"copy_rich_fragment","description":"Return a user-selected styled text fragment as structured JSON with relative Unicode scalar runs and source font defaults; never reads/writes the system clipboard or files. Requires note ID/unique title and scalar [start,end) offsets. Default grapheme_safe prevents splitting emoji/combining clusters; boundary_policy=scalar opts into scalar-level selection. Max selected text 256 KiB.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"unit":{"type":"string","const":"unicode_scalar"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0},"boundary_policy":{"type":"string","enum":["grapheme_safe","scalar"]}},"required":["unit","start","end"],"additionalProperties":false}}),
         json!({"name":"paste_rich_fragment","description":"Insert/replace a note selection with a previously returned rich fragment, without accessing OS clipboard. Reapplies validated bold, color, font and sizes, preserves unaffected text/styles, and commits atomically under Store lock. Fragment format_version=1, unit=unicode_scalar, text up to 256 KiB, up to 2048 canonical styled runs. Optional expected_text ensures the exact destination selection has not changed. Default grapheme_safe boundary validation; no durable text undo/redo is implied.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"unit":{"type":"string","const":"unicode_scalar"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0},"boundary_policy":{"type":"string","enum":["grapheme_safe","scalar"]},"expected_text":{"type":"string"},"fragment":{"type":"object","properties":{"format_version":{"type":"integer","const":1},"unit":{"type":"string","const":"unicode_scalar"},"text":{"type":"string"},"runs":{"type":"array"},"defaults":{"type":"object","properties":{"size":{"type":"integer","minimum":12,"maximum":40},"font_family":{"type":"string","enum":["Sans","Serif","Mono"]}},"required":["size","font_family"],"additionalProperties":false}},"required":["format_version","unit","text","runs"],"additionalProperties":false}},"required":["unit","start","end","fragment"],"additionalProperties":false}}),
-    ]
+    ];
+    tools.extend(drawing_tool_definitions());
+    tools
+}
+
+fn drawing_tool_definitions() -> Vec<Value> {
+    let shape = json!({"oneOf":[
+        {"type":"object","properties":{"type":{"const":"rectangle"},"width":{"type":"number","exclusiveMinimum":0,"maximum":8192},"height":{"type":"number","exclusiveMinimum":0,"maximum":8192}},"required":["type","width","height"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"rounded_rectangle"},"width":{"type":"number","exclusiveMinimum":0,"maximum":8192},"height":{"type":"number","exclusiveMinimum":0,"maximum":8192},"radius":{"type":"number","minimum":0}},"required":["type","width","height","radius"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"ellipse"},"radius_x":{"type":"number","exclusiveMinimum":0,"maximum":8192},"radius_y":{"type":"number","exclusiveMinimum":0,"maximum":8192}},"required":["type","radius_x","radius_y"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"circle"},"radius":{"type":"number","exclusiveMinimum":0,"maximum":8192}},"required":["type","radius"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"line"},"to":{"$ref":"#/$defs/point"}},"required":["type","to"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"polygon"},"points":{"type":"array","minItems":2,"maxItems":256,"items":{"$ref":"#/$defs/point"}},"closed":{"type":"boolean"}},"required":["type","points"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"cubic_bezier"},"control1":{"$ref":"#/$defs/point"},"control2":{"$ref":"#/$defs/point"},"to":{"$ref":"#/$defs/point"}},"required":["type","control1","control2","to"],"additionalProperties":false}
+    ]});
+    let point = json!({"type":"object","properties":{"x":{"type":"number","minimum":-16384,"maximum":16384},"y":{"type":"number","minimum":-16384,"maximum":16384}},"required":["x","y"],"additionalProperties":false});
+    let color = json!({"type":"array","minItems":4,"maxItems":4,"items":{"type":"integer","minimum":0,"maximum":255}});
+    let fill = json!({"oneOf":[
+        {"type":"object","properties":{"type":{"const":"solid"},"color":color},"required":["type","color"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"linear_gradient"},"start":point,"end":point,"stops":{"$ref":"#/$defs/stops"}},"required":["type","start","end","stops"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"radial_gradient"},"center":point,"radius":{"type":"number","exclusiveMinimum":0,"maximum":8192},"stops":{"$ref":"#/$defs/stops"}},"required":["type","center","radius","stops"],"additionalProperties":false}
+    ]});
+    let style = json!({"type":"object","properties":{"stroke":{"oneOf":[color,{"type":"null"}]},"stroke_width":{"type":"number","minimum":0,"maximum":256},"fill":{"oneOf":[fill,{"type":"null"}]},"opacity":{"type":"number","minimum":0,"maximum":1}},"additionalProperties":false});
+    let transform = json!({"type":"object","properties":{"translation":point,"scale_x":{"type":"number","minimum":0.001,"maximum":128},"scale_y":{"type":"number","minimum":0.001,"maximum":128},"rotation_deg":{"type":"number","minimum":-360000,"maximum":360000},"flip_x":{"type":"boolean"},"flip_y":{"type":"boolean"}},"additionalProperties":false});
+    let defs = json!({"point":point,"stops":{"type":"array","minItems":2,"maxItems":16,"items":{"type":"object","properties":{"offset":{"type":"number","minimum":0,"maximum":1},"color":color},"required":["offset","color"],"additionalProperties":false}}});
+    let note = json!({"id":{"type":"string"},"title":{"type":"string"}});
+    let object_id = json!({"type":"string","minLength":1,"maxLength":128});
+    let layer_id = object_id.clone();
+    let mut tools = Vec::new();
+    let mut add = |name: &str, description: &str, properties: Value, required: Vec<&str>, definitions: bool| {
+        let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
+        if definitions { schema["$defs"] = defs.clone(); }
+        tools.push(json!({"name":name,"description":description,"inputSchema":schema}));
+    };
+    add("get_capabilities", "Discover exact capabilities of the local MCP drawing model and current GUI/MCP differences, including supported shapes, styles, transforms, layers and transient history.",json!({}),vec![],false);
+    add("drawing_list", "Read editable vector objects and layers in the saved note. Legacy freehand strokes remain separate. No private image bytes are returned.",note.clone(),vec![],false);
+    add("drawing_create_shape", "Create one editable shape. Shape uses local coordinates and transform positions it on the 1100x700 canvas. RGBA colour arrays; optional style and transform; auto-creates Layer 1 when needed. No batch drawing commands.",json!({"id":note["id"],"title":note["title"],"shape":shape,"style":style,"transform":transform,"layer_id":layer_id}),vec!["shape"],true);
+    add("drawing_edit_shape", "Replace any provided shape geometry, style, transform, visibility or layer association of ONE existing drawing object. Locked layers reject edits. All omitted fields are kept.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"shape":shape,"style":style,"transform":transform,"visible":{"type":"boolean"},"layer_id":layer_id}),vec!["object_id"],true);
+    add("drawing_transform_object", "Apply a relative move (dx/dy), resize (sx/sy), rotate (degrees) or flip (horizontal=true/false) to one editable object. Locked layers reject edits; values are checked.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"operation":{"type":"string","enum":["move","resize","rotate","flip"]},"dx":{"type":"number","minimum":-16384,"maximum":16384},"dy":{"type":"number","minimum":-16384,"maximum":16384},"sx":{"type":"number","exclusiveMinimum":0,"maximum":128},"sy":{"type":"number","exclusiveMinimum":0,"maximum":128},"degrees":{"type":"number","minimum":-360000,"maximum":360000},"horizontal":{"type":"boolean"}}),vec!["object_id","operation"],false);
+    add("drawing_transform_group", "Apply a relative move, resize, rotation or flip to all objects in one named group around their shared transform origin. Locked layers reject the entire operation.",json!({"id":note["id"],"title":note["title"],"group_id":object_id,"operation":{"type":"string","enum":["move","resize","rotate","flip"]},"dx":{"type":"number","minimum":-16384,"maximum":16384},"dy":{"type":"number","minimum":-16384,"maximum":16384},"sx":{"type":"number","exclusiveMinimum":0,"maximum":128},"sy":{"type":"number","exclusiveMinimum":0,"maximum":128},"degrees":{"type":"number","minimum":-360000,"maximum":360000},"horizontal":{"type":"boolean"}}),vec!["group_id","operation"],false);
+    add("drawing_reorder_object", "Change one editable object's zero-based stacking position among vector objects.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"position":{"type":"integer","minimum":0,"maximum":1999}}),vec!["object_id","position"],false);
+    add("drawing_delete_object", "Delete the selected vector shape, requiring explicit human authorization and confirm:true. This does not delete legacy strokes or images.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"confirm":{"type":"boolean","const":true}}),vec!["object_id","confirm"],false);
+    add("drawing_group_objects", "Assign one group ID to 2–2000 selected vector objects; group membership is metadata and does not merge geometries.",json!({"id":note["id"],"title":note["title"],"object_ids":{"type":"array","minItems":2,"maxItems":2000,"items":object_id}}),vec!["object_ids"],false);
+    add("drawing_ungroup_objects", "Remove group membership for an existing drawing group without deleting shapes.",json!({"id":note["id"],"title":note["title"],"group_id":object_id}),vec!["group_id"],false);
+    add("drawing_create_layer", "Create one named editable drawing layer (maximum 64). Existing shapes and legacy strokes remain untouched.",json!({"id":note["id"],"title":note["title"],"name":{"type":"string","minLength":1,"maxLength":80}}),vec!["name"],false);
+    add("drawing_edit_layer", "Rename an existing drawing layer or change its visibility/lock. Supply one or more of name, visible or locked.",json!({"id":note["id"],"title":note["title"],"layer_id":layer_id,"name":{"type":"string","minLength":1,"maxLength":80},"visible":{"type":"boolean"},"locked":{"type":"boolean"}}),vec!["layer_id"],false);
+    add("drawing_move_layer", "Reorder one drawing layer using a zero-based index; maintains all object associations.",json!({"id":note["id"],"title":note["title"],"layer_id":layer_id,"position":{"type":"integer","minimum":0,"maximum":63}}),vec!["layer_id","position"],false);
+    add("drawing_delete_layer", "Remove an EMPTY drawing layer (not a layer containing objects), with explicit human authorization and confirm:true. Rejects locked layers.",json!({"id":note["id"],"title":note["title"],"layer_id":layer_id,"confirm":{"type":"boolean","const":true}}),vec!["layer_id","confirm"],false);
+    add("drawing_pick_object", "Inspect the topmost visible, unlocked vector object under a canvas point. Returns object metadata or null. Hit-testing uses the same implementation as the GUI.",json!({"id":note["id"],"title":note["title"],"x":{"type":"number","minimum":-16384,"maximum":16384},"y":{"type":"number","minimum":-16384,"maximum":16384},"tolerance":{"type":"number","minimum":0,"maximum":32}}),vec!["x","y"],false);
+    add("drawing_preview", "Render the current saved canvas as an MCP image/png content block, max 1 MiB PNG. Includes legacy freehand strokes and editable objects. Does not create a file or open the GUI.",note.clone(),vec![],false);
+    add("drawing_undo", "Undo the last vector drawing MCP edit in this same long-running stdio process. Requires explicit user authorization and confirm:true; refuses if another process changed the drawing.",json!({"id":note["id"],"title":note["title"],"confirm":{"type":"boolean","const":true}}),vec!["confirm"],false);
+    add("drawing_redo", "Redo the last vector drawing MCP undo in this same stdio process. Requires explicit user authorization and confirm:true; refuses after external changes.",json!({"id":note["id"],"title":note["title"],"confirm":{"type":"boolean","const":true}}),vec!["confirm"],false);
+    tools
 }
 
 fn invalid(message: impl Into<String>) -> String { message.into() }
@@ -439,14 +651,188 @@ fn find_note_index(workspace: &Workspace, by_title: bool, selector: &str) -> Res
     Ok(first)
 }
 
-fn ordered_notes(notes: &[Note]) -> Vec<&Note> {
-    let mut list: Vec<&Note> = notes.iter().collect();
-    sort_notes(&mut list);
-    list
+/// Batch operations borrow validated input, then run in request order inside
+/// one Store transaction. A failed later lookup/guard discards every edit.
+enum NoteBatchOp<'a> {
+    Create { title: &'a str, body: &'a str },
+    Append { by_title: bool, selector: String, text: &'a str, expected_body: Option<&'a str> },
+    Rename { by_title: bool, selector: String, new_title: &'a str },
+    Update { by_title: bool, selector: String, title: Option<&'a str>, body: Option<&'a str>, expected_body: Option<&'a str> },
+    Pin { by_title: bool, selector: String, pinned: bool },
 }
 
-fn sort_notes(list: &mut Vec<&Note>) {
-    list.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| b.updated.cmp(&a.updated)).then_with(|| a.title.cmp(&b.title)));
+impl NoteBatchOp<'_> {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::Append { .. } => "append",
+            Self::Rename { .. } => "rename",
+            Self::Update { .. } => "update",
+            Self::Pin { .. } => "pin",
+        }
+    }
+}
+
+fn parse_note_batch(args: &Value) -> Result<Vec<NoteBatchOp<'_>>, String> {
+    let args = object_args(args, &["operations"])?;
+    let operations = args.get("operations").and_then(Value::as_array)
+        .ok_or_else(|| invalid("operations must be an array of 1–32 note changes"))?;
+    if operations.is_empty() || operations.len() > MAX_BATCH_NOTE_OPS {
+        return Err(invalid("operations must contain 1–32 note changes"));
+    }
+    operations.iter().enumerate().map(|(index, operation)| {
+        let parse = || -> Result<NoteBatchOp<'_>, String> {
+            let value = operation.as_object().ok_or_else(|| invalid("Operation must be an object"))?;
+            match required_string(value, "op")? {
+                "create" => {
+                    let value = object_args(operation, &["op", "title", "body"])?;
+                    let title = optional_string(value, "title")?.unwrap_or("Untitled note");
+                    let body = optional_string(value, "body")?.unwrap_or("");
+                    validate_title(title)?;
+                    validate_body(body)?;
+                    Ok(NoteBatchOp::Create { title, body })
+                }
+                "append" => {
+                    let value = object_args(operation, &["op", "id", "title", "text", "expected_body"])?;
+                    let (by_title, selector) = selector(value, "title")?;
+                    let text = required_string(value, "text")?;
+                    validate_body(text)?;
+                    if text.is_empty() { return Err(invalid("text cannot be empty")); }
+                    let expected_body = optional_string(value, "expected_body")?;
+                    if let Some(expected) = expected_body { validate_body(expected)?; }
+                    Ok(NoteBatchOp::Append { by_title, selector, text, expected_body })
+                }
+                "rename" => {
+                    let value = object_args(operation, &["op", "id", "match_title", "new_title"])?;
+                    let (by_title, selector) = selector(value, "match_title")?;
+                    let new_title = required_string(value, "new_title")?;
+                    validate_title(new_title)?;
+                    Ok(NoteBatchOp::Rename { by_title, selector, new_title })
+                }
+                "update" => {
+                    let value = object_args(operation, &["op", "id", "match_title", "title", "body", "expected_body", "confirm"])?;
+                    let (by_title, selector) = selector(value, "match_title")?;
+                    let title = optional_string(value, "title")?;
+                    let body = optional_string(value, "body")?;
+                    if title.is_none() && body.is_none() { return Err(invalid("Provide title and/or body to update")); }
+                    if body.is_some() && value.get("confirm") != Some(&Value::Bool(true)) {
+                        return Err(invalid("Replacing a note body requires explicit user authorization and confirm:true"));
+                    }
+                    if body.is_none() && value.contains_key("confirm") {
+                        return Err(invalid("confirm is only valid for body replacement"));
+                    }
+                    if let Some(title) = title { validate_title(title)?; }
+                    if let Some(body) = body { validate_body(body)?; }
+                    let expected_body = optional_string(value, "expected_body")?;
+                    if let Some(expected) = expected_body { validate_body(expected)?; }
+                    Ok(NoteBatchOp::Update { by_title, selector, title, body, expected_body })
+                }
+                "pin" => {
+                    let value = object_args(operation, &["op", "id", "title", "pinned"])?;
+                    let (by_title, selector) = selector(value, "title")?;
+                    let pinned = required_bool(value, "pinned")?;
+                    Ok(NoteBatchOp::Pin { by_title, selector, pinned })
+                }
+                _ => Err(invalid("Unsupported op; use create, append, rename, update or pin")),
+            }
+        };
+        parse().map_err(|error| format!("Operation {index}: {error}"))
+    }).collect()
+}
+
+fn execute_note_batch(store: &Store, args: &Value) -> Result<Value, String> {
+    let operations = parse_note_batch(args)?;
+    mutate(store, |workspace| {
+        let mut results = Vec::with_capacity(operations.len());
+        for (index, operation) in operations.iter().enumerate() {
+            let kind = operation.kind();
+            let mut change = || -> Result<Value, String> {
+                let note = match operation {
+                    NoteBatchOp::Create { title, body } => {
+                        let mut note = Note::create("note");
+                        note.title = (*title).to_string();
+                        note.body = (*body).to_string();
+                        // In one fast transaction Note::create may get the same
+                        // clock tick for multiple notes. Assign collision-safe IDs.
+                        let base_id = note.id.clone();
+                        let mut suffix = 1usize;
+                        while workspace.notes.iter().any(|existing| existing.id == note.id) {
+                            note.id = format!("{base_id}-{suffix}");
+                            suffix += 1;
+                        }
+                        if workspace.notes.is_empty() { workspace.active_id = note.id.clone(); }
+                        workspace.notes.push(note);
+                        workspace.notes.last().expect("just added note")
+                    }
+                    NoteBatchOp::Append { by_title, selector, text, expected_body } => {
+                        let position = find_note_index(workspace, *by_title, selector)?;
+                        let note = &mut workspace.notes[position];
+                        if expected_body.is_some_and(|expected| note.body != expected) {
+                            return Err(invalid("expected_body does not match saved text"));
+                        }
+                        let separator = if note.body.is_empty() || note.body.ends_with('\n') || text.starts_with('\n') { "" } else { "\n" };
+                        let length = note.body.len().checked_add(separator.len())
+                            .and_then(|bytes| bytes.checked_add(text.len()))
+                            .ok_or_else(|| invalid("Resulting note body exceeds 1 MiB"))?;
+                        if length > MAX_BODY_BYTES { return Err(invalid("Resulting note body exceeds 1 MiB")); }
+                        let mut edited = note.body.clone();
+                        edited.push_str(separator);
+                        edited.push_str(text);
+                        note.set_body_preserving_format(edited)?;
+                        note
+                    }
+                    NoteBatchOp::Rename { by_title, selector, new_title } => {
+                        let position = find_note_index(workspace, *by_title, selector)?;
+                        let note = &mut workspace.notes[position];
+                        note.title = (*new_title).to_string();
+                        note.touch();
+                        note
+                    }
+                    NoteBatchOp::Update { by_title, selector, title, body, expected_body } => {
+                        let position = find_note_index(workspace, *by_title, selector)?;
+                        let note = &mut workspace.notes[position];
+                        if expected_body.is_some_and(|expected| note.body != expected) {
+                            return Err(invalid("expected_body does not match saved text"));
+                        }
+                        if let Some(title) = title { note.title = (*title).to_string(); }
+                        if let Some(body) = body { note.set_body_preserving_format((*body).to_string())?; }
+                        note.touch();
+                        note
+                    }
+                    NoteBatchOp::Pin { by_title, selector, pinned } => {
+                        let position = find_note_index(workspace, *by_title, selector)?;
+                        let note = &mut workspace.notes[position];
+                        note.pinned = *pinned;
+                        note.touch();
+                        note
+                    }
+                };
+                Ok(json!({"index":index,"op":kind,"id":note.id,"title":note.title,
+                    "pinned":note.pinned,"body_chars":note.body.chars().count()}))
+            };
+            results.push(change().map_err(|error| format!("Operation {index} ({kind}): {error}"))?);
+        }
+        Ok(json!({"applied":results.len(),"results":results}))
+    })
+}
+
+fn ordered_notes<'a>(notes: impl IntoIterator<Item = &'a Note>, limit: usize) -> Vec<&'a Note> {
+    // JSON-RPC allows at most 200 summaries. Partition large result sets once
+    // and sort only those actually returned. Include original position as the
+    // final tie-breaker to preserve the old stable-sort ordering exactly.
+    let mut list: Vec<_> = notes.into_iter().enumerate().collect();
+    let cmp = |a: &(usize, &Note), b: &(usize, &Note)| {
+        b.1.pinned.cmp(&a.1.pinned)
+            .then_with(|| b.1.updated.cmp(&a.1.updated))
+            .then_with(|| a.1.title.cmp(&b.1.title))
+            .then_with(|| a.0.cmp(&b.0))
+    };
+    if list.len() > limit {
+        list.select_nth_unstable_by(limit, cmp);
+        list.truncate(limit);
+    }
+    list.sort_unstable_by(cmp);
+    list.into_iter().map(|(_, note)| note).collect()
 }
 
 fn preview(body: &str) -> String {
@@ -460,6 +846,29 @@ fn note_summary(note: &Note) -> Value {
         "has_drawing":!note.strokes.is_empty(),"image_count":note.images.len(),"pinned":note.pinned,
         "font_size":note.font_size,"font_choice":note.font_choice,"updated":note.updated
     })
+}
+
+fn compact_note(note: &Note) -> Value {
+    json!({"id":note.id,"title":note.title,"body":note.body,
+        "kind":note.kind,"pinned":note.pinned,"updated":note.updated,
+        "font_size":note.font_size,"font_choice":note.font_choice,
+        "image_count":note.images.len(),"stroke_count":note.strokes.len(),
+        "drawing_object_count":note.drawing.objects.len(),
+        "rich_text_run_count":note.rich_text.len()})
+}
+
+fn search_note_with_body(note: &Note) -> Value {
+    let mut summary = note_summary(note);
+    // Bound the response even when a workspace has large notes. The flag is
+    // explicit so callers know when to fetch the remaining text with read_note.
+    let body_chars = note.body.chars().count();
+    summary["body"] = json!(if body_chars > MAX_SEARCH_BODY_CHARS {
+        note.body.chars().take(MAX_SEARCH_BODY_CHARS).collect::<String>()
+    } else {
+        note.body.clone()
+    });
+    summary["body_truncated"] = json!(body_chars > MAX_SEARCH_BODY_CHARS);
+    summary
 }
 
 fn limit(args: &Map<String, Value>) -> Result<usize, String> {
@@ -794,7 +1203,8 @@ fn export_note(note: &Note, format: &str, destination: &str) -> Result<Value, St
         if note.strokes.len() > 20_000 || note.strokes.iter().map(|s| s.points.len()).sum::<usize>() > 250_000 {
             return Err(invalid("Drawing is too large to safely render in a headless export"));
         }
-        Board::new(&note.strokes).png_bytes().map_err(|e| format!("PNG rendering failed: {e}"))?
+        note.drawing.validate()?;
+        Board::from_note(note).png_bytes().map_err(|e| format!("PNG rendering failed: {e}"))?
     };
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)
         .map_err(|e| format!("Cannot create export (existing files are never replaced): {e}"))?;
@@ -805,7 +1215,7 @@ fn export_note(note: &Note, format: &str, destination: &str) -> Result<Value, St
         "height":if format == "png" {Some(HEIGHT)} else {None}}))
 }
 
-fn load(store: &Store) -> Result<Workspace, String> { store.read_latest().map_err(|e| e.to_string()) }
+fn load(store: &Store) -> Result<Arc<Workspace>, String> { store.read_cached().map_err(|e| e.to_string()) }
 
 fn mutate<T>(store: &Store, work: impl FnOnce(&mut Workspace) -> Result<T, String>) -> Result<T, String> {
     // Failed validation aborts without writing an unchanged workspace.
@@ -816,39 +1226,315 @@ fn mutate<T>(store: &Store, work: impl FnOnce(&mut Workspace) -> Result<T, Strin
 
 fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String> {
     match name {
+        "note_batch" => execute_note_batch(store, args),
+        "get_capabilities" => {
+            object_args(args, &[])?;
+            Ok(drawing_capabilities())
+        }
+        "drawing_list" => {
+            let args = object_args(args, &["id","title"])?;
+            let (by_title, key) = selector(args, "title")?;
+            let workspace = load(store)?;
+            let note = &workspace.notes[find_note_index(&workspace, by_title, &key)?];
+            Ok(json!({"id":note.id,"drawing":note.drawing,"layer_count":note.drawing.layers.len(),
+                "object_count":note.drawing.objects.len(),"legacy_stroke_count":note.strokes.len(),
+                "canvas":{"width":WIDTH,"height":HEIGHT}}))
+        }
+        "drawing_create_shape" => {
+            let args = object_args(args, &["id","title","shape","style","transform","layer_id"])?;
+            let shape = draw_shape(args, "shape")?;
+            let style = optional_draw_style(args)?;
+            let transform = optional_draw_transform(args)?;
+            let layer_id = optional_string(args, "layer_id")?;
+            if layer_id.is_some() { drawing_id(args, "layer_id")?; }
+            drawing_change(store, args, |drawing| {
+                let object_id = drawing.add_object(shape, layer_id)?;
+                if style.is_some() || transform.is_some() {
+                    drawing.update_object(&object_id, |object| {
+                        if let Some(style) = &style { object.style = style.clone(); }
+                        if let Some(transform) = &transform { object.transform = transform.clone(); }
+                    })?;
+                }
+                Ok(json!({"object":drawing.object(&object_id),"object_count":drawing.objects.len()}))
+            })
+        }
+        "drawing_edit_shape" => {
+            let args = object_args(args, &["id","title","object_id","shape","style","transform","visible","layer_id"])?;
+            let object_id = drawing_id(args, "object_id")?;
+            let shape = if args.contains_key("shape") { Some(draw_shape(args, "shape")?) } else { None };
+            let style = optional_draw_style(args)?;
+            let transform = optional_draw_transform(args)?;
+            let visible = args.get("visible").map(|_| required_bool(args, "visible")).transpose()?;
+            let layer_id = optional_string(args, "layer_id")?;
+            if layer_id.is_some() { drawing_id(args, "layer_id")?; }
+            if shape.is_none() && style.is_none() && transform.is_none() && visible.is_none() && layer_id.is_none() {
+                return Err(invalid("Provide shape, style, transform, visible or layer_id to edit"));
+            }
+            drawing_change(store, args, |drawing| {
+                drawing.update_object(object_id, |object| {
+                    if let Some(shape) = &shape { object.shape = shape.clone(); }
+                    if let Some(style) = &style { object.style = style.clone(); }
+                    if let Some(transform) = &transform { object.transform = transform.clone(); }
+                    if let Some(visible) = visible { object.visible = visible; }
+                    if let Some(layer_id) = layer_id { object.layer_id = layer_id.into(); }
+                })?;
+                Ok(json!({"object":drawing.object(object_id)}))
+            })
+        }
+        "drawing_transform_object" | "drawing_transform_group" => {
+            let grouped = name == "drawing_transform_group";
+            let args = object_args(args, if grouped {
+                &["id","title","group_id","operation","dx","dy","sx","sy","degrees","horizontal"]
+            } else {
+                &["id","title","object_id","operation","dx","dy","sx","sy","degrees","horizontal"]
+            })?;
+            let target_id = drawing_id(args, if grouped { "group_id" } else { "object_id" })?;
+            let operation = required_string(args, "operation")?;
+            let parameters: &[&str] = match operation {
+                "move" => &["dx","dy"],
+                "resize" => &["sx","sy"],
+                "rotate" => &["degrees"],
+                "flip" => &["horizontal"],
+                _ => return Err(invalid("operation must be move, resize, rotate or flip")),
+            };
+            if let Some(extra) = ["dx","dy","sx","sy","degrees","horizontal"].iter()
+                .find(|key| args.contains_key(**key) && !parameters.contains(key)) {
+                return Err(format!("Unexpected transform parameter for {operation}: {extra}"));
+            }
+            let numbers = match operation {
+                "move" => Some((draw_number(args, "dx", -16384.0, 16384.0)?,draw_number(args, "dy", -16384.0, 16384.0)?)),
+                "resize" => Some((draw_number(args, "sx", 0.001, 128.0)?,draw_number(args, "sy", 0.001, 128.0)?)),
+                "rotate" => Some((draw_number(args, "degrees", -360000.0, 360000.0)?,0.0)),
+                _ => None,
+            };
+            let horizontal = if operation == "flip" { Some(required_bool(args, "horizontal")?) } else { None };
+            drawing_change(store, args, |drawing| {
+                match (grouped, operation) {
+                    (false, "move") => drawing.move_object(target_id, numbers.unwrap().0, numbers.unwrap().1)?,
+                    (false, "resize") => drawing.resize_object(target_id, numbers.unwrap().0, numbers.unwrap().1)?,
+                    (false, "rotate") => drawing.rotate_object(target_id, numbers.unwrap().0)?,
+                    (false, "flip") => drawing.flip_object(target_id, horizontal.unwrap())?,
+                    (true, "move") => drawing.move_group(target_id, numbers.unwrap().0, numbers.unwrap().1)?,
+                    (true, "resize") => drawing.resize_group(target_id, numbers.unwrap().0, numbers.unwrap().1)?,
+                    (true, "rotate") => drawing.rotate_group(target_id, numbers.unwrap().0)?,
+                    (true, "flip") => drawing.flip_group(target_id, horizontal.unwrap())?,
+                    _ => unreachable!(),
+                }
+                if grouped { Ok(json!({"group_id":target_id,"operation":operation,"object_count":drawing.objects.iter()
+                    .filter(|object| object.group_id.as_deref() == Some(target_id)).count()})) }
+                else { Ok(json!({"object":drawing.object(target_id)})) }
+            })
+        }
+        "drawing_reorder_object" => {
+            let args = object_args(args, &["id","title","object_id","position"])?;
+            let object_id = drawing_id(args, "object_id")?;
+            let position = required_i32(args, "position", 0, 1999)? as usize;
+            drawing_change(store, args, |drawing| {
+                drawing.reorder_object(object_id, position)?;
+                Ok(json!({"object_id":object_id,"position":position}))
+            })
+        }
+        "drawing_delete_object" => {
+            let args = object_args(args, &["id","title","object_id","confirm"])?;
+            require_confirmation(args, "Deleting this drawing object")?;
+            let object_id = drawing_id(args, "object_id")?;
+            drawing_change(store, args, |drawing| {
+                drawing.remove_object(object_id)?;
+                Ok(json!({"deleted":true,"object_id":object_id,"object_count":drawing.objects.len()}))
+            })
+        }
+        "drawing_group_objects" => {
+            let args = object_args(args, &["id","title","object_ids"])?;
+            let ids = args.get("object_ids").and_then(Value::as_array)
+                .filter(|list| (2..=2000).contains(&list.len()))
+                .ok_or_else(|| invalid("object_ids must contain 2–2000 drawing object IDs"))?;
+            let mut object_ids = Vec::with_capacity(ids.len());
+            for id in ids {
+                let mut identity = Map::new(); identity.insert("object_id".into(), id.clone());
+                object_ids.push(drawing_id(&identity, "object_id")?.to_string());
+            }
+            drawing_change(store, args, |drawing| {
+                let group_id = drawing.group_objects(&object_ids)?;
+                Ok(json!({"group_id":group_id,"object_ids":object_ids}))
+            })
+        }
+        "drawing_ungroup_objects" => {
+            let args = object_args(args, &["id","title","group_id"])?;
+            let group_id = drawing_id(args, "group_id")?;
+            drawing_change(store, args, |drawing| {
+                drawing.ungroup(group_id)?;
+                Ok(json!({"group_id":group_id,"ungrouped":true}))
+            })
+        }
+        "drawing_create_layer" => {
+            let args = object_args(args, &["id","title","name"])?;
+            let name = required_string(args, "name")?;
+            if name.trim().is_empty() || name.chars().count() > 80 || name.contains('\0') { return Err(invalid("Layer name must contain 1–80 characters and no NUL")); }
+            drawing_change(store, args, |drawing| {
+                let layer_id = drawing.add_layer(name)?;
+                Ok(json!({"layer_id":layer_id,"layer_count":drawing.layers.len()}))
+            })
+        }
+        "drawing_edit_layer" => {
+            let args = object_args(args, &["id","title","layer_id","name","visible","locked"])?;
+            let layer_id = drawing_id(args, "layer_id")?;
+            let name = optional_string(args, "name")?;
+            if let Some(name) = name {
+                if name.trim().is_empty() || name.chars().count() > 80 || name.contains('\0') { return Err(invalid("Layer name must contain 1–80 characters and no NUL")); }
+            }
+            let visible = args.get("visible").map(|_| required_bool(args, "visible")).transpose()?;
+            let locked = args.get("locked").map(|_| required_bool(args, "locked")).transpose()?;
+            if name.is_none() && visible.is_none() && locked.is_none() { return Err(invalid("Provide name, visible or locked to edit layer")); }
+            drawing_change(store, args, |drawing| {
+                if let Some(name) = name { drawing.rename_layer(layer_id, name)?; }
+                if let Some(visible) = visible { drawing.set_layer_visibility(layer_id, visible)?; }
+                if let Some(locked) = locked { drawing.set_layer_locked(layer_id, locked)?; }
+                Ok(json!({"layer":drawing.layers.iter().find(|layer| layer.id == layer_id)}))
+            })
+        }
+        "drawing_move_layer" => {
+            let args = object_args(args, &["id","title","layer_id","position"])?;
+            let layer_id = drawing_id(args, "layer_id")?;
+            let position = required_i32(args, "position", 0, 63)? as usize;
+            drawing_change(store, args, |drawing| {
+                drawing.move_layer(layer_id, position)?;
+                Ok(json!({"layer_id":layer_id,"position":position}))
+            })
+        }
+        "drawing_delete_layer" => {
+            let args = object_args(args, &["id","title","layer_id","confirm"])?;
+            require_confirmation(args, "Deleting this drawing layer")?;
+            let layer_id = drawing_id(args, "layer_id")?;
+            drawing_change(store, args, |drawing| {
+                drawing.remove_layer(layer_id)?;
+                Ok(json!({"deleted":true,"layer_id":layer_id,"layer_count":drawing.layers.len()}))
+            })
+        }
+        "drawing_pick_object" => {
+            let args = object_args(args, &["id","title","x","y","tolerance"])?;
+            let (by_title, key) = selector(args, "title")?;
+            let x = draw_number(args, "x", -16384.0, 16384.0)?;
+            let y = draw_number(args, "y", -16384.0, 16384.0)?;
+            let tolerance = if args.contains_key("tolerance") { draw_number(args, "tolerance", 0.0, 32.0)? } else { 5.0 };
+            let workspace = load(store)?;
+            let note = &workspace.notes[find_note_index(&workspace, by_title, &key)?];
+            note.drawing.validate()?;
+            let object_id = crate::canvas::pick_object(&note.drawing, Point::new(x, y), tolerance);
+            Ok(json!({"id":note.id,"object":object_id.as_ref().and_then(|id| note.drawing.object(id)),
+                "object_id":object_id,"x":x,"y":y,"tolerance":tolerance}))
+        }
+        "drawing_preview" => {
+            let args = object_args(args, &["id","title"])?;
+            let (by_title, key) = selector(args, "title")?;
+            let workspace = load(store)?;
+            let note = &workspace.notes[find_note_index(&workspace, by_title, &key)?];
+            note.drawing.validate()?;
+            let png = Board::from_note(note).png_bytes().map_err(|e| format!("Drawing render failed: {e}"))?;
+            if png.len() > MAX_DRAWING_PREVIEW_BYTES {
+                return Err(invalid("Rendered preview exceeds 1 MiB; export the drawing as a PNG file instead"));
+            }
+            Ok(json!({"id":note.id,"mime_type":"image/png","width":WIDTH,"height":HEIGHT,
+                "data_base64":base64::engine::general_purpose::STANDARD.encode(&png),"bytes":png.len(),
+                "object_count":note.drawing.objects.len(),"legacy_stroke_count":note.strokes.len()}))
+        }
+        "drawing_undo" | "drawing_redo" => {
+            let args = object_args(args, &["id","title","confirm"])?;
+            require_confirmation(args, if name == "drawing_undo" { "Undoing a drawing edit" } else { "Redoing a drawing edit" })?;
+            let (by_title, key) = selector(args, "title")?;
+            let id = {
+                let workspace = load(store)?;
+                workspace.notes[find_note_index(&workspace, by_title, &key)?].id.clone()
+            };
+            let mut sessions = drawing_sessions().lock().map_err(|_| invalid("Drawing history lock unavailable"))?;
+            let session = sessions.get_mut(&drawing_session_key(store, &id))
+                .ok_or_else(|| invalid("No drawing history in this agent session"))?;
+            let expected = session.expected.as_ref().ok_or_else(|| invalid("No tracked drawing history"))?.clone();
+            let target = if name == "drawing_undo" { session.undo.last() } else { session.redo.last() }
+                .ok_or_else(|| invalid("No drawing history in that direction"))?.clone();
+            let (id, new_drawing) = mutate(store, |workspace| {
+                let index = find_note_index(workspace, false, &id)?;
+                let note = &mut workspace.notes[index];
+                if note.drawing != expected {
+                    return Err(invalid("Drawing changed outside this agent session; undo/redo refused to avoid losing edits"));
+                }
+                note.drawing.restore_snapshot(&target)?;
+                note.touch();
+                Ok((note.id.clone(), note.drawing.snapshot()))
+            })?;
+            if name == "drawing_undo" {
+                session.undo.pop();
+                session.redo.push(expected);
+                if session.redo.len() > DRAWING_HISTORY_LIMIT { session.redo.remove(0); }
+            } else {
+                session.redo.pop();
+                session.undo.push(expected);
+                if session.undo.len() > DRAWING_HISTORY_LIMIT { session.undo.remove(0); }
+            }
+            session.expected = Some(new_drawing.clone());
+            Ok(json!({"id":id,"action":name,"object_count":new_drawing.objects.len(),
+                "layer_count":new_drawing.layers.len(),"undo_available":!session.undo.is_empty(),
+                "redo_available":!session.redo.is_empty()}))
+        }
         "list_notes" => {
             let args = object_args(args, &["limit"])?;
             let limit = limit(args)?;
             let workspace = load(store)?;
-            let notes: Vec<_> = ordered_notes(&workspace.notes).into_iter().take(limit).map(note_summary).collect();
+            let notes: Vec<_> = ordered_notes(&workspace.notes, limit).into_iter().map(note_summary).collect();
             Ok(json!({"total":workspace.notes.len(),"notes":notes}))
         }
         "search_notes" => {
-            let args = object_args(args, &["query","limit"])?;
+            let args = object_args(args, &["query","limit","include_body","sqlite_index"])?;
             let query = required_string(args, "query")?;
             if query.trim().is_empty() || query.chars().count() > MAX_SEARCH_CHARS {
                 return Err(invalid("query must be 1–1000 nonblank characters"));
             }
             let query = query.to_lowercase();
             let limit = limit(args)?;
-            let workspace = load(store)?;
-            // Filter in source order, then sort only matches. A selective query
-            // should not spend time sorting thousands of unrelated notes.
-            // Stable sorting retains the original tie order used by list_notes.
-            let mut found: Vec<_> = workspace.notes.iter().filter(|note| {
-                note.title.to_lowercase().contains(&query) || note.body.to_lowercase().contains(&query)
-            }).collect();
-            sort_notes(&mut found);
-            let total = found.len();
-            let notes: Vec<_> = found.into_iter().take(limit).map(note_summary).collect();
+            let include_body = args.get("include_body")
+                .map(|_| required_bool(args, "include_body")).transpose()?.unwrap_or(false);
+            if include_body && limit > MAX_SEARCH_WITH_BODY_RESULTS {
+                return Err(invalid("include_body requires limit between 1 and 10"));
+            }
+            // Release measurements showed the existing parsed in-memory index
+            // wins on a persistent MCP connection. SQLite remains opt-in until
+            // it proves faster in the actual workload (including cold build).
+            let use_sqlite = args.get("sqlite_index")
+                .map(|_| required_bool(args, "sqlite_index")).transpose()?.unwrap_or(false);
+            let (total, notes): (usize, Vec<Value>) = if use_sqlite {
+                let found = store.search_indexed(&query).map_err(|error| error.to_string())?;
+                let total = found.len();
+                let notes = ordered_notes(&found, limit).into_iter().map(|note| {
+                    if include_body { search_note_with_body(note) } else { note_summary(note) }
+                }).collect();
+                (total, notes)
+            } else {
+                let (workspace, search_index) = store.read_cached_with_search_index()
+                    .map_err(|error| error.to_string())?;
+                // Filter in source order, then sort only matches. A selective query
+                // should not sort thousands of unrelated notes.
+                let found: Vec<_> = workspace.notes.iter().zip(search_index.iter())
+                    .filter(|(_, (title, body))| title.contains(&query) || body.contains(&query))
+                    .map(|(note, _)| note).collect();
+                let total = found.len();
+                let notes = ordered_notes(found, limit).into_iter().map(|note| {
+                    if include_body { search_note_with_body(note) } else { note_summary(note) }
+                }).collect();
+                (total, notes)
+            };
             Ok(json!({"total":total,"notes":notes}))
         }
         "read_note" => {
-            let args = object_args(args, &["id","title"])?;
+            let args = object_args(args, &["id","title","compact"])?;
             let (by_title, key) = selector(args, "title")?;
+            let compact = args.get("compact").map(|_| required_bool(args, "compact")).transpose()?.unwrap_or(false);
             let workspace = load(store)?;
             let index = find_note_index(&workspace, by_title, &key)?;
-            serde_json::to_value(&workspace.notes[index]).map_err(|e| e.to_string())
+            let note = &workspace.notes[index];
+            if compact {
+                Ok(compact_note(note))
+            } else {
+                serde_json::to_value(note).map_err(|e| e.to_string())
+            }
         }
         "create_note" => {
             let args = object_args(args, &["title","body"])?;
@@ -958,10 +1644,16 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
             })
         }
         "get_active_note" => {
-            object_args(args, &[])?;
+            let args = object_args(args, &["compact"])?;
+            let compact = args.get("compact")
+                .map(|_| required_bool(args, "compact")).transpose()?.unwrap_or(false);
             let workspace = load(store)?;
             let note = workspace.notes.iter().find(|note| note.id == workspace.active_id);
-            Ok(json!({"active_id":workspace.active_id,"note":note}))
+            if compact {
+                Ok(json!({"active_id":workspace.active_id,"note":note.map(compact_note)}))
+            } else {
+                Ok(json!({"active_id":workspace.active_id,"note":note}))
+            }
         }
         "set_active_note" => {
             let args = object_args(args, &["id","title"])?;
@@ -1033,7 +1725,7 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
                 let index = find_note_index(workspace, by_title, &key)?;
                 let deleted = workspace.notes.remove(index);
                 if workspace.active_id == deleted.id {
-                    workspace.active_id = ordered_notes(&workspace.notes).first().map(|note| note.id.clone()).unwrap_or_default();
+                    workspace.active_id = ordered_notes(&workspace.notes, 1).first().map(|note| note.id.clone()).unwrap_or_default();
                 }
                 Ok(json!({"deleted":true,"id":deleted.id,"title":deleted.title,"deleted_strokes":deleted.strokes.len()}))
             })
@@ -1077,6 +1769,28 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
             let note_id = resolve_note_id(store, args)?;
             let image = store.update_image(&note_id, image_id, None, None, Some(position)).map_err(|e| e.to_string())?;
             Ok(json!({"note_id":note_id,"image":image}))
+        }
+        "image_place" => {
+            let args = object_args(args, &["id", "title", "image_id", "unit",
+                "char_offset", "expected_body"])?;
+            if required_string(args, "unit")? != "unicode_scalar" {
+                return Err(invalid("unit must be unicode_scalar"));
+            }
+            let image_id = image_identity(args)?;
+            let offset = match args.get("char_offset") {
+                Some(Value::Null) => None,
+                Some(value) => Some(value.as_u64()
+                    .and_then(|number| usize::try_from(number).ok())
+                    .filter(|number| *number <= MAX_BODY_BYTES)
+                    .ok_or_else(|| invalid("char_offset must be a Unicode scalar index or null"))?),
+                None => return Err(invalid("char_offset is required; use null to unplace image")),
+            };
+            let expected_body = optional_string(args, "expected_body")?;
+            let note_id = resolve_note_id(store, args)?;
+            store.place_image_at_scalar(&note_id, image_id, offset, expected_body)
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"note_id":note_id,"image_id":image_id,"unit":"unicode_scalar",
+                "char_offset":offset}))
         }
         "image_caption" => {
             let args = object_args(args, &["id", "title", "image_id", "caption"])?;
@@ -1443,6 +2157,207 @@ mod tests {
     }
 
     #[test]
+    fn note_batch_commits_ordered_unicode_edits_and_preserves_note_media_drawing_and_styles() {
+        let (store, folder) = store();
+        let original = tool(&store, "create_note", json!({"title":"画 / notes","body":"Bonjour 猫"}));
+        let id = original["id"].as_str().unwrap();
+        let active = load(&store).unwrap().active_id.clone();
+        tool(&store, "add_stroke", json!({"id":id,"width":3,"points":[[7,8],[12,13]]}));
+        tool(&store, "format_text_range", json!({"id":id,"unit":"unicode_scalar","start":0,"end":2,"bold":true}));
+        let image = tool(&store, "image_insert_base64", json!({"id":id,
+            "data_base64":base64::engine::general_purpose::STANDARD.encode(tiny_png()),"user_approved":true}));
+        let image_id = image["image"]["id"].as_str().unwrap();
+        tool(&store, "image_place", json!({"id":id,"image_id":image_id,
+            "unit":"unicode_scalar","char_offset":2}));
+        let before = tool(&store, "read_note", json!({"id":id}));
+
+        let result = tool(&store, "note_batch", json!({"operations":[
+            {"op":"create","title":"🦊","body":"新しい note"},
+            {"op":"create","title":"Second","body":"Prior"},
+            {"op":"append","id":id,"text":"👩‍🚀 café","expected_body":"Bonjour 猫"},
+            {"op":"rename","id":id,"new_title":"画 / renamed"},
+            {"op":"pin","title":"画 / renamed","pinned":true},
+            {"op":"update","match_title":"Second","body":"After 日","title":"Done","expected_body":"Prior","confirm":true}
+        ]}));
+        assert_eq!(result["applied"], 6);
+        assert_eq!(result["results"].as_array().unwrap().len(), 6);
+        for (index, kind) in ["create","create","append","rename","pin","update"].iter().enumerate() {
+            assert_eq!(result["results"][index]["index"], index);
+            assert_eq!(result["results"][index]["op"], *kind);
+        }
+        assert_ne!(result["results"][0]["id"], result["results"][1]["id"]);
+        assert_ne!(result["results"][0]["id"], id);
+        let after = tool(&store, "read_note", json!({"id":id}));
+        assert_eq!(after["body"], "Bonjour 猫\n👩‍🚀 café");
+        assert_eq!(after["title"], "画 / renamed");
+        assert_eq!(after["pinned"], true);
+        for preserved in ["strokes","drawing","images","inline_media","rich_text","kind","font_size","font_choice"] {
+            assert_eq!(after[preserved], before[preserved], "Batch lost {preserved}");
+        }
+        assert_eq!(tool(&store, "read_note", json!({"title":"Done"}))["body"], "After 日");
+        assert_eq!(load(&store).unwrap().active_id, active);
+        assert_eq!(load(&store).unwrap().notes.len(), 4);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn note_batch_late_failure_ambiguous_titles_and_stale_guard_are_fully_atomic() {
+        let (store, folder) = store();
+        let first = tool(&store, "create_note", json!({"title":"Twin","body":"original 👩‍🚀"}));
+        tool(&store, "create_note", json!({"title":"Twin","body":"another"}));
+        let id = first["id"].as_str().unwrap();
+        let before = std::fs::read(store.data_path()).unwrap();
+        let snapshot = serde_json::to_value(&*load(&store).unwrap()).unwrap();
+        for operations in [
+            json!([
+                {"op":"append","id":id,"text":"valid"},
+                {"op":"create","title":"Transient"},
+                {"op":"rename","id":"missing","new_title":"Nope"}
+            ]),
+            json!([
+                {"op":"create","title":"Transient"},
+                {"op":"append","title":"Twin","text":"ambiguous"}
+            ]),
+            json!([
+                {"op":"pin","id":id,"pinned":true},
+                {"op":"update","id":id,"body":"Changed","expected_body":"stale","confirm":true}
+            ]),
+        ] {
+            let err = execute_tool(&store, "note_batch", &json!({"operations":operations})).unwrap_err();
+            assert!(err.contains("Operation"), "Unidentified batch error: {err}");
+            assert_eq!(std::fs::read(store.data_path()).unwrap(), before, "Failed batch wrote disk");
+            assert_eq!(serde_json::to_value(&*load(&store).unwrap()).unwrap(), snapshot);
+        }
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn note_batch_rejects_unknown_destructive_and_malformed_operations_without_writes() {
+        let (store, folder) = store();
+        let original = tool(&store, "create_note", json!({"title":"Protected","body":"Keep"}));
+        let id = original["id"].as_str().unwrap();
+        let before = std::fs::read(store.data_path()).unwrap();
+        let invalid = vec![
+            json!({"operations":[]}),
+            json!({"operations":vec![json!({"op":"create"});33]}),
+            json!({"operations":[{"op":"delete","id":id,"confirm":true}]}),
+            json!({"operations":[{"op":"clear","id":id,"confirm":true}]}),
+            json!({"operations":[{"op":"append","id":id,"text":null}]}),
+            json!({"operations":[{"op":"append","id":id,"text":""}]}),
+            json!({"operations":[{"op":"pin","id":id,"pinned":"true"}]}),
+            json!({"operations":[{"op":"rename","id":id,"new_title":"   "}]}),
+            json!({"operations":[{"op":"update","id":id}]}),
+            json!({"operations":[{"op":"update","id":id,"body":"Not authorized"}]}),
+            json!({"operations":[{"op":"update","id":id,"body":"Not authorized","confirm":false}]}),
+            json!({"operations":[{"op":"update","id":id,"title":"Safe rename","confirm":true}]}),
+            json!({"operations":[{"op":"create","title":"x","id":"forbidden"}]}),
+            json!({"operations":[{"op":"create","title":"Valid"},{"op":"append","id":id,"text":"x","unknown":1}]}),
+            json!({"operations":[{"op":"update","id":id,"title":"A","body":1}]}),
+            json!({"operations":[{"op":"pin","id":id,"title":"Protected","pinned":true}]}),
+            json!({"operations":[{"op":"append","title":"Protected","text":"x","expected_body":5}]}),
+            json!({"operations":[{"op":"create","body":"x".repeat(MAX_BODY_BYTES+1)}]}),
+            json!({"operations":[{"op":"create"}],"unknown":true}),
+        ];
+        for request in invalid {
+            assert!(execute_tool(&store, "note_batch", &request).is_err(), "Accepted {request}");
+            assert_eq!(std::fs::read(store.data_path()).unwrap(), before, "Invalid batch wrote workspace");
+        }
+        let schema = tool_definitions().iter().find(|tool| tool["name"] == "note_batch").unwrap();
+        assert_eq!(schema["inputSchema"]["properties"]["operations"]["maxItems"], 32);
+        assert_eq!(schema["inputSchema"]["properties"]["operations"]["items"]["oneOf"].as_array().unwrap().len(), 5);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn editable_drawing_mcp_preserves_legacy_data_and_renders_vectors() {
+        let (store, folder) = store();
+        let note = tool(&store, "create_note", json!({"title":"Vector","body":"Keep 👩‍🚀 text"}));
+        let id = note["id"].as_str().unwrap();
+        tool(&store, "add_stroke", json!({"id":id,"width":4,"points":[[12,12],[24,24]]}));
+        let caps = tool(&store, "get_capabilities", json!({}));
+        assert_eq!(caps["mcp"]["batch_drawing_commands"], false);
+        assert!(caps["model"]["shapes"].as_array().unwrap().contains(&json!("cubic_bezier")));
+        assert!(execute_tool(&store,"drawing_create_shape",&json!({"id":id,
+            "shape":{"type":"rectangle","width":-4,"height":10}})).is_err());
+        assert!(execute_tool(&store,"drawing_create_shape",&json!({"id":id,
+            "shape":{"type":"rectangle","width":10,"height":10,"unexpected":true}})).is_err());
+        let created = tool(&store, "drawing_create_shape", json!({"id":id,
+            "shape":{"type":"rounded_rectangle","width":100,"height":80,"radius":12},
+            "style":{"stroke":[11,21,31,255],"stroke_width":2,
+                "fill":{"type":"solid","color":[212,30,66,255]},"opacity":0.9},
+            "transform":{"translation":{"x":100,"y":110}}}));
+        let object_id = created["object"]["id"].as_str().unwrap();
+        let saved = tool(&store, "read_note", json!({"id":id}));
+        assert_eq!(saved["body"], "Keep 👩‍🚀 text");
+        assert_eq!(saved["strokes"].as_array().unwrap().len(), 1);
+        assert_eq!(saved["drawing"]["objects"][0]["id"], object_id);
+        let bad_style = json!({"id":id,"object_id":object_id,"style":{"opacity":5}});
+        assert!(execute_tool(&store,"drawing_edit_shape",&bad_style).is_err());
+        assert_eq!(tool(&store, "read_note", json!({"id":id})), saved);
+        tool(&store, "drawing_edit_shape", json!({"id":id,"object_id":object_id,
+            "shape":{"type":"ellipse","radius_x":55,"radius_y":40},"visible":true}));
+        let preview = tool(&store, "drawing_preview", json!({"id":id}));
+        assert_eq!(preview["mime_type"], "image/png");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(preview["data_base64"].as_str().unwrap()).unwrap();
+        assert!(raw.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let export = folder.join("vectors.png");
+        tool(&store,"export_note",json!({"id":id,"format":"png","path":export.to_str().unwrap()}));
+        assert_eq!(std::fs::read(export).unwrap(),raw);
+        assert_eq!(tool(&store,"drawing_list",json!({"id":id}))["object_count"],1);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn drawing_layers_history_and_external_change_guard_are_transactional() {
+        let (store, folder) = store();
+        let id = tool(&store,"create_note",json!({"title":"History"}))["id"].as_str().unwrap().to_string();
+        let layer = tool(&store,"drawing_create_layer",json!({"id":id,"name":"Front"}));
+        let layer_id = layer["layer_id"].as_str().unwrap();
+        let a = tool(&store,"drawing_create_shape",json!({"id":id,"layer_id":layer_id,
+            "shape":{"type":"rectangle","width":50,"height":50}}));
+        let object_id = a["object"]["id"].as_str().unwrap();
+        let b = tool(&store,"drawing_create_shape",json!({"id":id,"layer_id":layer_id,
+            "shape":{"type":"line","to":{"x":70,"y":80}}}));
+        let second_id = b["object"]["id"].as_str().unwrap();
+        let group = tool(&store,"drawing_group_objects",json!({"id":id,"object_ids":[object_id,second_id]}));
+        assert!(group["group_id"].is_string());
+        tool(&store,"drawing_transform_group",json!({"id":id,"group_id":group["group_id"],
+            "operation":"move","dx":3,"dy":5}));
+        assert!(execute_tool(&store,"drawing_transform_group",&json!({"id":id,"group_id":group["group_id"],
+            "operation":"resize","sx":0,"sy":1})).is_err());
+        tool(&store,"drawing_ungroup_objects",json!({"id":id,"group_id":group["group_id"]}));
+        tool(&store,"drawing_edit_layer",json!({"id":id,"layer_id":layer_id,"locked":true}));
+        let locked_state = tool(&store,"drawing_list",json!({"id":id}));
+        assert!(execute_tool(&store,"drawing_transform_object",&json!({"id":id,
+            "object_id":object_id,"operation":"move","dx":20,"dy":20})).is_err());
+        assert_eq!(tool(&store,"drawing_list",json!({"id":id})),locked_state);
+        tool(&store,"drawing_edit_layer",json!({"id":id,"layer_id":layer_id,"locked":false}));
+        tool(&store,"drawing_transform_object",json!({"id":id,"object_id":object_id,
+            "operation":"move","dx":30,"dy":40}));
+        assert!(execute_tool(&store,"drawing_undo",&json!({"id":id})).is_err());
+        tool(&store,"drawing_undo",json!({"id":id,"confirm":true}));
+        let undone = tool(&store,"drawing_list",json!({"id":id}));
+        assert_eq!(undone["drawing"]["objects"][0]["transform"]["translation"]["x"],3.0);
+        tool(&store,"drawing_redo",json!({"id":id,"confirm":true}));
+        let redone = tool(&store,"drawing_list",json!({"id":id}));
+        assert_eq!(redone["drawing"]["objects"][0]["transform"]["translation"]["x"],33.0);
+        assert!(execute_tool(&store,"drawing_delete_object",&json!({"id":id,"object_id":object_id})).is_err());
+        assert!(execute_tool(&store,"drawing_delete_layer",&json!({"id":id,"layer_id":layer_id,"confirm":true})).is_err());
+        let other = Store::in_folder(folder.clone()).unwrap();
+        other.mutate(|workspace| {
+            let note = workspace.notes.iter_mut().find(|note| note.id == id).unwrap();
+            note.drawing.add_object(DrawShape::Ellipse { radius_x: 5.0, radius_y: 5.0 }, None)
+                .map_err(io::Error::other)?;
+            note.touch();
+            Ok(())
+        }).unwrap();
+        assert!(execute_tool(&store,"drawing_undo",&json!({"id":id,"confirm":true})).is_err());
+        assert_eq!(tool(&store,"drawing_list",json!({"id":id}))["object_count"],3);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
     fn create_search_read_append_update_and_delete_preserve_strokes() {
         let (store, folder) = store();
         store.mutate(|workspace| {
@@ -1454,7 +2369,7 @@ mod tests {
             workspace.notes.push(legacy);
             Ok(())
         }).unwrap();
-        let active = load(&store).unwrap().active_id;
+        let active = load(&store).unwrap().active_id.clone();
         let created = tool(&store, "create_note", json!({"title":"My diary","body":"rain today"}));
         let id = created["id"].as_str().unwrap();
         assert_eq!(load(&store).unwrap().active_id, active);
@@ -1507,9 +2422,94 @@ mod tests {
         let responses: Vec<Value> = String::from_utf8(output).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(responses.len(), 4);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 38);
+        let names: Vec<_> = responses[1]["result"]["tools"].as_array().unwrap().iter()
+            .map(|item| item["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), 58);
+        assert!(names.contains(&"note_batch"));
+        assert!(names.contains(&"get_capabilities"));
+        assert!(names.contains(&"drawing_preview"));
+        assert!(names.contains(&"paste_rich_fragment"));
+        assert!(names.contains(&"image_place"));
         assert_eq!(responses[2]["result"]["structuredContent"]["title"], "From MCP");
         assert_eq!(responses[3]["result"]["isError"], true);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn compact_read_returns_text_without_large_drawing_payload() {
+        let (store, folder) = store();
+        let created = tool(&store, "create_note", json!({"title":"Brief","body":"Hello 猫"}));
+        let id = created["id"].as_str().unwrap();
+        let full = tool(&store, "read_note", json!({"id":id}));
+        let compact = tool(&store, "read_note", json!({"id":id,"compact":true}));
+        assert_eq!(compact["body"], full["body"]);
+        assert_eq!(compact["title"], full["title"]);
+        assert_eq!(compact["image_count"], 0);
+        assert!(compact.get("strokes").is_none());
+        assert!(compact.get("images").is_none());
+        assert!(compact.get("rich_text").is_none());
+        assert!(execute_tool(&store, "read_note", &json!({"id":id,"compact":"yes"})).is_err());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn opt_in_sqlite_search_matches_default_and_refreshes_after_external_write() {
+        let (store, folder) = store();
+        let created = tool(&store, "create_note", json!({"title":"Search title","body":"needle 🐈"}));
+        let id = created["id"].as_str().unwrap();
+        let query = json!({"query":"needle","limit":5,"include_body":true});
+        let default = tool(&store, "search_notes", query.clone());
+        let mut indexed_args = query.clone();
+        indexed_args["sqlite_index"] = json!(true);
+        let indexed = tool(&store, "search_notes", indexed_args.clone());
+        assert_eq!(indexed, default);
+        let other = Store::in_folder(folder.clone()).unwrap();
+        other.mutate(|workspace| {
+            let note = workspace.notes.iter_mut().find(|note| note.id == id).unwrap();
+            note.body = "fresh 🦊".into();
+            note.touch();
+            Ok(())
+        }).unwrap();
+        assert_eq!(tool(&store, "search_notes", indexed_args.clone())["total"], 0);
+        indexed_args["query"] = json!("fresh");
+        let fresh = tool(&store, "search_notes", indexed_args);
+        assert_eq!(fresh["total"], 1);
+        assert_eq!(fresh["notes"][0]["body"], "fresh 🦊");
+        assert!(execute_tool(&store, "search_notes",
+            &json!({"query":"fresh","sqlite_index":"yes"})).is_err());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn search_can_include_bounded_text_and_active_note_can_be_compact() {
+        let (store, folder) = store();
+        let body = format!("start 猫\n{}MATCH at the end", "é".repeat(MAX_SEARCH_BODY_CHARS));
+        let created = tool(&store, "create_note", json!({"title":"Project", "body":body}));
+        let id = created["id"].as_str().unwrap();
+        let default_search = tool(&store, "search_notes", json!({"query":"MATCH", "limit":1}));
+        assert_eq!(default_search["total"], 1);
+        assert!(default_search["notes"][0].get("body").is_none());
+
+        let combined = tool(&store, "search_notes", json!({"query":"MATCH", "limit":1,"include_body":true}));
+        assert_eq!(combined["notes"][0]["id"], id);
+        assert_eq!(combined["notes"][0]["body_truncated"], true);
+        let prefix = combined["notes"][0]["body"].as_str().unwrap();
+        assert_eq!(prefix.chars().count(), MAX_SEARCH_BODY_CHARS);
+        assert!(prefix.starts_with("start 猫"));
+        assert!(execute_tool(&store, "search_notes", &json!({"query":"MATCH","limit":11,"include_body":true})).is_err());
+        assert!(execute_tool(&store, "search_notes", &json!({"query":"MATCH","limit":1,"include_body":1})).is_err());
+
+        let short = tool(&store, "create_note", json!({"title":"Tiny", "body":"hello 🦊"}));
+        let short_id = short["id"].as_str().unwrap();
+        let result = tool(&store, "search_notes", json!({"query":"hello", "limit":1,"include_body":true}));
+        assert_eq!(result["notes"][0]["body"], "hello 🦊");
+        assert_eq!(result["notes"][0]["body_truncated"], false);
+        tool(&store, "set_active_note", json!({"id":short_id}));
+        let active = tool(&store, "get_active_note", json!({"compact":true}));
+        assert_eq!(active["note"]["body"], "hello 🦊");
+        assert!(active["note"].get("strokes").is_none());
+        assert!(tool(&store, "get_active_note", json!({}))["note"].get("strokes").is_some());
+        assert!(execute_tool(&store, "get_active_note", &json!({"compact":1})).is_err());
         std::fs::remove_dir_all(folder).unwrap();
     }
 
@@ -1534,15 +2534,17 @@ mod tests {
         let (store, folder) = store();
         let note = tool(&store, "create_note", json!({"title":"Shared note","body":"before"}));
         let id = note["id"].as_str().unwrap();
+        // Prime the persistent lowercased search index before an external save.
+        assert_eq!(tool(&store, "search_notes", json!({"query":"BEFORE"}))["total"], 1);
         // Models another process, such as the GUI, saving after MCP starts.
         let concurrent_gui = Store::in_folder(folder.clone()).unwrap();
         concurrent_gui.mutate(|workspace| {
             let note = workspace.notes.iter_mut().find(|note| note.id == id).unwrap();
-            note.body = "after GUI save".into();
+            note.body = "after GUI save 🐈".into();
             note.touch();
             Ok(())
         }).unwrap();
-        assert_eq!(tool(&store, "read_note", json!({"id":id}))["body"], "after GUI save");
+        assert_eq!(tool(&store, "read_note", json!({"id":id}))["body"], "after GUI save 🐈");
         assert_eq!(tool(&store, "search_notes", json!({"query":"after GUI"}))["total"], 1);
         assert_eq!(tool(&store, "search_notes", json!({"query":"before"}))["total"], 0);
         std::fs::remove_dir_all(folder).unwrap();
@@ -1641,7 +2643,7 @@ mod tests {
             assert!(execute_tool(&store, name, &args).is_err(), "Should reject {name} {args}");
         }
         let after = load(&store).unwrap();
-        assert_eq!(serde_json::to_value(before).unwrap(), serde_json::to_value(after).unwrap());
+        assert_eq!(serde_json::to_value(&*before).unwrap(), serde_json::to_value(&*after).unwrap());
         std::fs::remove_dir_all(folder).unwrap();
     }
 
@@ -1767,6 +2769,47 @@ mod tests {
             encoder.write_header().unwrap().write_image_data(&[24, 60, 180, 255]).unwrap();
         }
         png
+    }
+
+    #[test]
+    fn mcp_image_place_is_additive_scalar_safe_and_rejects_stale_editor_carets() {
+        let (store, folder) = store();
+        let note = tool(&store, "create_note", json!({"title":"Inline","body":"A🦊猫B"}));
+        let id = note["id"].as_str().unwrap();
+        let image = store.insert_image_bytes(id, &tiny_png()).unwrap();
+        let original = tool(&store, "image_list", json!({"id":id}));
+        assert_eq!(original["images"][0]["position"], 0);
+        assert!(original["images"][0].get("char_offset").is_none());
+        assert!(execute_tool(&store, "image_place", &json!({
+            "id":id,"image_id":image.id,"char_offset":2
+        })).is_err(), "explicit scalar unit required");
+        assert!(execute_tool(&store, "image_place", &json!({
+            "id":id,"image_id":image.id,"unit":"unicode_scalar",
+            "char_offset":2,"expected_body":"stale"
+        })).is_err());
+        let placed = tool(&store, "image_place", json!({
+            "id":id,"image_id":image.id,"unit":"unicode_scalar",
+            "char_offset":2,"expected_body":"A🦊猫B"
+        }));
+        assert_eq!(placed["char_offset"], 2);
+        assert_eq!(tool(&store, "read_note", json!({"id":id}))["body"], "A🦊猫B");
+        assert_eq!(store.load().unwrap().notes.iter().find(|note| note.id == id)
+            .unwrap().image_anchor(&image.id).unwrap(), Some(2));
+
+        tool(&store, "replace_text_range", json!({
+            "id":id,"unit":"unicode_scalar","start":0,"end":0,"text":"💚"
+        }));
+        assert_eq!(store.load().unwrap().notes.iter().find(|note| note.id == id)
+            .unwrap().image_anchor(&image.id).unwrap(), Some(3));
+        let cleared = tool(&store, "image_place", json!({
+            "id":id,"image_id":image.id,"unit":"unicode_scalar","char_offset":null
+        }));
+        assert!(cleared["char_offset"].is_null());
+        let saved = tool(&store, "read_note", json!({"id":id}));
+        assert_eq!(saved["body"], "💚A🦊猫B");
+        assert!(saved.get("inline_media").is_none(), "legacy shape restored on unplace");
+        assert_eq!(saved["images"][0]["position"], 0);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

@@ -28,13 +28,20 @@ impl TextRevision {
     pub fn apply(&self, note: &mut Note) -> Result<(), String> {
         if self.note_id != note.id { return Err("Undo history belongs to another note".into()); }
         let mut next = note.clone();
+        let original_body = next.body.clone();
         next.body = self.body.clone();
         next.rich_text = self.rich_text.clone();
         next.font_size = self.font_size;
         next.font_choice = self.font_choice.clone();
+        // History owns text/formatting, but picture placement is durable and
+        // independently editable. Rebase live anchors across the restored text;
+        // restoring an old full-note snapshot would resurrect deleted pictures.
+        next.rebase_image_placements_for_text_change(&original_body);
         next.validate_rich_text()?;
+        next.validate_inline_media()?;
         note.body = next.body;
         note.rich_text = next.rich_text;
+        note.inline_media = next.inline_media;
         note.font_size = next.font_size;
         note.font_choice = next.font_choice;
         note.touch();

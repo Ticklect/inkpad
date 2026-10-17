@@ -198,7 +198,7 @@ fn stacked_editor_toolbar_insets_should_align() {
         ("text-draw-tabs", "label: \"Text\""),
         ("font-toolbar", "label: \"FONT\""),
         ("rich-toolbar", "label: \"Bold\""),
-        ("pictures-toolbar", "label: \"PICTURES\""),
+        ("pictures-toolbar", "label: \"IMAGES\""),
     ];
     let positions: Vec<(&str, f64)> = labels.into_iter()
         .map(|(label, marker)| (label, field_before_marker(marker, "padding-left:")))
@@ -243,7 +243,7 @@ fn primary_palette_labels_pass_normal_text_contrast() {
 
 #[test]
 fn fixed_draw_toolbar_labels_must_be_readable_in_dark_theme() {
-    for label in ["PICTURES", "COLOURS"] {
+    for label in ["IMAGES", "COLOURS"] {
         let fg = dark_ink_for_label(label);
         let ratio = contrast(&fg, "#202732");
         assert!(ratio >= 4.5,

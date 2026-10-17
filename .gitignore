@@ -16,3 +16,9 @@ ui-settings.json.*
 .vscode/
 .DS_Store
 Thumbs.db
+# Generated Python bytecode and disposable local SQLite indexes.
+__pycache__/
+*.pyc
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

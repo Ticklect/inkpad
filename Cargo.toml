@@ -16,6 +16,8 @@ png = "0.17"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 base64 = "0.22"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+blake3 = "1.8.2"
 
 [build-dependencies]
 slint-build = "=1.18.1"

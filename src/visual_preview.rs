@@ -17,6 +17,17 @@ pub struct VisualSpan {
     pub foreground: Option<[u8; 3]>,
 }
 
+impl VisualSpan {
+    /// Slint Text's preferred width can exclude trailing ordinary spaces.
+    /// Each word is a separate Flexbox child, so that makes words appear
+    /// joined together even though the saved text still contains spaces.
+    /// A non-breaking space has a measured glyph width and remains visible.
+    /// Keep `text` untouched; this conversion is only for presentation.
+    pub fn layout_text(&self) -> String {
+        self.text.replace(' ', "\u{00a0}")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisualParagraph {
     pub spans: Vec<VisualSpan>,
@@ -55,6 +66,9 @@ fn push_word(target: &mut VisualParagraph, text: &mut String,
 /// None indicates a case best rendered by StyledText's native script shaping.
 pub fn build(note: &Note) -> Option<Vec<VisualParagraph>> {
     if note.body.len() > MAX_PREVIEW_BYTES || note.validate_rich_text().is_err() { return None; }
+    // A single native text widget preserves ordinary unformatted whitespace,
+    // paragraph flow and selection-like shaping more accurately than Flexbox.
+    if note.rich_text.is_empty() || note.body.contains('\t') { return None; }
     // Flexbox lays out independent words. Directional embedding of Arabic or
     // Hebrew across such items changes bidi ordering, so do not misrender it.
     if note.body.chars().any(|ch| ('\u{0590}'..='\u{08FF}').contains(&ch)
@@ -137,5 +151,36 @@ mod tests {
             bold: Some(true), ..Default::default()
         }).unwrap();
         assert!(build(&combining).is_none());
+    }
+
+    #[test]
+    fn layout_spaces_remain_measurable_without_changing_the_saved_text() {
+        let mut note = Note::create("note");
+        note.body = "Feature idea: Show recommended YouTube channels that can be added to the channels bar, based on the user's previous channel searches.\nUI improvement: Remove the strip at the top of the YouTube Downloader Desktop Beta window (see attached screenshot).".into();
+        note.format_text_range(0, 12, TextStylePatch {
+            bold: Some(true), ..Default::default()
+        }).unwrap();
+
+        let paragraphs = build(&note).unwrap();
+        assert_eq!(paragraphs.len(), 2);
+        for (rendered, source) in paragraphs.iter().zip(note.body.split('\n')) {
+            let raw: String = rendered.spans.iter().map(|span| span.text.as_str()).collect();
+            assert_eq!(raw, source, "the model must never alter the note");
+            let laid_out: String = rendered.spans.iter().map(VisualSpan::layout_text).collect();
+            assert_eq!(laid_out.replace('\u{00a0}', " "), source);
+            assert!(!laid_out.contains(' '), "regular spaces can collapse in the Flexbox");
+            assert!(laid_out.contains('\u{00a0}'), "word gaps need measurable width");
+        }
+    }
+
+    #[test]
+    fn plain_text_and_tabs_use_the_lossless_native_renderer() {
+        let mut note = Note::create("note");
+        note.body = "A  B\n  C".into();
+        assert!(build(&note).is_none());
+        note.format_text_range(0, 1, TextStylePatch { bold: Some(true), ..Default::default() }).unwrap();
+        assert!(build(&note).is_some());
+        note.body.push('\t');
+        assert!(build(&note).is_none());
     }
 }

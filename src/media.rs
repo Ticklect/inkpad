@@ -5,7 +5,7 @@
 //! filenames are opaque generated IDs, never user-provided paths.
 
 use crate::canvas::Board;
-use crate::store::{MediaBlock, Note, Store, TextStyle, Workspace};
+use crate::store::{MediaBlock, Note, NoteContentBlock, Store, TextStyle, Workspace};
 use base64::Engine as _;
 use image::codecs::png::PngEncoder;
 use image::{GenericImageView, ImageEncoder, ImageFormat, ImageReader};
@@ -211,6 +211,28 @@ impl Store {
         Ok(items)
     }
 
+    /// Move an existing picture to a Unicode-scalar boundary in the original
+    /// note text. None restores the legacy after-text gallery placement.
+    /// expected_body prevents applying a stale caret to concurrently edited
+    /// text; the entire change occurs under the workspace lock.
+    pub fn place_image_at_scalar(
+        &self, note_id: &str, image_id: &str, char_offset: Option<usize>,
+        expected_body: Option<&str>,
+    ) -> io::Result<Option<usize>> {
+        self.mutate(|workspace| {
+            let note = note_mut(workspace, note_id)?;
+            if expected_body.is_some_and(|expected| expected != note.body) {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                    "Note text changed; refresh the editor before moving this picture"));
+            }
+            if !note.images.iter().any(|image| image.id == image_id) {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "Image not found"));
+            }
+            note.set_image_anchor(image_id, char_offset).map_err(bad)?;
+            Ok(char_offset)
+        })
+    }
+
     pub fn update_image(&self, note_id: &str, image_id: &str, caption: Option<&str>,
         width_percent: Option<u8>, position: Option<usize>) -> io::Result<MediaBlock> {
         if let Some(width) = width_percent {
@@ -242,6 +264,7 @@ impl Store {
             if old_len == note.images.len() {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "Image not found"));
             }
+            note.inline_media.retain(|placement| placement.image_id != image_id);
             normalize_positions(&mut note.images);
             note.touch();
             Ok(())
@@ -261,6 +284,14 @@ impl Store {
     }
 
     pub(crate) fn prune_unused_media_locked(&self, workspace: &Workspace) -> io::Result<usize> {
+        // A text-only notebook has no media directory. Return before parsing
+        // the previous full workspace just to discover there is nothing to
+        // prune; this runs after every note mutation, including text edits.
+        let root = self.data_path().with_file_name("media");
+        if !root.exists() { return Ok(0); }
+        if fs::symlink_metadata(&root)?.file_type().is_symlink() {
+            return Err(bad("Unsafe media directory"));
+        }
         let backup_file = self.data_path().with_extension("json.bak");
         let backup = match fs::read(backup_file) {
             Ok(bytes) => match serde_json::from_slice::<Workspace>(&bytes) {
@@ -278,11 +309,6 @@ impl Store {
             for note in &previous.notes {
                 for item in &note.images { referenced.insert(item.filename.clone()); }
             }
-        }
-        let root = self.data_path().with_file_name("media");
-        if !root.exists() { return Ok(0); }
-        if fs::symlink_metadata(&root)?.file_type().is_symlink() {
-            return Err(bad("Unsafe media directory"));
         }
         let previews = root.join("previews");
         let mut removed = 0;
@@ -325,19 +351,32 @@ impl Store {
         html.push_str(&format!(
             "<div class=\"body\" style=\"font-family:{base_family};font-size:{base_size}px\">"
         ));
-        html.push_str(&render_formatted_body(note)?);
-        html.push_str("</div>");
-        let mut images = note.images.clone();
-        images.sort_by_key(|item| item.position);
-        for image in &images {
-            let png = fs::read(self.media_path(image)?)?;
-            html.push_str(&format!("<figure><img style=\"width:{}%;height:auto\" alt=\"{}\" src=\"data:image/png;base64,{}\">",
-                image.width_percent.clamp(10, 100), escape_html(&image.caption),
-                base64::engine::general_purpose::STANDARD.encode(png)));
-            if !image.caption.is_empty() {
-                html.push_str("<figcaption>"); html.push_str(&escape_html(&image.caption)); html.push_str("</figcaption>");
+        if note.inline_media.is_empty() {
+            // Keep the legacy export shape byte-for-byte when no anchors were
+            // supplied. Old workspaces still export their gallery after text.
+            html.push_str(&render_formatted_body(note)?);
+        } else {
+            let blocks = note.content_blocks().map_err(mime_error)?;
+            // Index the scalar text once; large styled documents otherwise
+            // repeatedly scan the same UTF-8 prefix for each inline figure.
+            let characters = note.body.chars().collect::<Vec<_>>();
+            for block in blocks {
+                match block {
+                    NoteContentBlock::Text { start, end } =>
+                        html.push_str(&render_formatted_body_slice(note, &characters, start, end)?),
+                    NoteContentBlock::Image { image_id } => {
+                        let image = note.images.iter().find(|item| item.id == image_id)
+                            .ok_or_else(|| mime_error("Inline image placement references missing picture"))?;
+                        write_html_figure(&mut html, self, image)?;
+                    }
+                }
             }
-            html.push_str("</figure>");
+        }
+        html.push_str("</div>");
+        if note.inline_media.is_empty() {
+            let mut images = note.images.clone();
+            images.sort_by_key(|item| item.position);
+            for image in &images { write_html_figure(&mut html, self, image)?; }
         }
         if !note.strokes.is_empty() {
             let png = Board::new(&note.strokes).png_bytes()?;
@@ -350,6 +389,20 @@ impl Store {
         output.write_all(html.as_bytes())?;
         output.sync_all()
     }
+}
+
+fn write_html_figure(html: &mut String, store: &Store, image: &MediaBlock) -> io::Result<()> {
+    let png = fs::read(store.media_path(image)?)?;
+    html.push_str(&format!("<figure><img style=\"width:{}%;height:auto\" alt=\"{}\" src=\"data:image/png;base64,{}\">",
+        image.width_percent.clamp(10, 100), escape_html(&image.caption),
+        base64::engine::general_purpose::STANDARD.encode(png)));
+    if !image.caption.is_empty() {
+        html.push_str("<figcaption>");
+        html.push_str(&escape_html(&image.caption));
+        html.push_str("</figcaption>");
+    }
+    html.push_str("</figure>");
+    Ok(())
 }
 
 fn escape_html(value: &str) -> String {
@@ -425,10 +478,94 @@ fn render_formatted_body(note: &Note) -> io::Result<String> {
     Ok(html)
 }
 
+/// Render a scalar text slice while preserving styles that cross a picture.
+/// A rich run straddling an image is safely reopened after the figure without
+/// shifting any stored formatting offsets.
+fn render_formatted_body_slice(note: &Note, characters: &[char],
+    start: usize, end: usize) -> io::Result<String> {
+    note.validate_rich_text().map_err(mime_error)?;
+    if start > end || end > characters.len() {
+        return Err(mime_error("Invalid inline text slice"));
+    }
+    fn append_slice(out: &mut String, characters: &[char], start: usize, end: usize) {
+        for ch in &characters[start..end] { escaped_char(out, *ch); }
+    }
+    let mut html = String::new();
+    let mut cursor = start;
+    for run in &note.rich_text {
+        if run.end <= start { continue; }
+        if run.start >= end { break; }
+        let lo = run.start.max(start);
+        let hi = run.end.min(end);
+        if cursor < lo { append_slice(&mut html, characters, cursor, lo); }
+        html.push_str("<span style=\"");
+        html.push_str(&safe_style_css(&run.style)?);
+        html.push_str("\">");
+        append_slice(&mut html, characters, lo, hi);
+        html.push_str("</span>");
+        cursor = hi;
+    }
+    if cursor < end { append_slice(&mut html, characters, cursor, end); }
+    Ok(html)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{Stroke, TextStylePatch};
+
+    #[test]
+    fn inline_html_places_pictures_between_escaped_rich_text_and_preserves_legacy_order() {
+        let folder = std::env::temp_dir().join(format!("inkpad-inline-html-{}", fresh_id()));
+        let store = Store::in_folder(folder.clone()).unwrap();
+        let note_id = store.load().unwrap().notes[0].id.clone();
+        store.mutate(|workspace| {
+            let note = &mut workspace.notes[0];
+            note.set_body_preserving_format("A猫🦊B <script> & end".into())
+                .map_err(mime_error)?;
+            note.format_text_range(0, 4, TextStylePatch {
+                bold:Some(true), ..Default::default()
+            }).map_err(mime_error)?;
+            Ok(())
+        }).unwrap();
+        let mut source = Vec::new();
+        PngEncoder::new(&mut source).write_image(&[100, 90, 20, 255], 1, 1,
+            image::ExtendedColorType::Rgba8).unwrap();
+        let first = store.insert_image_bytes(&note_id, &source).unwrap();
+        let second = store.insert_image_bytes(&note_id, &source).unwrap();
+        let text = store.load().unwrap().notes[0].body.clone();
+        assert!(store.place_image_at_scalar(&note_id, &first.id, Some(2),
+            Some("stale text")).is_err());
+        assert_eq!(store.load().unwrap().notes[0].image_anchor(&first.id).unwrap(), None);
+        assert!(store.place_image_at_scalar(&note_id, &first.id, Some(100),
+            Some(&text)).is_err());
+        store.place_image_at_scalar(&note_id, &first.id, Some(2), Some(&text)).unwrap();
+        let before = store.load().unwrap();
+        let output = folder.join("inline.html");
+        store.export_note_html(&note_id, &output).unwrap();
+        let html = fs::read_to_string(&output).unwrap();
+        let rich_before = "<span style=\"font-weight:700;\">A猫</span>";
+        let rich_after = "<span style=\"font-weight:700;\">🦊B</span>";
+        let before_pos = html.find(rich_before).unwrap();
+        let image_pos = html.find("src=\"data:image/png;base64,").unwrap();
+        let after_pos = html.find(rich_after).unwrap();
+        let second_pos = html.rfind("src=\"data:image/png;base64,").unwrap();
+        assert!(before_pos < image_pos && image_pos < after_pos && after_pos < second_pos);
+        assert!(html.contains("&lt;script&gt; &amp; end"));
+        assert_eq!(html.matches("src=\"data:image/png;base64,").count(), 2);
+        assert_eq!(store.load().unwrap().notes[0], before.notes[0],
+            "export must not mutate text, images or anchors");
+
+        store.delete_image(&note_id, &first.id).unwrap();
+        assert!(store.load().unwrap().notes[0].inline_media.is_empty());
+        let legacy_output = folder.join("legacy.html");
+        store.export_note_html(&note_id, &legacy_output).unwrap();
+        let legacy_html = fs::read_to_string(&legacy_output).unwrap();
+        assert!(legacy_html.find("end</div>").unwrap() <
+            legacy_html.find("src=\"data:image/png;base64,").unwrap());
+        assert_eq!(store.list_media(&note_id).unwrap()[0].id, second.id);
+        fs::remove_dir_all(folder).unwrap();
+    }
 
     #[test]
     fn html_export_preserves_unicode_rich_text_images_drawing_and_safe_css() {
