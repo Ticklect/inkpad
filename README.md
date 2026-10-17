@@ -33,6 +33,8 @@ Inkpad exposes **58 MCP tools**. Destructive changes and access to local image f
 2. Extract it and run `Inkpad.exe`. Windows may show a SmartScreen warning for an unsigned Beta executable.
 3. To connect an AI agent, add `inkpad-agent.exe` as an **MCP stdio server** with argument `mcp`.
 
+If Windows reports a missing `VCRUNTIME140.dll`, install the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
 For example, a client that accepts an MCP command can launch:
 
 ```powershell
