@@ -10,21 +10,28 @@ MCP server; no Inkpad window, browser or clipboard is required.
    objects and any artwork that must be preserved.
 2. Plan the composition as a small set of regions: background, distant objects,
    subject, foreground and highlights. Give each region a restrained palette.
-3. Create any named layers using `drawing_create_layer`. Layers appear in their
-   stacking order. Keep shadow/highlight objects near the subject they belong to.
-4. Use **`drawing_create_batch`** to add up to 64 vector objects per request.
-   Prefer one thoughtful batch over dozens of `drawing_create_shape` calls.
-   Supply `expected_object_count` when editing a note that might also be open
-   in the desktop, so a stale plan is rejected instead of blindly appended.
+3. **Prefer `drawing_create_scene`** to create up to 16 named layers and 512
+   editable objects together in a single validated commit. Refer to each new
+   layer by zero-based `layer_index` in the corresponding object. Keep shadows
+   and highlights close to the subjects they belong to. For smaller additions,
+   use `drawing_create_batch` (1–64 shapes); older servers may require this
+   fallback. Supply `expected_object_count` when another editor might change
+   the note before the save, so a stale composition is rejected.
+4. Build a coherent scene with large silhouettes before adding fine feathers,
+   reeds, water glints and other repetitive objects. Minimize unnecessary
+   `drawing_create_shape` calls; do not optimize for object count alone.
 5. Call `drawing_preview` **after each meaningful scene-level batch**, not after
    every single shape. Inspect the returned MCP `image/png` and correct the
    artwork based on what is actually visible. Do not claim to have inspected
    artwork without opening the preview.
 
-The schema in MCP `tools/list` is authoritative. `drawing_create_batch` adds
-objects in array order (back to front within the selected layer) and accepts
-the same `shape`, `style` and `transform` fields as `drawing_create_shape`.
-Object IDs returned by the batch are stable and can be edited later.
+The schema in MCP `tools/list` is authoritative. `drawing_create_scene` adds
+new layers in array order and shapes in draw order, preserving existing data.
+It uses the same `shape`, `style` and `transform` fields as
+`drawing_create_shape`, plus `layer_index` for a newly created layer or
+`layer_id` for an existing layer (never both). Returned object and layer IDs
+are stable and can be edited later. 512 shapes is a per-call ceiling, while
+the note-wide limit remains 2000 objects and 64 layers.
 
 ## Visual quality guidelines
 
@@ -55,8 +62,10 @@ foreground surface on the same editable layer:
 ```json
 {
   "id": "NOTE_ID",
+  "layers": [{"name": "Sunset sky and backdrop"}],
   "objects": [
     {
+      "layer_index": 0,
       "shape": {"type": "rectangle", "width": 1100, "height": 700},
       "style": {
         "stroke": null,
@@ -73,6 +82,7 @@ foreground surface on the same editable layer:
       }
     },
     {
+      "layer_index": 0,
       "shape": {"type": "circle", "radius": 94},
       "transform": {"translation": {"x": 815, "y": 186}},
       "style": {
@@ -90,6 +100,7 @@ foreground surface on the same editable layer:
       }
     },
     {
+      "layer_index": 0,
       "shape": {"type": "rounded_rectangle", "width": 920, "height": 190, "radius": 32},
       "transform": {"translation": {"x": 90, "y": 458}},
       "style": {

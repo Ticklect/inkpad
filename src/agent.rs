@@ -3,7 +3,7 @@
 
 use crate::canvas::{Board, HEIGHT, WIDTH};
 use crate::store::{DrawShape, DrawStyle, DrawingData, Point, Transform};
-use crate::store::drawing::{fresh_id as fresh_drawing_id, DrawObject, Layer, MAX_OBJECTS};
+use crate::store::drawing::{fresh_id as fresh_drawing_id, DrawObject, Layer, MAX_OBJECTS, MAX_LAYERS};
 use crate::settings::{AppearanceTheme, UiSettings};
 use crate::store::{Note, Store, Stroke, TextRun, TextStylePatch, Workspace};
 use base64::Engine as _;
@@ -31,6 +31,8 @@ const MAX_IMAGE_CAPTION_CHARS: usize = 500;
 const MAX_BATCH_FORMAT_OPS: usize = 32;
 const MAX_BATCH_NOTE_OPS: usize = 32;
 const MAX_BATCH_DRAW_OBJECTS: usize = 64;
+const MAX_SCENE_DRAW_OBJECTS: usize = 512;
+const MAX_SCENE_DRAW_LAYERS: usize = 16;
 const MAX_BATCH_STROKES: usize = 64;
 const MAX_FRAGMENT_TEXT_BYTES: usize = 256 * 1024;
 const MAX_FRAGMENT_RUNS: usize = 2048;
@@ -204,6 +206,110 @@ fn execute_drawing_create_batch(store: &Store, args: &Value) -> Result<Value, St
     })
 }
 
+/// Create a complete multi-layer vector scene without a per-layer or
+/// per-object MCP round trip. All layer and object validation occurs before
+/// the single workspace commit. A scene is ONE undo step; note text and media
+/// are never altered. Layers created by this call use array indexes in object
+/// definitions, avoiding a preliminary layer-ID discovery round trip.
+fn execute_drawing_create_scene(store: &Store, args: &Value) -> Result<Value, String> {
+    let args = object_args(args, &["id", "title", "expected_object_count", "layers", "objects"])?;
+    let layers = match args.get("layers") {
+        None => &[][..],
+        Some(Value::Array(items)) if items.len() <= MAX_SCENE_DRAW_LAYERS => items.as_slice(),
+        _ => return Err(invalid("layers must be an array of at most 16 named layers")),
+    };
+    let mut names = Vec::with_capacity(layers.len());
+    for (index, value) in layers.iter().enumerate() {
+        let item = object_args(value, &["name"])
+            .map_err(|error| format!("Layer {index}: {error}"))?;
+        let name = required_string(item, "name")?;
+        if name.trim().is_empty() || name.chars().count() > 80 || name.contains('\0') {
+            return Err(format!("Layer {index}: name must contain 1–80 characters without NUL"));
+        }
+        names.push(name.to_owned());
+    }
+    let objects = args.get("objects").and_then(Value::as_array)
+        .filter(|items| !items.is_empty() && items.len() <= MAX_SCENE_DRAW_OBJECTS)
+        .ok_or_else(|| invalid("objects must contain 1–512 editable shapes"))?;
+    let expected = args.get("expected_object_count").map(|value| {
+        value.as_u64().filter(|count| *count <= MAX_OBJECTS as u64)
+            .map(|count| count as usize)
+            .ok_or_else(|| invalid("expected_object_count must be an integer from 0 to 2000"))
+    }).transpose()?;
+    let prepared = objects.iter().enumerate().map(|(index, value)| {
+        let parse = || -> Result<(BatchDrawObject, Option<usize>), String> {
+            let item = object_args(value, &["shape", "style", "transform", "layer_id", "layer_index"])?;
+            if item.contains_key("layer_id") && item.contains_key("layer_index") {
+                return Err(invalid("Provide only layer_id or layer_index, not both"));
+            }
+            let layer_index = item.get("layer_index").map(|value| {
+                let index = value.as_u64().and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| invalid("layer_index must be a non-negative integer"))?;
+                if index >= names.len() { return Err(invalid("layer_index must reference one of this scene's new layers")); }
+                Ok(index)
+            }).transpose()?;
+            let layer_id = optional_string(item, "layer_id")?;
+            if layer_id.is_some() { drawing_id(item, "layer_id")?; }
+            Ok((BatchDrawObject {
+                shape:draw_shape(item, "shape")?,
+                style:optional_draw_style(item)?.unwrap_or_default(),
+                transform:optional_draw_transform(item)?.unwrap_or_default(),
+                layer_id:layer_id.map(str::to_string),
+            }, layer_index))
+        };
+        parse().map_err(|error| format!("Object {index}: {error}"))
+    }).collect::<Result<Vec<_>, _>>()?;
+    drawing_change(store, args, move |drawing| {
+        if expected.is_some_and(|count| count != drawing.objects.len()) {
+            return Err(invalid("expected_object_count does not match the saved drawing; refresh before adding artwork"));
+        }
+        if drawing.layers.len().saturating_add(names.len()) > MAX_LAYERS {
+            return Err(invalid("Scene would exceed 64 drawing layers"));
+        }
+        if drawing.objects.len().saturating_add(prepared.len()) > MAX_OBJECTS {
+            return Err(invalid("Scene would exceed 2000 drawing objects"));
+        }
+        let mut layer_ids = Vec::with_capacity(names.len());
+        for name in names {
+            let mut id = fresh_drawing_id("layer");
+            while drawing.layers.iter().any(|layer| layer.id == id) || layer_ids.contains(&id) {
+                id = fresh_drawing_id("layer");
+            }
+            drawing.layers.push(Layer {id:id.clone(),name,visible:true,locked:false});
+            layer_ids.push(id);
+        }
+        let mut object_ids = Vec::with_capacity(prepared.len());
+        for (index, (item, layer_index)) in prepared.into_iter().enumerate() {
+            let layer_id = match (layer_index, item.layer_id) {
+                (Some(index), None) => layer_ids[index].clone(),
+                (None, Some(id)) => id,
+                (None, None) if drawing.layers.is_empty() => {
+                    let id = fresh_drawing_id("layer");
+                    drawing.layers.push(Layer {id:id.clone(),name:"Layer 1".into(),visible:true,locked:false});
+                    id
+                },
+                (None, None) => drawing.layers.last().expect("at least one layer exists").id.clone(),
+                (Some(_), Some(_)) => unreachable!("exclusive source validation"),
+            };
+            let layer = drawing.layers.iter().find(|layer| layer.id == layer_id)
+                .ok_or_else(|| format!("Object {index}: referenced drawing layer not found"))?;
+            if layer.locked { return Err(format!("Object {index}: drawing layer is locked")); }
+            let mut id = fresh_drawing_id("obj");
+            while drawing.objects.iter().any(|object| object.id == id) || object_ids.contains(&id) {
+                id = fresh_drawing_id("obj");
+            }
+            let object = DrawObject {id:id.clone(),layer_id,shape:item.shape,
+                style:item.style,transform:item.transform,visible:true,group_id:None};
+            object.validate().map_err(|error| format!("Object {index}: {error}"))?;
+            drawing.objects.push(object);
+            object_ids.push(id);
+        }
+        Ok(json!({"object_ids":object_ids,"created_layer_ids":layer_ids,
+            "added_objects":object_ids.len(),"added_layers":layer_ids.len(),
+            "object_count":drawing.objects.len(),"layer_count":drawing.layers.len()}))
+    })
+}
+
 fn drawing_id<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
     let id = required_string(args, key)?;
     if id.is_empty() || id.len() > 128 || !id.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-' || ch == b'_') {
@@ -278,11 +384,12 @@ fn drawing_capabilities() -> Value {
             "layers":["create","rename","reorder","visibility","lock","delete_empty"],
             "object_management":["create","edit","reorder","delete","group","ungroup"],
             "history":"last 48 MCP drawing edits in this stdio process only; rejects undo/redo after external drawing changes"},
-        "mcp":{"drawing_tools":["drawing_list","drawing_create_shape","drawing_create_batch","drawing_edit_shape","drawing_transform_object",
+        "mcp":{"drawing_tools":["drawing_list","drawing_create_shape","drawing_create_batch","drawing_create_scene","drawing_edit_shape","drawing_transform_object",
             "drawing_reorder_object","drawing_delete_object","drawing_group_objects","drawing_ungroup_objects",
             "drawing_create_layer","drawing_edit_layer","drawing_move_layer","drawing_delete_layer",
             "drawing_transform_group","drawing_pick_object","drawing_preview","drawing_undo","drawing_redo"],
             "batch_drawing_commands":true,"max_batch_shapes":MAX_BATCH_DRAW_OBJECTS,
+            "max_scene_shapes":MAX_SCENE_DRAW_OBJECTS,"max_scene_layers":MAX_SCENE_DRAW_LAYERS,
             "batch_is_atomic":true,"operates_on_saved_workspace":true,"opens_gui":false},
         "gui":{"drawing_model_shared":true,"interactive_acceptance":"requires GUI verification",
             "mcp_cannot_control":["active_tool","editor_view","selection","open_dialogs"]},
@@ -701,7 +808,8 @@ fn drawing_tool_definitions() -> Vec<Value> {
     };
     add("get_capabilities", "Discover exact capabilities of the local MCP drawing model and current GUI/MCP differences, including supported shapes, styles, transforms, layers and transient history.",json!({}),vec![],false);
     add("drawing_list", "Read editable vector objects and layers in the saved note. Legacy freehand strokes remain separate. No private image bytes are returned.",note.clone(),vec![],false);
-    add("drawing_create_shape", "Create one editable shape on the 1100x700 canvas. For detailed artwork, prefer drawing_create_batch to add up to 64 ordered shapes with one save. Set local geometry, transform.translation for placement, RGBA stroke, and optional solid/linear/radial gradient fill. Use drawing_create_layer before painting separate foreground/background layers.",json!({"id":note["id"],"title":note["title"],"shape":shape.clone(),"style":style.clone(),"transform":transform.clone(),"layer_id":layer_id.clone()}),vec!["shape"],true);
+    add("drawing_create_shape", "Create one editable shape on the 1100x700 canvas. For detailed artwork prefer drawing_create_scene (up to 512 shapes + named layers in one save) or drawing_create_batch (up to 64). Set local geometry, transform.translation for placement, RGBA stroke and solid/linear/radial gradient fill.",json!({"id":note["id"],"title":note["title"],"shape":shape.clone(),"style":style.clone(),"transform":transform.clone(),"layer_id":layer_id.clone()}),vec!["shape"],true);
+    add("drawing_create_scene", "BEST for complex AI artwork: atomically add 1–16 named layers and 1–512 editable vector objects in ONE MCP tool call, one workspace write and one undo step. Each object's layer_index selects its new layer (0-based); existing layer_id also supported. Objects appear in array order and retain stable object IDs. Plan coherent silhouette, palette, lighting and foreground; inspect a drawing_preview after the composition, then add details. Does not replace existing art/text/media. Invalid entries, missing/locked layers, stale expected_object_count or drawing limits roll back the entire scene. MCP message maximum 2 MiB.",json!({"id":note["id"],"title":note["title"],"expected_object_count":{"type":"integer","minimum":0,"maximum":2000},"layers":{"type":"array","maxItems":MAX_SCENE_DRAW_LAYERS,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":80}},"required":["name"],"additionalProperties":false}},"objects":{"type":"array","minItems":1,"maxItems":MAX_SCENE_DRAW_OBJECTS,"items":{"type":"object","properties":{"shape":shape.clone(),"style":style.clone(),"transform":transform.clone(),"layer_id":layer_id.clone(),"layer_index":{"type":"integer","minimum":0,"maximum":15}},"required":["shape"],"additionalProperties":false}}}),vec!["objects"],true);
     add("drawing_create_batch", "Paint 1–64 editable vector objects in input order with ONE atomic saved transaction, one cross-process lock and one session undo step. Fast for layered illustrations: create named layers first with drawing_create_layer; set each object's layer_id or a shared default layer_id, RGBA stroke/opacity, solid/linear/radial gradient fill and transform.translation. Objects keep unique editable IDs and existing text, images and strokes remain unchanged. An invalid object, missing/locked layer or mismatched expected_object_count aborts the entire batch; response returns object_ids in stacking order. MCP message maximum is 2 MiB.",json!({"id":note["id"],"title":note["title"],"layer_id":layer_id.clone(),"expected_object_count":{"type":"integer","minimum":0,"maximum":2000},"objects":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"shape":shape,"style":style,"transform":transform,"layer_id":layer_id},"required":["shape"],"additionalProperties":false}}}),vec!["objects"],true);
     add("drawing_edit_shape", "Replace any provided shape geometry, style, transform, visibility or layer association of ONE existing drawing object. Locked layers reject edits. All omitted fields are kept.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"shape":shape,"style":style,"transform":transform,"visible":{"type":"boolean"},"layer_id":layer_id}),vec!["object_id"],true);
     add("drawing_transform_object", "Apply a relative move (dx/dy), resize (sx/sy), rotate (degrees) or flip (horizontal=true/false) to one editable object. Locked layers reject edits; values are checked.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"operation":{"type":"string","enum":["move","resize","rotate","flip"]},"dx":{"type":"number","minimum":-16384,"maximum":16384},"dy":{"type":"number","minimum":-16384,"maximum":16384},"sx":{"type":"number","exclusiveMinimum":0,"maximum":128},"sy":{"type":"number","exclusiveMinimum":0,"maximum":128},"degrees":{"type":"number","minimum":-360000,"maximum":360000},"horizontal":{"type":"boolean"}}),vec!["object_id","operation"],false);
@@ -970,7 +1078,12 @@ fn note_summary(note: &Note) -> Value {
     json!({
         "id":note.id,"title":note.title,"kind":note.kind,
         "preview":preview(&note.body),"stroke_count":note.strokes.len(),
-        "has_drawing":!note.strokes.is_empty(),"image_count":note.images.len(),"pinned":note.pinned,
+        // Vector-only drawings are still drawings: the old stroke-only flag
+        // falsely reported all three detailed mallard paintings as empty.
+        "has_drawing":!note.strokes.is_empty() || !note.drawing.objects.is_empty(),
+        "drawing_object_count":note.drawing.objects.len(),
+        "drawing_layer_count":note.drawing.layers.len(),
+        "image_count":note.images.len(),"pinned":note.pinned,
         "font_size":note.font_size,"font_choice":note.font_choice,"updated":note.updated
     })
 }
@@ -1386,6 +1499,7 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
             })
         }
         "drawing_create_batch" => execute_drawing_create_batch(store, args),
+        "drawing_create_scene" => execute_drawing_create_scene(store, args),
         "drawing_edit_shape" => {
             let args = object_args(args, &["id","title","object_id","shape","style","transform","visible","layer_id"])?;
             let object_id = drawing_id(args, "object_id")?;
@@ -2418,6 +2532,99 @@ mod tests {
     }
 
     #[test]
+    fn list_and_search_identify_vector_only_drawing_without_legacy_strokes() {
+        let (store, folder) = store();
+        let created = tool(&store, "create_note", json!({"title":"Vector mallard 🦆"}));
+        let id = created["id"].as_str().unwrap();
+        tool(&store, "drawing_create_batch", json!({"id":id,"objects":[
+            {"shape":{"type":"ellipse","radius_x":20,"radius_y":10}},
+            {"shape":{"type":"circle","radius":4}}
+        ]}));
+        let listed = tool(&store, "list_notes", json!({"limit":200}));
+        let found = listed["notes"].as_array().unwrap().iter()
+            .find(|value| value["id"] == id).unwrap();
+        assert_eq!(found["stroke_count"], 0);
+        assert_eq!(found["has_drawing"], true);
+        assert_eq!(found["drawing_object_count"], 2);
+        assert_eq!(found["drawing_layer_count"], 1);
+        let searched = tool(&store, "search_notes", json!({"query":"mallard"}));
+        let hit = &searched["notes"][0];
+        assert_eq!(hit["id"], id);
+        assert_eq!(hit["has_drawing"], true);
+        assert_eq!(hit["drawing_object_count"], 2);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn drawing_create_scene_atomic_layers_512_shapes_and_one_step_undo() {
+        let (store, folder) = store();
+        let created = tool(&store, "create_note", json!({"title":"Lake 🦆", "body":"Preserve 🐈"}));
+        let id = created["id"].as_str().unwrap();
+        let before = tool(&store, "read_note", json!({"id":id}));
+        let shapes: Vec<Value> = (0..512).map(|i| json!({
+            "shape":{"type":"ellipse","radius_x":2.0,"radius_y":4.0},
+            "layer_index":i % 2,
+            "transform":{"translation":{"x":i % 100,"y":i / 2}},
+            "style":{"stroke":null,"fill":{"type":"solid","color":[15,45,85,255]}}
+        })).collect();
+        let request = json!({"id":id,"expected_object_count":0,
+            "layers":[{"name":"背景 🌅"},{"name":"羽根 🦆"}],"objects":shapes});
+        // An invalid 301st object cannot leave behind even the newly created layers.
+        let mut broken = request.clone();
+        broken["objects"][300]["layer_index"] = json!(9);
+        let old_bytes = std::fs::read(store.data_path()).unwrap();
+        assert!(execute_tool(&store,"drawing_create_scene",&broken).is_err());
+        assert_eq!(std::fs::read(store.data_path()).unwrap(),old_bytes);
+        let reply = tool(&store,"drawing_create_scene",request);
+        assert_eq!(reply["added_objects"],512);
+        assert_eq!(reply["added_layers"],2);
+        assert_eq!(reply["object_count"],512);
+        assert_eq!(reply["layer_count"],2);
+        let ids=reply["object_ids"].as_array().unwrap();
+        assert_eq!(ids.len(),512);
+        let read=tool(&store,"read_note",json!({"id":id}));
+        assert_eq!(read["body"],"Preserve 🐈");
+        assert_eq!(read["drawing"]["layers"][0]["name"],"背景 🌅");
+        assert_eq!(read["drawing"]["layers"][1]["name"],"羽根 🦆");
+        assert_eq!(read["drawing"]["objects"][0]["layer_id"],reply["created_layer_ids"][0]);
+        assert_eq!(read["drawing"]["objects"][1]["layer_id"],reply["created_layer_ids"][1]);
+        assert_eq!(read["drawing"]["objects"][511]["id"],ids[511]);
+        assert!(execute_tool(&store,"drawing_create_scene",&json!({"id":id,
+            "expected_object_count":0,"objects":[{"shape":{"type":"circle","radius":5}}]})).is_err());
+        assert_eq!(tool(&store,"read_note",json!({"id":id})),read);
+        tool(&store,"drawing_undo",json!({"id":id,"confirm":true}));
+        assert_eq!(tool(&store,"read_note",json!({"id":id}))["drawing"],before["drawing"]);
+        tool(&store,"drawing_redo",json!({"id":id,"confirm":true}));
+        assert_eq!(tool(&store,"read_note",json!({"id":id}))["drawing"],read["drawing"]);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn drawing_create_scene_rejects_bad_index_locked_layer_and_extra_field() {
+        let (store,folder)=store();
+        let id=tool(&store,"create_note",json!({"title":"Do not disturb","body":"safe"}))["id"]
+            .as_str().unwrap().to_owned();
+        let layer=tool(&store,"drawing_create_layer",json!({"id":id,"name":"Locked"}))["layer_id"]
+            .as_str().unwrap().to_owned();
+        tool(&store,"drawing_edit_layer",json!({"id":id,"layer_id":layer,"locked":true}));
+        let before=std::fs::read(store.data_path()).unwrap();
+        let base=json!({"id":id,"layers":[{"name":"New"}],
+            "objects":[{"shape":{"type":"rectangle","width":20,"height":20},"layer_index":0}]});
+        for bad in [
+            json!({"id":id,"objects":[]}),
+            json!({"id":id,"layers":[{"name":""}],"objects":base["objects"]}),
+            json!({"id":id,"objects":[{"shape":{"type":"circle","radius":5},"layer_index":0}]}),
+            json!({"id":id,"objects":[{"shape":{"type":"circle","radius":5},"layer_id":layer}]}),
+            json!({"id":id,"objects":[{"shape":{"type":"circle","radius":5},"unexpected":1}]}),
+            json!({"id":id,"objects":[{"shape":{"type":"circle","radius":5},"layer_index":0,"layer_id":layer}]}),
+        ] {
+            assert!(execute_tool(&store,"drawing_create_scene",&bad).is_err(),"Accepted {bad}");
+            assert_eq!(std::fs::read(store.data_path()).unwrap(),before);
+        }
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
     fn drawing_create_batch_preserves_unicode_media_layers_order_and_one_step_undo() {
         let (store, folder) = store();
         let id = tool(&store, "create_note", json!({"title":"画 🎨 / 雲", "body":"猫👩‍🚀\nExisting text"}))["id"]
@@ -2790,7 +2997,7 @@ mod tests {
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
         let names: Vec<_> = responses[1]["result"]["tools"].as_array().unwrap().iter()
             .map(|item| item["name"].as_str().unwrap()).collect();
-        assert_eq!(names.len(), 60);
+        assert_eq!(names.len(), 61);
         assert!(names.contains(&"note_batch"));
         assert!(names.contains(&"get_capabilities"));
         assert!(names.contains(&"drawing_preview"));
