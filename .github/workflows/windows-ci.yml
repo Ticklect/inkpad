@@ -1,0 +1,37 @@
+name: Windows Rust and MCP regression
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Agent Rust regressions
+        run: cargo test --locked --bin inkpad-agent
+      - name: Desktop Rust regressions
+        run: cargo test --locked --bin inkpad
+      - name: Compile release desktop and MCP executables
+        run: cargo build --locked --release --bins
+      - name: Verify atomic scenes and export equivalence
+        shell: pwsh
+        run: |
+          python tests/scene_atomic_revision_mcp.py target/release/inkpad-agent.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/advanced_vector_mcp_smoke.py target/release/inkpad-agent.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/vector_geometry_qa.py target/release/inkpad-agent.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

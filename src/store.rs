@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -603,14 +603,15 @@ impl Store {
 
     fn write_unlocked_with_primary_validity(&self, workspace: &Workspace, primary_valid: Option<bool>) -> io::Result<()> {
         workspace.validate_rich_text()?;
-        // Compact JSON retains exactly the same persisted schema and Unicode
-        // content, while reducing bytes written, backed up and parsed later.
-        let encoded = serde_json::to_vec(workspace)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        // Stream identical compact JSON into a bounded write buffer instead
+        // of materializing a second 9+ MB Vec for every large notebook save.
+        // The temp file is still flushed and synced before backup/replace.
         let temp = self.path.with_extension("json.tmp");
-        let mut file = File::create(&temp)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
+        let mut file = BufWriter::with_capacity(128 * 1024, File::create(&temp)?);
+        serde_json::to_writer(&mut file, workspace)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        file.flush()?;
+        file.get_ref().sync_all()?;
         drop(file);
         if self.path.exists() {
             // Never replace a valid backup with a corrupt/truncated primary.
@@ -639,6 +640,63 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "benchmark: compare old Vec serialization with streaming on a synthetic large workspace"]
+    fn compare_atomic_json_serializers_benchmark() {
+        use std::io::BufWriter;
+        use std::time::Instant;
+        let folder = std::env::temp_dir().join(format!("inkpad-serializer-bench-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&folder).unwrap();
+        let mut workspace = Workspace::default();
+        workspace.notes.clear();
+        for index in 0..2200 {
+            let mut note = Note::create("note");
+            note.id = format!("bench-{index:05}");
+            note.title = format!("Synthetic Unicode note #{index}");
+            note.body = "Large synthetic note content and 漢字 emoji 🦆. ".repeat(77);
+            workspace.notes.push(note);
+        }
+        let payload = serde_json::to_vec(&workspace).unwrap();
+        let expected_len = payload.len();
+        let mut vec_times = Vec::new();
+        let mut streaming_times = Vec::new();
+        let mut old_encode_times = Vec::new();
+        let mut streamed_total_bytes = 0;
+        for i in 0..20 {
+            for kind in if i % 2 == 0 { [0,1] } else { [1,0] } {
+                let path = folder.join(if kind == 0 { "legacy.json.tmp" } else { "stream.json.tmp" });
+                let start = Instant::now();
+                if kind == 0 {
+                    let bytes = serde_json::to_vec(&workspace).unwrap();
+                    let encoded = start.elapsed().as_secs_f64() * 1000.0;
+                    let mut f = File::create(&path).unwrap();
+                    f.write_all(&bytes).unwrap();
+                    f.sync_all().unwrap();
+                    old_encode_times.push(encoded);
+                    vec_times.push(start.elapsed().as_secs_f64() * 1000.0);
+                } else {
+                    let mut writer = BufWriter::with_capacity(128 * 1024, File::create(&path).unwrap());
+                    serde_json::to_writer(&mut writer, &workspace).unwrap();
+                    writer.flush().unwrap();
+                    writer.get_ref().sync_all().unwrap();
+                    streaming_times.push(start.elapsed().as_secs_f64() * 1000.0);
+                    streamed_total_bytes = fs::metadata(&path).unwrap().len();
+                }
+            }
+        }
+        let a = fs::read(folder.join("legacy.json.tmp")).unwrap();
+        let b = fs::read(folder.join("stream.json.tmp")).unwrap();
+        assert_eq!(a, b, "Streaming serializer must preserve exact compact JSON bytes");
+        assert_eq!(expected_len as u64, streamed_total_bytes);
+        let stat = |samples: &mut Vec<f64>| { samples.sort_by(f64::total_cmp);
+            (samples[samples.len()/2], samples[samples.len()*95/100]) };
+        let (legacy_p50,legacy_p95) = stat(&mut vec_times);
+        let (stream_p50,stream_p95) = stat(&mut streaming_times);
+        let (encode_p50,encode_p95) = stat(&mut old_encode_times);
+        println!("json_serializer_2200_notes bytes={expected_len} legacy_serialize_only_p50_p95_ms={encode_p50:.3}/{encode_p95:.3} legacy_serialize_sync_p50_p95_ms={legacy_p50:.3}/{legacy_p95:.3} streaming_serialize_sync_p50_p95_ms={stream_p50:.3}/{stream_p95:.3} legacy_extra_heap_bytes_at_least={expected_len} stream_writer_capacity_bytes=131072 samples=20");
+        fs::remove_dir_all(folder).unwrap();
+    }
     #[test]
     fn saves_and_restores_multiline_unicode_and_strokes() {
         let folder = std::env::temp_dir().join(format!("inkpad-test-{}-{}", std::process::id(),
