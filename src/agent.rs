@@ -132,9 +132,104 @@ fn drawing_change(store: &Store, args: &Map<String, Value>,
 /// has passed its per-object and final drawing integrity checks.
 struct BatchDrawObject {
     shape: DrawShape,
+    clip_shape: Option<DrawShape>,
     style: DrawStyle,
     transform: Transform,
     layer_id: Option<String>,
+    placement_warning: Option<&'static str>,
+}
+
+/// Ordered revisions to existing vector IDs. Unlike appending a replacement
+/// contour over the old one, these preserve object identity and layer order.
+/// A scene can apply up to 64 in its existing atomic transaction, making
+/// anatomy repairs cheaper and avoiding dozens of separate MCP round trips.
+struct SceneDrawEdit {
+    object_id: String,
+    shape: Option<DrawShape>,
+    clip_shape: Option<Option<DrawShape>>,
+    style: Option<DrawStyle>,
+    transform: Option<Transform>,
+    position: Option<Point>,
+    visible: Option<bool>,
+    layer_id: Option<String>,
+}
+
+fn scene_draw_edits(args: &Map<String, Value>) -> Result<Vec<SceneDrawEdit>, String> {
+    let edits = match args.get("edits") {
+        None => return Ok(Vec::new()),
+        Some(Value::Array(items)) if items.len() <= 64 => items,
+        _ => return Err(invalid("edits must be an array of at most 64 object revisions")),
+    };
+    let mut prepared = Vec::with_capacity(edits.len());
+    let mut seen = std::collections::HashSet::new();
+    for (index, value) in edits.iter().enumerate() {
+        let parse = || -> Result<SceneDrawEdit, String> {
+            let item = object_args(value, &["object_id","shape","clip_shape","style",
+                "transform","position","visible","layer_id"])?;
+            let object_id = drawing_id(item,"object_id")?.to_string();
+            let shape = item.get("shape").map(|_| draw_shape(item,"shape")).transpose()?;
+            let clip_shape = match item.get("clip_shape") {
+                None => None, Some(Value::Null) => Some(None),
+                Some(_) => Some(Some(draw_shape(item,"clip_shape")?))
+            };
+            let style = optional_draw_style(item)?;
+            let positioned = optional_object_placement(item)?;
+            let position = item.get("position").map(|_| positioned.clone().expect("placement parsed").translation);
+            let transform = if position.is_none() { positioned } else { None };
+            let visible = item.get("visible").map(|_| required_bool(item,"visible")).transpose()?;
+            let layer_id = optional_string(item,"layer_id")?.map(str::to_string);
+            if item.contains_key("layer_id") { drawing_id(item,"layer_id")?; }
+            if shape.is_none() && clip_shape.is_none() && style.is_none() &&
+                transform.is_none() && position.is_none() && visible.is_none() && layer_id.is_none() {
+                return Err(invalid("Edit requires at least one changed field"));
+            }
+            Ok(SceneDrawEdit {object_id,shape,clip_shape,style,transform,position,visible,layer_id})
+        };
+        let edit = parse().map_err(|e|format!("Edit {index}: {e}"))?;
+        if !seen.insert(edit.object_id.clone()) {
+            return Err(format!("Edit {index}: Duplicate object_id in scene revisions"));
+        }
+        prepared.push(edit);
+    }
+    Ok(prepared)
+}
+
+/// Conservative, non-failing feedback for a common agent error: putting a
+/// colour gradient at an absolute canvas coordinate while leaving the object
+/// itself at its default (0,0) position. Existing valid art is NEVER rejected
+/// or altered by these hints. They cost no additional MCP round trip.
+fn placement_warning(shape: &DrawShape, style: &DrawStyle, placed: bool) -> Option<&'static str> {
+    if placed { return None; }
+    let Some(fill) = &style.fill else { return None; };
+    let too_far = |x: f32, y: f32| -> bool {
+        match shape {
+            DrawShape::Circle { radius } => x.abs() > radius * 2.0 || y.abs() > radius * 2.0,
+            DrawShape::Ellipse { radius_x, radius_y } => x.abs() > radius_x * 2.0 || y.abs() > radius_y * 2.0,
+            _ => false,
+        }
+    };
+    match fill {
+        crate::store::DrawFill::RadialGradient { center, .. } |
+        crate::store::DrawFill::EllipticalGradient { center, .. } if too_far(center.x, center.y) =>
+            Some("Possible misplaced shape: gradient.center changes colour but NOT the object position; use position:{x,y} or transform.translation"),
+        crate::store::DrawFill::LinearGradient { start, end, .. } => {
+            let rectangle_size = match shape {
+                DrawShape::Rectangle {width,height} | DrawShape::RoundedRectangle {width,height,..} =>
+                    Some((*width,*height)),
+                _ => None,
+            };
+            if let Some((w,h)) = rectangle_size {
+                if (start.x > w+5.0 && end.x > w+5.0) ||
+                    (start.y > h+5.0 && end.y > h+5.0) ||
+                    (start.x < -5.0 && end.x < -5.0) ||
+                    (start.y < -5.0 && end.y < -5.0) {
+                    return Some("Possible misplaced rectangle: gradient endpoints are outside local shape bounds; use position:{x,y} or transform.translation");
+                }
+            }
+            None
+        },
+        _ => None,
+    }
 }
 
 fn execute_drawing_create_batch(store: &Store, args: &Value) -> Result<Value, String> {
@@ -153,16 +248,23 @@ fn execute_drawing_create_batch(store: &Store, args: &Value) -> Result<Value, St
     }).transpose()?;
     let prepared = objects.iter().enumerate().map(|(index, value)| {
         let parse = || -> Result<BatchDrawObject, String> {
-            let item = object_args(value, &["shape", "style", "transform", "layer_id"])?;
+            let item = object_args(value, &["shape", "clip_shape", "style", "transform", "position", "layer_id"])?;
             let shape = draw_shape(item, "shape")?;
+            let clip_shape = item.get("clip_shape").map(|_| draw_shape(item, "clip_shape")).transpose()?;
             let style = optional_draw_style(item)?.unwrap_or_default();
-            let transform = optional_draw_transform(item)?.unwrap_or_default();
+            let transform = optional_object_placement(item)?.unwrap_or_default();
+            let placement_warning = placement_warning(&shape, &style,
+                item.contains_key("position") || item.contains_key("transform"));
             let layer_id = optional_string(item, "layer_id")?.or(default_layer);
             if item.contains_key("layer_id") { drawing_id(item, "layer_id")?; }
-            Ok(BatchDrawObject { shape, style, transform, layer_id: layer_id.map(str::to_string) })
+            Ok(BatchDrawObject { shape, clip_shape, style, transform, layer_id: layer_id.map(str::to_string), placement_warning })
         };
         parse().map_err(|error| format!("Object {index}: {error}"))
     }).collect::<Result<Vec<_>, _>>()?;
+
+    let placement_warnings: Vec<Value> = prepared.iter().enumerate()
+        .filter_map(|(index, item)| item.placement_warning.map(|message|
+            json!({"object_index":index,"message":message}))).collect();
 
     drawing_change(store, args, move |drawing| {
         if expected_object_count.is_some_and(|expected| expected != drawing.objects.len()) {
@@ -171,6 +273,11 @@ fn execute_drawing_create_batch(store: &Store, args: &Value) -> Result<Value, St
         if drawing.objects.len().saturating_add(prepared.len()) > MAX_OBJECTS {
             return Err(format!("Cannot exceed {MAX_OBJECTS} editable objects on one page"));
         }
+        // For large batches, avoid scanning the growing object array for each
+        // new ID. Keep tiny batches on the allocation-free linear path.
+        let mut known_object_ids = (prepared.len() >= 16).then(|| drawing.objects.iter()
+            .map(|object| object.id.clone()).collect::<std::collections::HashSet<_>>());
+        drawing.objects.reserve(prepared.len());
         let mut ids = Vec::with_capacity(prepared.len());
         for (index, item) in prepared.into_iter().enumerate() {
             let add = || -> Result<DrawObject, String> {
@@ -189,10 +296,14 @@ fn execute_drawing_create_batch(store: &Store, args: &Value) -> Result<Value, St
                 // Use the same shared ID generator as DrawingData::add_object,
                 // and also reject collisions with preexisting legacy IDs.
                 let mut id = fresh_drawing_id("obj");
-                while drawing.objects.iter().any(|object| object.id == id) || ids.iter().any(|other| other == &id) {
+                while match known_object_ids.as_mut() {
+                    Some(known) => !known.insert(id.clone()),
+                    None => drawing.objects.iter().any(|object| object.id == id)
+                        || ids.iter().any(|other| other == &id),
+                } {
                     id = fresh_drawing_id("obj");
                 }
-                let object = DrawObject { id, layer_id, shape: item.shape,
+                let object = DrawObject { id, layer_id, shape: item.shape, clip_shape: item.clip_shape,
                     style: item.style, transform: item.transform, visible: true, group_id: None };
                 object.validate()?;
                 Ok(object)
@@ -202,7 +313,8 @@ fn execute_drawing_create_batch(store: &Store, args: &Value) -> Result<Value, St
             drawing.objects.push(object);
         }
         Ok(json!({"object_ids":ids,"added_objects":ids.len(),
-            "object_count":drawing.objects.len(),"layer_count":drawing.layers.len()}))
+            "object_count":drawing.objects.len(),"layer_count":drawing.layers.len(),
+            "placement_warnings":placement_warnings}))
     })
 }
 
@@ -212,7 +324,8 @@ fn execute_drawing_create_batch(store: &Store, args: &Value) -> Result<Value, St
 /// are never altered. Layers created by this call use array indexes in object
 /// definitions, avoiding a preliminary layer-ID discovery round trip.
 fn execute_drawing_create_scene(store: &Store, args: &Value) -> Result<Value, String> {
-    let args = object_args(args, &["id", "title", "expected_object_count", "layers", "objects"])?;
+    let args = object_args(args, &["id", "title", "expected_object_count", "layers", "objects", "edits"])?;
+    let edits = scene_draw_edits(args)?;
     let layers = match args.get("layers") {
         None => &[][..],
         Some(Value::Array(items)) if items.len() <= MAX_SCENE_DRAW_LAYERS => items.as_slice(),
@@ -228,9 +341,14 @@ fn execute_drawing_create_scene(store: &Store, args: &Value) -> Result<Value, St
         }
         names.push(name.to_owned());
     }
-    let objects = args.get("objects").and_then(Value::as_array)
-        .filter(|items| !items.is_empty() && items.len() <= MAX_SCENE_DRAW_OBJECTS)
-        .ok_or_else(|| invalid("objects must contain 1–512 editable shapes"))?;
+    let objects = match args.get("objects") {
+        None => &[][..],
+        Some(Value::Array(items)) if items.len() <= MAX_SCENE_DRAW_OBJECTS => items.as_slice(),
+        _ => return Err(invalid("objects must contain at most 512 editable shapes")),
+    };
+    if objects.is_empty() && edits.is_empty() {
+        return Err(invalid("Scene needs objects (1–512) or edits (1–64)"));
+    }
     let expected = args.get("expected_object_count").map(|value| {
         value.as_u64().filter(|count| *count <= MAX_OBJECTS as u64)
             .map(|count| count as usize)
@@ -238,7 +356,7 @@ fn execute_drawing_create_scene(store: &Store, args: &Value) -> Result<Value, St
     }).transpose()?;
     let prepared = objects.iter().enumerate().map(|(index, value)| {
         let parse = || -> Result<(BatchDrawObject, Option<usize>), String> {
-            let item = object_args(value, &["shape", "style", "transform", "layer_id", "layer_index"])?;
+            let item = object_args(value, &["shape", "clip_shape", "style", "transform", "position", "layer_id", "layer_index"])?;
             if item.contains_key("layer_id") && item.contains_key("layer_index") {
                 return Err(invalid("Provide only layer_id or layer_index, not both"));
             }
@@ -250,18 +368,52 @@ fn execute_drawing_create_scene(store: &Store, args: &Value) -> Result<Value, St
             }).transpose()?;
             let layer_id = optional_string(item, "layer_id")?;
             if layer_id.is_some() { drawing_id(item, "layer_id")?; }
+            let shape = draw_shape(item, "shape")?;
+            let style = optional_draw_style(item)?.unwrap_or_default();
+            let placement_warning = placement_warning(&shape, &style,
+                item.contains_key("position") || item.contains_key("transform"));
             Ok((BatchDrawObject {
-                shape:draw_shape(item, "shape")?,
-                style:optional_draw_style(item)?.unwrap_or_default(),
-                transform:optional_draw_transform(item)?.unwrap_or_default(),
+                shape,
+                clip_shape:item.get("clip_shape").map(|_| draw_shape(item, "clip_shape")).transpose()?,
+                style,
+                transform:optional_object_placement(item)?.unwrap_or_default(),
                 layer_id:layer_id.map(str::to_string),
+                placement_warning,
             }, layer_index))
         };
         parse().map_err(|error| format!("Object {index}: {error}"))
     }).collect::<Result<Vec<_>, _>>()?;
+    let placement_warnings: Vec<Value> = prepared.iter().enumerate()
+        .filter_map(|(index, (item,_))| item.placement_warning.map(|message|
+            json!({"object_index":index,"message":message}))).collect();
     drawing_change(store, args, move |drawing| {
         if expected.is_some_and(|count| count != drawing.objects.len()) {
             return Err(invalid("expected_object_count does not match the saved drawing; refresh before adding artwork"));
+        }
+        // Apply revisions by stable ID to saved existing objects before adding
+        // anything. A late failure rolls back all prior edits and added layers.
+        let mut edited_ids = Vec::with_capacity(edits.len());
+        for (index, edit) in edits.into_iter().enumerate() {
+            let position = drawing.objects.iter().position(|o|o.id == edit.object_id)
+                .ok_or_else(||format!("Edit {index}: Drawing object not found"))?;
+            let before_layer = &drawing.objects[position].layer_id;
+            if drawing.layers.iter().any(|l|l.id == *before_layer && l.locked) {
+                return Err(format!("Edit {index}: Drawing layer is locked"));
+            }
+            let mut candidate = drawing.objects[position].clone();
+            if let Some(shape) = edit.shape { candidate.shape = shape; }
+            if let Some(clip) = edit.clip_shape { candidate.clip_shape = clip; }
+            if let Some(style) = edit.style { candidate.style = style; }
+            if let Some(transform) = edit.transform { candidate.transform = transform; }
+            if let Some(point) = edit.position { candidate.transform.translation = point; }
+            if let Some(visible) = edit.visible { candidate.visible = visible; }
+            if let Some(layer_id) = edit.layer_id { candidate.layer_id = layer_id; }
+            if !drawing.layers.iter().any(|l|l.id == candidate.layer_id && !l.locked) {
+                return Err(format!("Edit {index}: Target drawing layer missing or locked"));
+            }
+            candidate.validate().map_err(|e|format!("Edit {index}: {e}"))?;
+            edited_ids.push(candidate.id.clone());
+            drawing.objects[position] = candidate;
         }
         if drawing.layers.len().saturating_add(names.len()) > MAX_LAYERS {
             return Err(invalid("Scene would exceed 64 drawing layers"));
@@ -278,6 +430,16 @@ fn execute_drawing_create_scene(store: &Store, args: &Value) -> Result<Value, St
             drawing.layers.push(Layer {id:id.clone(),name,visible:true,locked:false});
             layer_ids.push(id);
         }
+        // The old collision check walked every existing and newly inserted
+        // object for every generated ID: O(n*m + m^2) for m scene objects.
+        // Keep the exact same collision protection with one bounded set.
+        let mut known_object_ids = (prepared.len() >= 16).then(|| {
+            let mut ids = std::collections::HashSet::with_capacity(
+                drawing.objects.len().saturating_add(prepared.len()));
+            ids.extend(drawing.objects.iter().map(|object| object.id.clone()));
+            ids
+        });
+        drawing.objects.reserve(prepared.len());
         let mut object_ids = Vec::with_capacity(prepared.len());
         for (index, (item, layer_index)) in prepared.into_iter().enumerate() {
             let layer_id = match (layer_index, item.layer_id) {
@@ -295,10 +457,14 @@ fn execute_drawing_create_scene(store: &Store, args: &Value) -> Result<Value, St
                 .ok_or_else(|| format!("Object {index}: referenced drawing layer not found"))?;
             if layer.locked { return Err(format!("Object {index}: drawing layer is locked")); }
             let mut id = fresh_drawing_id("obj");
-            while drawing.objects.iter().any(|object| object.id == id) || object_ids.contains(&id) {
+            while match known_object_ids.as_mut() {
+                Some(known) => !known.insert(id.clone()),
+                None => drawing.objects.iter().any(|object| object.id == id)
+                    || object_ids.contains(&id),
+            } {
                 id = fresh_drawing_id("obj");
             }
-            let object = DrawObject {id:id.clone(),layer_id,shape:item.shape,
+            let object = DrawObject {id:id.clone(),layer_id,shape:item.shape,clip_shape:item.clip_shape,
                 style:item.style,transform:item.transform,visible:true,group_id:None};
             object.validate().map_err(|error| format!("Object {index}: {error}"))?;
             drawing.objects.push(object);
@@ -306,7 +472,9 @@ fn execute_drawing_create_scene(store: &Store, args: &Value) -> Result<Value, St
         }
         Ok(json!({"object_ids":object_ids,"created_layer_ids":layer_ids,
             "added_objects":object_ids.len(),"added_layers":layer_ids.len(),
-            "object_count":drawing.objects.len(),"layer_count":drawing.layers.len()}))
+            "edited_object_ids":edited_ids,"edited_objects":edited_ids.len(),
+            "object_count":drawing.objects.len(),"layer_count":drawing.layers.len(),
+            "placement_warnings":placement_warnings}))
     })
 }
 
@@ -335,10 +503,29 @@ fn draw_shape(args: &Map<String, Value>, key: &str) -> Result<DrawShape, String>
         "line" => &["type", "to"],
         "polygon" => &["type", "points", "closed"],
         "cubic_bezier" => &["type", "control1", "control2", "to"],
-        _ => return Err(invalid("shape.type must be rectangle, rounded_rectangle, ellipse, circle, line, polygon or cubic_bezier")),
+        "path" => &["type", "commands"],
+        _ => return Err(invalid("Unsupported shape.type")),
     };
     if let Some(unknown) = map.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(format!("Unknown shape property: {unknown}"));
+    }
+    if kind == "path" {
+        let commands = map.get("commands").and_then(Value::as_array)
+            .ok_or_else(|| invalid("path.commands must be an array"))?;
+        if commands.len() < 2 || commands.len() > 256 { return Err(invalid("path.commands must contain 2–256 commands")); }
+        for (index, command) in commands.iter().enumerate() {
+            let value = command.as_object().ok_or_else(|| format!("Path command {index} must be an object"))?;
+            let fields: &[&str] = match value.get("type").and_then(Value::as_str) {
+                Some("move_to" | "line_to") => &["type", "to"],
+                Some("cubic_to") => &["type", "control1", "control2", "to"],
+                Some("quad_to") => &["type", "control", "to"],
+                Some("close") => &["type"],
+                _ => return Err(format!("Invalid path command {index} type")),
+            };
+            if let Some(extra) = value.keys().find(|key| !fields.contains(&key.as_str())) {
+                return Err(format!("Unknown path command {index} property: {extra}"));
+            }
+        }
     }
     serde_json::from_value(value.clone()).map_err(|e| format!("Invalid shape: {e}"))
 }
@@ -346,8 +533,27 @@ fn draw_shape(args: &Map<String, Value>, key: &str) -> Result<DrawShape, String>
 fn optional_draw_style(args: &Map<String, Value>) -> Result<Option<DrawStyle>, String> {
     if let Some(value) = args.get("style") {
         let map = value.as_object().ok_or_else(|| invalid("style must be an object"))?;
-        if let Some(unknown) = map.keys().find(|key| !["stroke", "stroke_width", "fill", "opacity"].contains(&key.as_str())) {
+        if let Some(unknown) = map.keys().find(|key| !["stroke", "stroke_width", "fill", "opacity", "shadow"].contains(&key.as_str())) {
             return Err(format!("Unknown style property: {unknown}"));
+        }
+        if let Some(value) = map.get("shadow").filter(|value| !value.is_null()) {
+            let shadow = value.as_object().ok_or_else(|| invalid("shadow must be an object or null"))?;
+            if let Some(unknown) = shadow.keys().find(|key| !["offset", "blur_radius", "color"].contains(&key.as_str())) {
+                return Err(format!("Unknown shadow property: {unknown}"));
+            }
+        }
+        if let Some(value) = map.get("fill").filter(|value| !value.is_null()) {
+            let fill = value.as_object().ok_or_else(|| invalid("fill must be an object or null"))?;
+            let fields: &[&str] = match fill.get("type").and_then(Value::as_str) {
+                Some("solid") => &["type", "color"],
+                Some("linear_gradient") => &["type", "start", "end", "stops"],
+                Some("radial_gradient") => &["type", "center", "radius", "stops"],
+                Some("elliptical_gradient") => &["type", "center", "radius_x", "radius_y", "stops"],
+                _ => return Err(invalid("Unsupported fill.type")),
+            };
+            if let Some(unknown) = fill.keys().find(|key| !fields.contains(&key.as_str())) {
+                return Err(format!("Unknown fill property: {unknown}"));
+            }
         }
     }
     let style: Option<DrawStyle> = drawing_value(args, "style")?;
@@ -367,6 +573,29 @@ fn optional_draw_transform(args: &Map<String, Value>) -> Result<Option<Transform
     Ok(transform)
 }
 
+/// Absolute canvas position is a compact, unambiguous alternative to a
+/// transform. Shapes still keep their historical local geometry: rectangles
+/// start at position, circles/ellipses are centred at position. Gradient
+/// start/center coordinates affect colour only; they never move an object.
+/// Absence of position/transform preserves existing stored artwork exactly.
+fn optional_object_placement(args: &Map<String, Value>) -> Result<Option<Transform>, String> {
+    if args.contains_key("position") && args.contains_key("transform") {
+        return Err(invalid("Provide position OR transform, not both"));
+    }
+    if let Some(value) = args.get("position") {
+        object_args(value, &["x","y"])
+            .map_err(|e| format!("Invalid position: {e}"))?;
+        let point: Point = serde_json::from_value(value.clone())
+            .map_err(|e| format!("Invalid position: {e}"))?;
+        if !point.x.is_finite() || !point.y.is_finite() ||
+            point.x.abs() > 16384.0 || point.y.abs() > 16384.0 {
+            return Err(invalid("position.x/y must be finite canvas coordinates between -16384 and 16384"));
+        }
+        return Ok(Some(Transform { translation:point, ..Transform::default() }));
+    }
+    optional_draw_transform(args)
+}
+
 fn draw_number(args: &Map<String, Value>, key: &str, min: f64, max: f64) -> Result<f32, String> {
     let value = args.get(key).and_then(Value::as_f64)
         .filter(|x| x.is_finite() && *x >= min && *x <= max)
@@ -378,9 +607,11 @@ fn drawing_capabilities() -> Value {
     json!({
         "agent_transport":"local_stdio_mcp", "agent_drawing_model":"editable_vector_objects_v1",
         "canvas":{"width":WIDTH,"height":HEIGHT,"coordinates":"pixels"},
-        "model":{"shapes":["rectangle","rounded_rectangle","ellipse","circle","line","polygon","cubic_bezier"],
-            "style":["rgba_stroke","stroke_width","solid_fill","linear_gradient","radial_gradient","opacity"],
+        "model":{"shapes":["rectangle","rounded_rectangle","ellipse","circle","line","polygon","cubic_bezier","path"],
+            "path_commands":["move_to","line_to","cubic_to","quad_to","close"],"clip_shape":true,
+            "style":["rgba_stroke","stroke_width","solid_fill","linear_gradient","radial_gradient","elliptical_gradient","opacity","shadow"],
             "transforms":["move","resize","rotate","flip","group_move","group_resize","group_rotate","group_flip"],
+            "absolute_position":true,"placement_warnings":true,
             "layers":["create","rename","reorder","visibility","lock","delete_empty"],
             "object_management":["create","edit","reorder","delete","group","ungroup"],
             "history":"last 48 MCP drawing edits in this stdio process only; rejects undo/redo after external drawing changes"},
@@ -785,16 +1016,24 @@ fn drawing_tool_definitions() -> Vec<Value> {
         {"type":"object","properties":{"type":{"const":"circle"},"radius":{"type":"number","exclusiveMinimum":0,"maximum":8192}},"required":["type","radius"],"additionalProperties":false},
         {"type":"object","properties":{"type":{"const":"line"},"to":{"$ref":"#/$defs/point"}},"required":["type","to"],"additionalProperties":false},
         {"type":"object","properties":{"type":{"const":"polygon"},"points":{"type":"array","minItems":2,"maxItems":256,"items":{"$ref":"#/$defs/point"}},"closed":{"type":"boolean"}},"required":["type","points"],"additionalProperties":false},
-        {"type":"object","properties":{"type":{"const":"cubic_bezier"},"control1":{"$ref":"#/$defs/point"},"control2":{"$ref":"#/$defs/point"},"to":{"$ref":"#/$defs/point"}},"required":["type","control1","control2","to"],"additionalProperties":false}
+        {"type":"object","properties":{"type":{"const":"cubic_bezier"},"control1":{"$ref":"#/$defs/point"},"control2":{"$ref":"#/$defs/point"},"to":{"$ref":"#/$defs/point"}},"required":["type","control1","control2","to"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"path"},"commands":{"type":"array","minItems":2,"maxItems":256,"items":{"oneOf":[
+            {"type":"object","properties":{"type":{"const":"move_to"},"to":{"$ref":"#/$defs/point"}},"required":["type","to"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"line_to"},"to":{"$ref":"#/$defs/point"}},"required":["type","to"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"cubic_to"},"control1":{"$ref":"#/$defs/point"},"control2":{"$ref":"#/$defs/point"},"to":{"$ref":"#/$defs/point"}},"required":["type","control1","control2","to"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"quad_to"},"control":{"$ref":"#/$defs/point"},"to":{"$ref":"#/$defs/point"}},"required":["type","control","to"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"close"}},"required":["type"],"additionalProperties":false}
+        ]}}},"required":["type","commands"],"additionalProperties":false}
     ]});
     let point = json!({"type":"object","properties":{"x":{"type":"number","minimum":-16384,"maximum":16384},"y":{"type":"number","minimum":-16384,"maximum":16384}},"required":["x","y"],"additionalProperties":false});
     let color = json!({"type":"array","minItems":4,"maxItems":4,"items":{"type":"integer","minimum":0,"maximum":255}});
     let fill = json!({"oneOf":[
         {"type":"object","properties":{"type":{"const":"solid"},"color":color},"required":["type","color"],"additionalProperties":false},
         {"type":"object","properties":{"type":{"const":"linear_gradient"},"start":point,"end":point,"stops":{"$ref":"#/$defs/stops"}},"required":["type","start","end","stops"],"additionalProperties":false},
-        {"type":"object","properties":{"type":{"const":"radial_gradient"},"center":point,"radius":{"type":"number","exclusiveMinimum":0,"maximum":8192},"stops":{"$ref":"#/$defs/stops"}},"required":["type","center","radius","stops"],"additionalProperties":false}
+        {"type":"object","properties":{"type":{"const":"radial_gradient"},"center":point,"radius":{"type":"number","exclusiveMinimum":0,"maximum":8192},"stops":{"$ref":"#/$defs/stops"}},"required":["type","center","radius","stops"],"additionalProperties":false},
+        {"type":"object","properties":{"type":{"const":"elliptical_gradient"},"center":point,"radius_x":{"type":"number","exclusiveMinimum":0,"maximum":8192},"radius_y":{"type":"number","exclusiveMinimum":0,"maximum":8192},"stops":{"$ref":"#/$defs/stops"}},"required":["type","center","radius_x","radius_y","stops"],"additionalProperties":false}
     ]});
-    let style = json!({"type":"object","properties":{"stroke":{"oneOf":[color,{"type":"null"}]},"stroke_width":{"type":"number","minimum":0,"maximum":256},"fill":{"oneOf":[fill,{"type":"null"}]},"opacity":{"type":"number","minimum":0,"maximum":1}},"additionalProperties":false});
+    let style = json!({"type":"object","properties":{"stroke":{"oneOf":[color,{"type":"null"}]},"stroke_width":{"type":"number","minimum":0,"maximum":256},"fill":{"oneOf":[fill,{"type":"null"}]},"opacity":{"type":"number","minimum":0,"maximum":1},"shadow":{"oneOf":[{"type":"object","properties":{"offset":point,"blur_radius":{"type":"number","minimum":0,"maximum":32},"color":color},"required":["offset","blur_radius","color"],"additionalProperties":false},{"type":"null"}]}},"additionalProperties":false});
     let transform = json!({"type":"object","properties":{"translation":point,"scale_x":{"type":"number","minimum":0.001,"maximum":128},"scale_y":{"type":"number","minimum":0.001,"maximum":128},"rotation_deg":{"type":"number","minimum":-360000,"maximum":360000},"flip_x":{"type":"boolean"},"flip_y":{"type":"boolean"}},"additionalProperties":false});
     let defs = json!({"point":point,"stops":{"type":"array","minItems":2,"maxItems":16,"items":{"type":"object","properties":{"offset":{"type":"number","minimum":0,"maximum":1},"color":color},"required":["offset","color"],"additionalProperties":false}}});
     let note = json!({"id":{"type":"string"},"title":{"type":"string"}});
@@ -808,10 +1047,28 @@ fn drawing_tool_definitions() -> Vec<Value> {
     };
     add("get_capabilities", "Discover exact capabilities of the local MCP drawing model and current GUI/MCP differences, including supported shapes, styles, transforms, layers and transient history.",json!({}),vec![],false);
     add("drawing_list", "Read editable vector objects and layers in the saved note. Legacy freehand strokes remain separate. No private image bytes are returned.",note.clone(),vec![],false);
-    add("drawing_create_shape", "Create one editable shape on the 1100x700 canvas. For detailed artwork prefer drawing_create_scene (up to 512 shapes + named layers in one save) or drawing_create_batch (up to 64). Set local geometry, transform.translation for placement, RGBA stroke and solid/linear/radial gradient fill.",json!({"id":note["id"],"title":note["title"],"shape":shape.clone(),"style":style.clone(),"transform":transform.clone(),"layer_id":layer_id.clone()}),vec!["shape"],true);
-    add("drawing_create_scene", "BEST for complex AI artwork: atomically add 1–16 named layers and 1–512 editable vector objects in ONE MCP tool call, one workspace write and one undo step. Each object's layer_index selects its new layer (0-based); existing layer_id also supported. Objects appear in array order and retain stable object IDs. Plan coherent silhouette, palette, lighting and foreground; inspect a drawing_preview after the composition, then add details. Does not replace existing art/text/media. Invalid entries, missing/locked layers, stale expected_object_count or drawing limits roll back the entire scene. MCP message maximum 2 MiB.",json!({"id":note["id"],"title":note["title"],"expected_object_count":{"type":"integer","minimum":0,"maximum":2000},"layers":{"type":"array","maxItems":MAX_SCENE_DRAW_LAYERS,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":80}},"required":["name"],"additionalProperties":false}},"objects":{"type":"array","minItems":1,"maxItems":MAX_SCENE_DRAW_OBJECTS,"items":{"type":"object","properties":{"shape":shape.clone(),"style":style.clone(),"transform":transform.clone(),"layer_id":layer_id.clone(),"layer_index":{"type":"integer","minimum":0,"maximum":15}},"required":["shape"],"additionalProperties":false}}}),vec!["objects"],true);
-    add("drawing_create_batch", "Paint 1–64 editable vector objects in input order with ONE atomic saved transaction, one cross-process lock and one session undo step. Fast for layered illustrations: create named layers first with drawing_create_layer; set each object's layer_id or a shared default layer_id, RGBA stroke/opacity, solid/linear/radial gradient fill and transform.translation. Objects keep unique editable IDs and existing text, images and strokes remain unchanged. An invalid object, missing/locked layer or mismatched expected_object_count aborts the entire batch; response returns object_ids in stacking order. MCP message maximum is 2 MiB.",json!({"id":note["id"],"title":note["title"],"layer_id":layer_id.clone(),"expected_object_count":{"type":"integer","minimum":0,"maximum":2000},"objects":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"shape":shape,"style":style,"transform":transform,"layer_id":layer_id},"required":["shape"],"additionalProperties":false}}}),vec!["objects"],true);
-    add("drawing_edit_shape", "Replace any provided shape geometry, style, transform, visibility or layer association of ONE existing drawing object. Locked layers reject edits. All omitted fields are kept.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"shape":shape,"style":style,"transform":transform,"visible":{"type":"boolean"},"layer_id":layer_id}),vec!["object_id"],true);
+    add("drawing_create_shape", "Create editable shape, including compound paths and clipping. For absolute canvas placement use position:{x,y} (rectangle top-left; circle/ellipse centre); or transform, never both. Gradient coordinates do NOT move geometry.",json!({"id":note["id"],"title":note["title"],"shape":shape.clone(),"clip_shape":shape.clone(),"style":style.clone(),"transform":transform.clone(),"position":point.clone(),"layer_id":layer_id.clone()}),vec!["shape"],true);
+    let scene_edits = json!({"type":"array","maxItems":64,"items":{"type":"object",
+        "properties":{"object_id":object_id.clone(),"shape":shape.clone(),
+            "clip_shape":{"oneOf":[shape.clone(),{"type":"null"}]},
+            "style":style.clone(),"transform":transform.clone(),"position":point.clone(),
+            "visible":{"type":"boolean"},"layer_id":layer_id.clone()},
+        "required":["object_id"],"additionalProperties":false}});
+    add("drawing_create_scene", "In ONE atomic call, add 0–512 vector shapes and/or edit 1–64 existing objects by stable ID (no duplicate contours/59 edit round trips). Up to 16 layers; edits can alter shape, clip, style, visibility and absolute position without changing IDs. Supply objects or edits. Gradients do not move shapes; nonblocking placement_warnings identify likely mistakes.",json!({
+        "id":note["id"],"title":note["title"],
+        "expected_object_count":{"type":"integer","minimum":0,"maximum":2000},
+        "layers":{"type":"array","maxItems":MAX_SCENE_DRAW_LAYERS,
+            "items":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":80}},
+                "required":["name"],"additionalProperties":false}},
+        "objects":{"type":"array","maxItems":MAX_SCENE_DRAW_OBJECTS,
+            "items":{"type":"object","properties":{"shape":shape.clone(),"clip_shape":shape.clone(),
+                "style":style.clone(),"transform":transform.clone(),"position":point.clone(),
+                "layer_id":layer_id.clone(),"layer_index":{"type":"integer","minimum":0,"maximum":15}},
+                "required":["shape"],"additionalProperties":false}},
+        "edits":scene_edits
+    }),vec![],true);
+    add("drawing_create_batch", "Atomically create 1–64 shapes. Use position:{x,y} for absolute geometry placement or transform (not both); a gradient centre never moves its shape. Compound paths, clips and gradients supported.",json!({"id":note["id"],"title":note["title"],"layer_id":layer_id.clone(),"expected_object_count":{"type":"integer","minimum":0,"maximum":2000},"objects":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"shape":shape.clone(),"clip_shape":shape.clone(),"style":style.clone(),"transform":transform.clone(),"position":point.clone(),"layer_id":layer_id.clone()},"required":["shape"],"additionalProperties":false}}}),vec!["objects"],true);
+    add("drawing_edit_shape", "Edit geometry, clipping, style, visibility, layer or placement. position:{x,y} updates only absolute translation and preserves scale/rotation; alternatively transform replaces full transform. Set clip_shape:null to clear.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"shape":shape.clone(),"clip_shape":{"oneOf":[shape,{"type":"null"}]},"style":style,"transform":transform,"position":point.clone(),"visible":{"type":"boolean"},"layer_id":layer_id}),vec!["object_id"],true);
     add("drawing_transform_object", "Apply a relative move (dx/dy), resize (sx/sy), rotate (degrees) or flip (horizontal=true/false) to one editable object. Locked layers reject edits; values are checked.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"operation":{"type":"string","enum":["move","resize","rotate","flip"]},"dx":{"type":"number","minimum":-16384,"maximum":16384},"dy":{"type":"number","minimum":-16384,"maximum":16384},"sx":{"type":"number","exclusiveMinimum":0,"maximum":128},"sy":{"type":"number","exclusiveMinimum":0,"maximum":128},"degrees":{"type":"number","minimum":-360000,"maximum":360000},"horizontal":{"type":"boolean"}}),vec!["object_id","operation"],false);
     add("drawing_transform_group", "Apply a relative move, resize, rotation or flip to all objects in one named group around their shared transform origin. Locked layers reject the entire operation.",json!({"id":note["id"],"title":note["title"],"group_id":object_id,"operation":{"type":"string","enum":["move","resize","rotate","flip"]},"dx":{"type":"number","minimum":-16384,"maximum":16384},"dy":{"type":"number","minimum":-16384,"maximum":16384},"sx":{"type":"number","exclusiveMinimum":0,"maximum":128},"sy":{"type":"number","exclusiveMinimum":0,"maximum":128},"degrees":{"type":"number","minimum":-360000,"maximum":360000},"horizontal":{"type":"boolean"}}),vec!["group_id","operation"],false);
     add("drawing_reorder_object", "Change one editable object's zero-based stacking position among vector objects.",json!({"id":note["id"],"title":note["title"],"object_id":object_id,"position":{"type":"integer","minimum":0,"maximum":1999}}),vec!["object_id","position"],false);
@@ -1481,42 +1738,58 @@ fn execute_tool(store: &Store, name: &str, args: &Value) -> Result<Value, String
                 "canvas":{"width":WIDTH,"height":HEIGHT}}))
         }
         "drawing_create_shape" => {
-            let args = object_args(args, &["id","title","shape","style","transform","layer_id"])?;
+            let args = object_args(args, &["id","title","shape","clip_shape","style","transform","position","layer_id"])?;
             let shape = draw_shape(args, "shape")?;
+            let clip_shape = args.get("clip_shape").map(|_| draw_shape(args, "clip_shape")).transpose()?;
             let style = optional_draw_style(args)?;
-            let transform = optional_draw_transform(args)?;
+            let transform = optional_object_placement(args)?;
+            let warning = placement_warning(&shape, &style.clone().unwrap_or_default(),
+                args.contains_key("position") || args.contains_key("transform"));
             let layer_id = optional_string(args, "layer_id")?;
             if layer_id.is_some() { drawing_id(args, "layer_id")?; }
             drawing_change(store, args, |drawing| {
                 let object_id = drawing.add_object(shape, layer_id)?;
-                if style.is_some() || transform.is_some() {
+                if style.is_some() || transform.is_some() || clip_shape.is_some() {
                     drawing.update_object(&object_id, |object| {
+                        object.clip_shape = clip_shape.clone();
                         if let Some(style) = &style { object.style = style.clone(); }
                         if let Some(transform) = &transform { object.transform = transform.clone(); }
                     })?;
                 }
-                Ok(json!({"object":drawing.object(&object_id),"object_count":drawing.objects.len()}))
+                Ok(json!({"object":drawing.object(&object_id),"object_count":drawing.objects.len(),
+                    "placement_warnings":warning.into_iter().collect::<Vec<_>>()}))
             })
         }
         "drawing_create_batch" => execute_drawing_create_batch(store, args),
         "drawing_create_scene" => execute_drawing_create_scene(store, args),
         "drawing_edit_shape" => {
-            let args = object_args(args, &["id","title","object_id","shape","style","transform","visible","layer_id"])?;
+            let args = object_args(args, &["id","title","object_id","shape","clip_shape","style","transform","position","visible","layer_id"])?;
             let object_id = drawing_id(args, "object_id")?;
             let shape = if args.contains_key("shape") { Some(draw_shape(args, "shape")?) } else { None };
+            let clip_shape = match args.get("clip_shape") { None => None, Some(Value::Null) => Some(None), Some(_) => Some(Some(draw_shape(args,"clip_shape")?)) };
             let style = optional_draw_style(args)?;
+            // For edits, position changes translation only; the other transform
+            // components retain their existing values.
+            if args.contains_key("position") && args.contains_key("transform") {
+                return Err(invalid("Provide position OR transform, not both"));
+            }
+            let position = if args.contains_key("position") {
+                Some(optional_object_placement(args)?.expect("position supplied").translation)
+            } else { None };
             let transform = optional_draw_transform(args)?;
             let visible = args.get("visible").map(|_| required_bool(args, "visible")).transpose()?;
             let layer_id = optional_string(args, "layer_id")?;
             if layer_id.is_some() { drawing_id(args, "layer_id")?; }
-            if shape.is_none() && style.is_none() && transform.is_none() && visible.is_none() && layer_id.is_none() {
+            if shape.is_none() && clip_shape.is_none() && style.is_none() && transform.is_none() && position.is_none() && visible.is_none() && layer_id.is_none() {
                 return Err(invalid("Provide shape, style, transform, visible or layer_id to edit"));
             }
             drawing_change(store, args, |drawing| {
                 drawing.update_object(object_id, |object| {
                     if let Some(shape) = &shape { object.shape = shape.clone(); }
+                    if let Some(clip_shape) = &clip_shape { object.clip_shape = clip_shape.clone(); }
                     if let Some(style) = &style { object.style = style.clone(); }
                     if let Some(transform) = &transform { object.transform = transform.clone(); }
+                    if let Some(position) = position { object.transform.translation = position; }
                     if let Some(visible) = visible { object.visible = visible; }
                     if let Some(layer_id) = layer_id { object.layer_id = layer_id.into(); }
                 })?;
@@ -2408,10 +2681,17 @@ mod tests {
     use super::*;
     use crate::store::Stroke;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Windows wall-clock timestamp resolution can be coarse enough that two
+    // concurrent tests generate the same nanosecond name. Their independent
+    // cleanup then races, producing spurious OS error 3 during Store writes.
+    static NEXT_TEST_FOLDER: AtomicU64 = AtomicU64::new(1);
 
     fn store() -> (Store, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("inkpad-agent-test-{}-{}", std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!("inkpad-agent-test-{}-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            NEXT_TEST_FOLDER.fetch_add(1, Ordering::Relaxed)));
         (Store::in_folder(path.clone()).unwrap(), path)
     }
 
@@ -2838,6 +3118,230 @@ mod tests {
         batches.sort_by(f64::total_cmp);
         println!("32 editable vectors: individual={:.2} ms, batch={:.2} ms, speedup={:.1}x (median of 3 local runs)",
             singles[1],batches[1],singles[1]/batches[1]);
+    }
+
+    #[test]
+    fn mcp_compound_paths_clipping_shadow_schema_and_atomic_rollback() {
+        let (store, folder) = store();
+        let note = tool(&store, "create_note", json!({"title":"Path regression"}));
+        let id = note["id"].as_str().unwrap();
+        let path = json!({"type":"path","commands":[
+            {"type":"move_to","to":{"x":10,"y":10}},
+            {"type":"line_to","to":{"x":60,"y":10}},
+            {"type":"quad_to","control":{"x":80,"y":30},"to":{"x":60,"y":60}},
+            {"type":"cubic_to","control1":{"x":40,"y":70},"control2":{"x":20,"y":70},"to":{"x":10,"y":60}},
+            {"type":"close"} ]});
+        let style = json!({"shadow":{"offset":{"x":5,"y":7},"blur_radius":8,"color":[0,0,0,130]},
+            "fill":{"type":"elliptical_gradient","center":{"x":40,"y":30},"radius_x":60,"radius_y":35,
+                "stops":[{"offset":0,"color":[255,255,255,255]},{"offset":1,"color":[20,80,120,255]}]}});
+        let defs = tool_definitions();
+        for name in ["drawing_create_shape","drawing_create_batch","drawing_create_scene","drawing_edit_shape"] {
+            let schema = &defs.iter().find(|def| def["name"] == name).unwrap()["inputSchema"];
+            let props = if name == "drawing_create_batch" || name == "drawing_create_scene" {
+                &schema["properties"]["objects"]["items"]["properties"]
+            } else { &schema["properties"] };
+            assert!(props.get("clip_shape").is_some(), "{name} missing clipping schema");
+            assert!(props["shape"]["oneOf"].as_array().unwrap().iter().any(|option| option["properties"]["type"]["const"] == "path"));
+            assert!(props["style"]["properties"].get("shadow").is_some());
+        }
+        let created = tool(&store,"drawing_create_shape",json!({"id":id,"shape":path,"clip_shape":path,"style":style}));
+        let oid = created["object"]["id"].as_str().unwrap();
+        assert_eq!(created["object"]["clip_shape"]["type"],"path");
+        assert_eq!(created["object"]["style"]["shadow"]["blur_radius"],8.0);
+        let before = tool(&store,"read_note",json!({"id":id}));
+        for invalid_path in [
+            json!({"type":"path","commands":[{"type":"move_to","to":{"x":1,"y":2},"unknown":1}]}),
+            json!({"type":"path","commands":[{"type":"wrong"}]}),
+            json!({"type":"path","commands":[]}),
+        ] {
+            assert!(execute_tool(&store,"drawing_create_batch",&json!({"id":id,"objects":[
+                {"shape":{"type":"circle","radius":5}}, {"shape":invalid_path}
+            ]})).is_err());
+            assert_eq!(tool(&store,"read_note",json!({"id":id})),before);
+            assert!(execute_tool(&store,"drawing_create_scene",&json!({"id":id,"layers":[{"name":"Rollback"}],"objects":[
+                {"shape":{"type":"circle","radius":5},"layer_index":0},{"shape":invalid_path,"layer_index":0}
+            ]})).is_err());
+            assert_eq!(tool(&store,"read_note",json!({"id":id})),before);
+        }
+        tool(&store,"drawing_edit_shape",json!({"id":id,"object_id":oid,"clip_shape":null}));
+        let edited = tool(&store,"drawing_list",json!({"id":id}));
+        assert!(edited["drawing"]["objects"][0]["clip_shape"].is_null());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn absolute_canvas_position_shorthand_prevents_origin_and_gradient_placement_errors() {
+        let (store, folder) = store();
+        let id = tool(&store, "create_note", json!({"title":"Placement regression"}))["id"]
+            .as_str().unwrap().to_owned();
+        for name in ["drawing_create_shape","drawing_create_batch","drawing_create_scene","drawing_edit_shape"] {
+            let defs = tool_definitions();
+            let input = &defs.iter().find(|def| def["name"] == name).unwrap()["inputSchema"];
+            let props = if matches!(name,"drawing_create_batch"|"drawing_create_scene") {
+                &input["properties"]["objects"]["items"]["properties"]
+            } else { &input["properties"] };
+            assert!(props.get("position").is_some(), "{name} must advertise absolute position");
+        }
+        assert_eq!(tool(&store,"get_capabilities",json!({}))["model"]["absolute_position"],true);
+        let sun = tool(&store,"drawing_create_shape",json!({
+            "id":id,"shape":{"type":"circle","radius":32},
+            "position":{"x":855,"y":238},
+            "style":{"stroke":null,"fill":{"type":"elliptical_gradient",
+                "center":{"x":0,"y":0},"radius_x":100,"radius_y":100,
+                "stops":[{"offset":0,"color":[255,240,190,255]},{"offset":1,"color":[255,200,160,0]}]}}
+        }));
+        let sun_id = sun["object"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(sun["object"]["transform"]["translation"],json!({"x":855.0,"y":238.0}));
+        let scene = tool(&store,"drawing_create_scene",json!({"id":id,"expected_object_count":1,
+            "layers":[{"name":"Lake"}],
+            "objects":[
+                {"layer_index":0,"shape":{"type":"rectangle","width":1100,"height":318},
+                 "position":{"x":0,"y":382},"style":{"stroke":null,
+                    "fill":{"type":"linear_gradient","start":{"x":0,"y":382},
+                        "end":{"x":0,"y":700},
+                        "stops":[{"offset":0,"color":[80,120,150,255]},
+                                 {"offset":1,"color":[10,50,80,255]}]}}},
+                {"layer_index":0,"shape":{"type":"ellipse","radius_x":40,"radius_y":12},
+                 "position":{"x":520,"y":470}}
+            ]}));
+        assert_eq!(scene["object_count"],3);
+        let listed = tool(&store,"drawing_list",json!({"id":id}));
+        assert_eq!(listed["drawing"]["objects"][1]["transform"]["translation"],
+            json!({"x":0.0,"y":382.0}));
+        assert_eq!(listed["drawing"]["objects"][2]["transform"]["translation"],
+            json!({"x":520.0,"y":470.0}));
+        // Editing position changes only translation, unlike replacing the
+        // entire transform (which would reset rotation/scale).
+        tool(&store,"drawing_edit_shape",json!({"id":id,"object_id":sun_id,
+            "transform":{"translation":{"x":855,"y":238},"scale_x":2,"rotation_deg":25}}));
+        let moved = tool(&store,"drawing_edit_shape",json!({"id":id,"object_id":sun_id,
+            "position":{"x":750,"y":200}}));
+        assert_eq!(moved["object"]["transform"]["translation"],json!({"x":750.0,"y":200.0}));
+        assert_eq!(moved["object"]["transform"]["scale_x"],2.0);
+        assert_eq!(moved["object"]["transform"]["rotation_deg"],25.0);
+        let saved = tool(&store,"drawing_list",json!({"id":id}));
+        let before = std::fs::read(store.data_path()).unwrap();
+        for bad in [
+            json!({"objects":[{"shape":{"type":"circle","radius":5},
+                    "position":{"x":200,"y":150},"transform":{"translation":{"x":3,"y":4}}}]}),
+            json!({"objects":[{"shape":{"type":"circle","radius":5},
+                    "position":{"x":20000,"y":20}}]}),
+            json!({"objects":[{"shape":{"type":"circle","radius":5},
+                    "position":{"x":200,"y":20,"unexpected":true}}]}),
+            json!({"objects":[{"shape":{"type":"circle","radius":5}},
+                    {"shape":{"type":"circle","radius":5},"position":{"x":"invalid","y":2}}]})
+        ] {
+            let mut request = bad.as_object().unwrap().clone();
+            request.insert("id".into(),json!(id));
+            assert!(execute_tool(&store,"drawing_create_scene",&Value::Object(request)).is_err());
+            assert_eq!(std::fs::read(store.data_path()).unwrap(),before,"Invalid scene changed data");
+        }
+        assert!(execute_tool(&store,"drawing_edit_shape",&json!({"id":id,"object_id":sun_id,
+            "position":{"x":0,"y":0},"transform":{"translation":{"x":10,"y":20}}})).is_err());
+        assert_eq!(tool(&store,"drawing_list",json!({"id":id})),saved);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn scene_and_single_creation_warn_about_gradient_positions_without_rejecting_legacy_geometry() {
+        let (store, folder) = store();
+        let id = tool(&store,"create_note",json!({"title":"Spot mispositioned sun and water"}))["id"]
+            .as_str().unwrap().to_string();
+        let radial = json!({"type":"elliptical_gradient","center":{"x":855,"y":238},
+            "radius_x":200,"radius_y":150,"stops":[
+                {"offset":0,"color":[255,230,130,255]},
+                {"offset":1,"color":[255,200,100,0]}]});
+        let line = json!({"type":"linear_gradient","start":{"x":0,"y":382},
+            "end":{"x":0,"y":700},"stops":[
+                {"offset":0,"color":[90,145,190,255]},
+                {"offset":1,"color":[20,40,80,255]}]});
+        let created = tool(&store,"drawing_create_shape",json!({"id":id,
+            "shape":{"type":"circle","radius":104},
+            "style":{"stroke":null,"fill":radial}}));
+        assert_eq!(created["placement_warnings"].as_array().unwrap().len(),1);
+        // This is a WARNING, not an implicit transform or rejection. Keeping
+        // the old behaviour prevents silent movement of existing art.
+        assert_eq!(created["object"]["transform"]["translation"],
+            json!({"x":0.0,"y":0.0}));
+        let scene = tool(&store,"drawing_create_scene",json!({"id":id,
+            "objects":[
+                {"shape":{"type":"rectangle","width":1100,"height":318},
+                 "style":{"stroke":null,"fill":line}},
+                {"shape":{"type":"circle","radius":104},
+                 "position":{"x":855,"y":238},
+                 "style":{"stroke":null,"fill":radial}}
+            ]}));
+        let warnings = scene["placement_warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(),1);
+        assert_eq!(warnings[0]["object_index"],0);
+        assert!(warnings[0]["message"].as_str().unwrap().contains("rectangle"));
+        assert_eq!(tool(&store,"drawing_list",json!({"id":id}))["object_count"],3);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn scene_edits_repair_existing_contours_in_one_atomic_commit_and_single_undo_step() {
+        let (store,folder)=store();
+        let note=tool(&store,"create_note",json!({"title":"Editable mallard wing","body":"Don't lose this"}));
+        let id=note["id"].as_str().unwrap();
+        let objects=vec![
+            json!({"shape":{"type":"ellipse","radius_x":80,"radius_y":36},
+                "position":{"x":400,"y":390},"style":{"stroke":null,
+                    "fill":{"type":"solid","color":[77,71,62,255]}}}),
+            json!({"shape":{"type":"circle","radius":40},"position":{"x":500,"y":325},
+                "style":{"stroke":null,"fill":{"type":"solid","color":[6,114,91,255]}}})
+        ];
+        let created=tool(&store,"drawing_create_scene",json!({"id":id,
+            "expected_object_count":0,"objects":objects}));
+        let ids=created["object_ids"].as_array().unwrap();
+        let wing=ids[0].as_str().unwrap().to_string();
+        let head=ids[1].as_str().unwrap().to_string();
+        let before=tool(&store,"drawing_list",json!({"id":id}));
+        let path=json!({"type":"path","commands":[
+            {"type":"move_to","to":{"x":350,"y":385}},
+            {"type":"cubic_to","control1":{"x":374,"y":335},"control2":{"x":470,"y":357},
+                "to":{"x":483,"y":390}},
+            {"type":"cubic_to","control1":{"x":451,"y":418},"control2":{"x":375,"y":425},
+                "to":{"x":350,"y":385}},{"type":"close"}]});
+        let edit_reply=tool(&store,"drawing_create_scene",json!({"id":id,
+            "expected_object_count":2,
+            "edits":[
+                {"object_id":wing,"shape":path,"position":{"x":0,"y":0}},
+                {"object_id":head,"position":{"x":521,"y":311}}
+            ]}));
+        assert_eq!(edit_reply["edited_objects"],2);
+        assert_eq!(edit_reply["added_objects"],0);
+        assert_eq!(edit_reply["object_count"],2);
+        assert_eq!(edit_reply["edited_object_ids"],json!([wing,head]));
+        let updated=tool(&store,"drawing_list",json!({"id":id}));
+        assert_eq!(updated["drawing"]["objects"][0]["id"],wing);
+        assert_eq!(updated["drawing"]["objects"][0]["shape"]["type"],"path");
+        assert_eq!(updated["drawing"]["objects"][1]["transform"]["translation"],
+            json!({"x":521.0,"y":311.0}));
+        let good_file=std::fs::read(store.data_path()).unwrap();
+        let failures=[
+            json!({"edits":[{"object_id":wing,"visible":false},
+                {"object_id":"missing-id","position":{"x":0,"y":0}}]}),
+            json!({"edits":[{"object_id":wing,"visible":false},
+                {"object_id":head,"shape":{"type":"ellipse","radius_x":-12,"radius_y":5}}]}),
+            json!({"edits":[{"object_id":wing,"visible":false},
+                {"object_id":wing,"visible":true}]}),
+            json!({"edits":[{"object_id":wing,"position":{"x":25,"y":0}}],
+                "expected_object_count":0}),
+        ];
+        for bad in failures {
+            let mut req=bad.as_object().unwrap().clone();
+            req.insert("id".into(),json!(id));
+            assert!(execute_tool(&store,"drawing_create_scene",&Value::Object(req)).is_err());
+            assert_eq!(std::fs::read(store.data_path()).unwrap(),good_file);
+        }
+        let read=tool(&store,"read_note",json!({"id":id}));
+        assert_eq!(read["body"],"Don't lose this");
+        tool(&store,"drawing_undo",json!({"id":id,"confirm":true}));
+        assert_eq!(tool(&store,"drawing_list",json!({"id":id}))["drawing"],before["drawing"]);
+        tool(&store,"drawing_redo",json!({"id":id,"confirm":true}));
+        assert_eq!(tool(&store,"drawing_list",json!({"id":id}))["drawing"],updated["drawing"]);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

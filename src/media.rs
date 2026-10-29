@@ -57,7 +57,9 @@ fn normalize_to_png(bytes: &[u8]) -> io::Result<Vec<u8>> {
     if width == 0 || height == 0 || (width as u64) * (height as u64) > MAX_PIXELS {
         return Err(bad("Image dimensions exceed Inkpad's 16-megapixel limit"));
     }
-    let pixels = decoded.to_rgba8();
+    // Reuse the decoded RGBA buffer when the source already has that format.
+    // `to_rgba8` clones even an existing full-size RGBA image.
+    let pixels = decoded.into_rgba8();
     let mut png = Vec::new();
     PngEncoder::new(&mut png).write_image(
         pixels.as_raw(), width, height, image::ExtendedColorType::Rgba8,
@@ -203,7 +205,11 @@ impl Store {
     }
 
     pub fn list_media(&self, note_id: &str) -> io::Result<Vec<MediaBlock>> {
-        let workspace = self.read_latest()?;
+        // Image metadata is frequently queried after every placement or
+        // reorder. Reuse the same byte-verified, externally invalidated
+        // notebook snapshot as MCP note/search reads instead of parsing a
+        // large unchanged JSON workspace for each image-list request.
+        let workspace = self.read_cached()?;
         let note = workspace.notes.iter().find(|note| note.id == note_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Note not found"))?;
         let mut items = note.images.clone();
@@ -292,34 +298,44 @@ impl Store {
         if fs::symlink_metadata(&root)?.file_type().is_symlink() {
             return Err(bad("Unsafe media directory"));
         }
-        let backup_file = self.data_path().with_extension("json.bak");
-        let backup = match fs::read(backup_file) {
-            Ok(bytes) => match serde_json::from_slice::<Workspace>(&bytes) {
-                Ok(backup) => Some(backup),
-                Err(_) => return Ok(0), // preserve assets if recovery state unknown
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
         let mut referenced = HashSet::new();
         for note in &workspace.notes {
             for item in &note.images { referenced.insert(item.filename.clone()); }
         }
-        if let Some(previous) = backup {
-            for note in &previous.notes {
-                for item in &note.images { referenced.insert(item.filename.clone()); }
-            }
-        }
-        let previews = root.join("previews");
-        let mut removed = 0;
+        // Most edits leave all on-disk images referenced by the current
+        // workspace. Scan first so a large previous-save backup is parsed
+        // only when there is actually a candidate for removal.
+        let mut candidates = Vec::new();
         for item in fs::read_dir(&root)? {
             let item = item?;
-            let info = item.metadata()?;
-            if !info.is_file() || item.file_type()?.is_symlink() { continue; }
+            if !item.file_type()?.is_file() { continue; }
             let name = item.file_name().to_string_lossy().into_owned();
             let Some(id) = name.strip_suffix(".png") else { continue; };
             if validate_id(id).is_err() || referenced.contains(&name) { continue; }
-            fs::remove_file(item.path())?;
+            candidates.push((name, item.path()));
+        }
+        if candidates.is_empty() { return Ok(0); }
+
+        // Preserve any candidate still referenced by the recovery backup.
+        // An unreadable backup must keep all possible recovery assets.
+        let backup_file = self.data_path().with_extension("json.bak");
+        match fs::read(backup_file) {
+            Ok(bytes) => match serde_json::from_slice::<Workspace>(&bytes) {
+                Ok(previous) => {
+                    for note in &previous.notes {
+                        for item in &note.images { referenced.insert(item.filename.clone()); }
+                    }
+                }
+                Err(_) => return Ok(0),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let previews = root.join("previews");
+        let mut removed = 0;
+        for (name, path) in candidates {
+            if referenced.contains(&name) { continue; }
+            fs::remove_file(path)?;
             if previews.exists() {
                 let preview = previews.join(&name);
                 if preview.is_file() && !fs::symlink_metadata(&preview)?.file_type().is_symlink() {
@@ -514,6 +530,55 @@ mod tests {
     use super::*;
     use crate::store::{Stroke, TextStylePatch};
 
+    /// Synthetic local-only benchmark for large workspaces with at least one
+    /// persisted image. Run explicitly via `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn large_notebook_media_prune_benchmark() {
+        use std::time::Instant;
+        let folder = std::env::temp_dir().join(format!("inkpad-media-prune-bench-{}", fresh_id()));
+        let store = Store::in_folder(folder.clone()).unwrap();
+        let mut workspace = store.load().unwrap();
+        workspace.notes.clear();
+        let filler = "Large saved text and drawing notes. ".repeat(95);
+        for index in 0..2200 {
+            let mut note = Note::create("note");
+            note.id = format!("bench-{index}");
+            note.title = format!("Notebook page {index}");
+            note.body = filler.clone();
+            if index == 0 {
+                note.images.push(MediaBlock {
+                    id: "aabbcc".into(), filename: "aabbcc.png".into(),
+                    caption: String::new(), width_percent: 65, position: 0,
+                });
+            }
+            workspace.notes.push(note);
+        }
+        let media = workspace.notes[0].images[0].clone();
+        fs::write(store.media_path(&media).unwrap(), b"png-placeholder").unwrap();
+        store.save(&workspace).unwrap();
+        store.save(&workspace).unwrap();
+        let mut prune_times = Vec::new();
+        let mut mutation_times = Vec::new();
+        for iteration in 0..14 {
+            let start = Instant::now();
+            assert_eq!(store.prune_unused_media_locked(&workspace).unwrap(), 0);
+            prune_times.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = Instant::now();
+            store.mutate(|notebook| {
+                notebook.notes[0].title = format!("Notebook page {iteration}");
+                Ok(())
+            }).unwrap();
+            mutation_times.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        prune_times.sort_by(f64::total_cmp);
+        mutation_times.sort_by(f64::total_cmp);
+        println!("Media prune benchmark: {:.2} MiB JSON, {} notes, prune median {:.3} ms, mutation median {:.3} ms",
+            fs::metadata(store.data_path()).unwrap().len() as f64 / 1048576.0,
+            workspace.notes.len(), prune_times[7], mutation_times[7]);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
     #[test]
     fn inline_html_places_pictures_between_escaped_rich_text_and_preserves_legacy_order() {
         let folder = std::env::temp_dir().join(format!("inkpad-inline-html-{}", fresh_id()));
@@ -701,6 +766,14 @@ mod tests {
         assert!(deleted_path.exists());
         store.update_image(&note.id, &second.id, Some("Rotate backup"), None, None).unwrap();
         assert!(!deleted_path.exists(), "orphan media should be reclaimed after backup rotation");
+        let cached = store.list_media(&note.id).unwrap();
+        assert_eq!(cached[0].caption, "Rotate backup");
+        let json = fs::read_to_string(store.data_path()).unwrap();
+        assert!(json.contains("Rotate backup"));
+        // A second process can change the JSON without changing its size.
+        // Image metadata caches must observe the exact new bytes immediately.
+        fs::write(store.data_path(), json.replace("Rotate backup", "Mutate backup")).unwrap();
+        assert_eq!(store.list_media(&note.id).unwrap()[0].caption, "Mutate backup");
         assert!(store.media_path(&MediaBlock { filename: "../evil.png".into(), ..first }).is_err());
         fs::remove_dir_all(folder).unwrap();
     }

@@ -30,6 +30,7 @@ struct App {
     workspace: Workspace,
     baseline: Workspace,
     board: Option<Board>,
+    select_render_cache: Option<SelectRenderCache>,
     drawing: bool,
     edit_mode: String,
     last_seen_file: Option<(SystemTime, u64)>,
@@ -48,6 +49,7 @@ struct App {
     draw_origin: Option<[u16; 2]>,
     draw_previous: Option<[u16; 2]>,
     draw_gesture_changed: bool,
+    select_canvas_dirty: bool,
     drawing_history: DrawingHistory,
     drawing_undo_order: Vec<DrawingEdit>,
     drawing_redo_order: Vec<DrawingEdit>,
@@ -62,6 +64,15 @@ struct App {
     /// at the end of the note instead of unexpectedly before its first word.
     selection_explicit: bool,
     rich_clipboard: Option<StyledFragment>,
+}
+
+/// A render prefix captured at the start of a selection drag. Only the
+/// selected object changes during a pointer gesture, so unchanged strokes
+/// and objects beneath it need not be rasterized for every preview frame.
+/// Drawing anything else, changing pages or ending the gesture invalidates it.
+struct SelectRenderCache {
+    selected_id: String,
+    prefix: Board,
 }
 
 /// Tracks actual cross-tool edit order. Engine snapshots store vector state;
@@ -344,6 +355,27 @@ fn drawing_bounds(object: &DrawObject) -> (f32, f32, f32, f32) {
         DrawShape::Polygon { points, .. } => points.clone(),
         DrawShape::CubicBezier { control1, control2, to } =>
             vec![Point::default(), *control1, *control2, *to],
+        // A multi-segment vector path has editable control points rather than
+        // one ellipse-sized proxy. Include every control point for a safe GUI
+        // selection rectangle; actual curves lie within their control hulls.
+        DrawShape::Path { commands } => {
+            let mut bounds_points = Vec::with_capacity(commands.len() * 3);
+            for command in commands {
+                use crate::store::drawing::PathCommand;
+                match command {
+                    PathCommand::MoveTo { to } | PathCommand::LineTo { to } =>
+                        bounds_points.push(*to),
+                    PathCommand::CubicTo { control1, control2, to } => {
+                        bounds_points.extend([*control1, *control2, *to]);
+                    }
+                    PathCommand::QuadTo { control, to } => {
+                        bounds_points.extend([*control, *to]);
+                    }
+                    PathCommand::Close => {}
+                }
+            }
+            bounds_points
+        }
     };
     if points.is_empty() { points.push(Point::default()); }
     let mut min_x = f32::INFINITY;
@@ -450,13 +482,14 @@ impl App {
         let mut app = Self {
             last_seen_file: file_stamp(storage.data_path()),
             last_seen_preferences: file_stamp(&UiSettings::path_for(storage.data_path())),
-            storage, baseline: workspace.clone(), workspace, board: None, drawing: false, edit_mode,
+            storage, baseline: workspace.clone(), workspace, board: None, select_render_cache: None,
+            drawing: false, edit_mode,
             filter: "all".into(), query: String::new(), brush_size: 6,
             brush_color: "#263238".into(), eraser: false,
             draw_tool: "pen".into(), draw_filled: true, draw_fill_color: "#F0D964".into(),
             draw_opacity: 100, selected_draw_layer_id: None,
             selected_draw_object: None, draw_origin: None,
-            draw_previous: None, draw_gesture_changed: false,
+            draw_previous: None, draw_gesture_changed: false, select_canvas_dirty: false,
             drawing_history: DrawingHistory::default(), ui_settings,
             drawing_undo_order: Vec::new(), drawing_redo_order: Vec::new(),
             last_canvas_render: Instant::now(),
@@ -482,8 +515,11 @@ impl App {
     }
 
     fn persist(&mut self) -> io::Result<()> {
-        let local = self.workspace.clone();
-        let baseline = self.baseline.clone();
+        // These snapshots stay immutable while the transactional merge runs.
+        // Borrowing them avoids two whole-notebook clones on every save (and
+        // preserves both intact if lock acquisition/serialization fails).
+        let local = &self.workspace;
+        let baseline = &self.baseline;
         let merged = self.storage.mutate(|latest| {
             // Apply *only* the GUI's own changes. Agent-created notes and
             // unrelated agent edits must not be overwritten by stale GUI state.
@@ -594,6 +630,7 @@ impl App {
     }
 
     fn reload_board(&mut self) {
+        self.select_render_cache = None;
         self.drawing = false;
         self.draw_origin = None;
         self.draw_previous = None;
@@ -613,8 +650,8 @@ impl App {
         self.board = self.active().map(Board::from_note);
     }
 
-    fn record_vector_edit(&mut self, before: &store::DrawingData) {
-        self.drawing_history.record(before);
+    fn record_vector_edit(&mut self, before: store::DrawingData) {
+        self.drawing_history.record_owned(before);
         self.drawing_undo_order.push(DrawingEdit::Vector);
         if self.drawing_undo_order.len() > 48 { self.drawing_undo_order.remove(0); }
         self.drawing_redo_order.clear();
@@ -628,8 +665,95 @@ impl App {
 
     /// Redraw without discarding a selected shape or session history.
     fn refresh_drawing(&mut self) {
-        self.board = self.active().map(Board::from_note);
+        self.select_render_cache = None;
+        // Redraw into the existing pixel allocation during ordinary edits.
+        // A full frame is 3.08 MB; rebuilding Board for every pen/shape
+        // preview previously discarded and reallocated that buffer even when
+        // its dimensions never changed. replay clears every pixel first.
+        let active = self.workspace.notes.iter().find(|note| note.id == self.workspace.active_id);
+        match active {
+            Some(note) => {
+                if let Some(board) = self.board.as_mut() {
+                    board.replay(&note.strokes);
+                    board.draw_drawing(&note.drawing);
+                } else {
+                    self.board = Some(Board::from_note(note));
+                }
+            }
+            None => self.board = None,
+        }
         self.last_canvas_render = Instant::now();
+        self.select_canvas_dirty = false;
+    }
+
+    fn render_selected_drag(&mut self) {
+        let Some(id) = self.selected_draw_object.clone() else {
+            self.refresh_drawing();
+            return;
+        };
+        if self.select_render_cache.as_ref().is_none_or(|cache| cache.selected_id != id) {
+            let Some(note) = self.active() else { self.refresh_drawing(); return; };
+            if note.drawing.validate().is_err() { self.refresh_drawing(); return; }
+            // The saved pixel prefix costs a full-frame allocation/copy. It
+            // only pays off if enough visible objects lie UNDER the moving
+            // object. A 512-object page with the first object selected should
+            // use the normal renderer; total object count is misleading.
+            let mut preceding = 0;
+            let mut found = false;
+            'count_objects: for layer in &note.drawing.layers {
+                if !layer.visible { continue; }
+                for object in &note.drawing.objects {
+                    if object.layer_id != layer.id || !object.visible { continue; }
+                    if object.id == id { found = true; break 'count_objects; }
+                    preceding += 1;
+                }
+            }
+            if !found || preceding < 128 { self.refresh_drawing(); return; }
+            let mut prefix = Board::new(&note.strokes);
+            'layer_search: for layer in &note.drawing.layers {
+                if !layer.visible { continue; }
+                for object in &note.drawing.objects {
+                    if object.layer_id != layer.id || !object.visible { continue; }
+                    if object.id == id { break 'layer_search; }
+                    prefix.draw_object(object);
+                }
+            }
+            self.select_render_cache = Some(SelectRenderCache { selected_id: id.clone(), prefix });
+        }
+        let prefix = &self.select_render_cache.as_ref().unwrap().prefix;
+        // Keep the existing 1100x700 RGBA allocation across drag frames.
+        // Cloning the prefix each time allocated a fresh 3.08 MB buffer at
+        // every preview. Its bytes are copied exactly before redrawing the
+        // changed shape and objects above it.
+        let mut board = match self.board.take() {
+            Some(mut existing) => {
+                existing.copy_pixels_from(prefix);
+                existing
+            }
+            None => prefix.clone(),
+        };
+        // Preserve original layer/object ordering and its alpha-compositing
+        // arithmetic. Redraw the moving object plus any objects above it.
+        if let Some(note) = self.active() {
+            let mut reached = false;
+            for layer in &note.drawing.layers {
+                if !layer.visible { continue; }
+                for object in &note.drawing.objects {
+                    if object.layer_id != layer.id || !object.visible { continue; }
+                    if object.id == id { reached = true; }
+                    if reached { board.draw_object(object); }
+                }
+            }
+        }
+        self.board = Some(board);
+        self.last_canvas_render = Instant::now();
+        self.select_canvas_dirty = false;
+    }
+
+    fn preview_selected_drawing(&mut self) {
+        if self.last_canvas_render.elapsed() >= Duration::from_millis(40) {
+            self.render_selected_drag();
+        }
     }
 
     fn preview_drawing(&mut self) {
@@ -647,7 +771,7 @@ impl App {
         note.drawing.update_object(&id, change).map_err(io::Error::other)?;
         if note.drawing == before { return Ok(false); }
         note.touch();
-        self.record_vector_edit(&before);
+        self.record_vector_edit(before);
         self.refresh_drawing();
         self.persist()?;
         Ok(true)
@@ -669,7 +793,7 @@ impl App {
             obj.visible = original.visible;
         }).map_err(io::Error::other)?;
         note.touch();
-        self.record_vector_edit(&before);
+        self.record_vector_edit(before);
         self.selected_draw_object = Some(next);
         self.refresh_drawing();
         self.persist()
@@ -681,7 +805,7 @@ impl App {
         let before = note.drawing.snapshot();
         note.drawing.remove_object(&id).map_err(io::Error::other)?;
         note.touch();
-        self.record_vector_edit(&before);
+        self.record_vector_edit(before);
         self.selected_draw_object = None;
         self.refresh_drawing();
         self.persist()
@@ -693,7 +817,7 @@ impl App {
         let name = format!("Layer {}", note.drawing.layers.len() + 1);
         let new_id = note.drawing.add_layer(&name).map_err(io::Error::other)?;
         note.touch();
-        self.record_vector_edit(&before);
+        self.record_vector_edit(before);
         self.selected_draw_layer_id = Some(new_id);
         self.refresh_drawing();
         self.persist()
@@ -708,7 +832,7 @@ impl App {
         change(&mut note.drawing).map_err(io::Error::other)?;
         if note.drawing == before { return Ok(()); }
         note.touch();
-        self.record_vector_edit(&before);
+        self.record_vector_edit(before);
         self.refresh_drawing();
         self.persist()
     }
@@ -838,27 +962,43 @@ impl App {
                     self.drawing = true;
                     self.draw_previous = Some(point);
                     self.draw_gesture_changed = false;
+                    self.select_canvas_dirty = false;
                     return Ok(true);
                 }
                 1 | 2 if self.drawing => {
+                    let same_as_previous_event = self.draw_previous == Some(point);
                     if let (Some(previous), Some(id)) = (self.draw_previous, self.selected_draw_object.clone()) {
                         if previous != point {
-                            let before = self.active().unwrap().drawing.snapshot();
+                            // A gesture needs one undo snapshot. Capture it
+                            // only on the first successful movement; cloning
+                            // the whole scene on every move can dominate
+                            // pointer latency on complex notebook artwork.
+                            let before = (!self.draw_gesture_changed)
+                                .then(|| self.active().unwrap().drawing.snapshot());
                             if let Some(note) = self.active_mut() {
                                 note.drawing.move_object(&id,
                                     point[0] as f32 - previous[0] as f32,
                                     point[1] as f32 - previous[1] as f32).map_err(io::Error::other)?;
                                 note.touch();
                             }
-                            if !self.draw_gesture_changed { self.record_vector_edit(&before); }
+                            if let Some(before) = before { self.record_vector_edit(before); }
                             self.draw_gesture_changed = true;
                             self.draw_previous = Some(point);
-                            if phase == 2 { self.refresh_drawing(); }
-                            else { self.preview_drawing(); }
+                            self.select_canvas_dirty = true;
+                            if phase == 2 { self.render_selected_drag(); }
+                            else { self.preview_selected_drawing(); }
                         }
                     }
                     if phase == 2 {
+                        // A mouse-up can have exactly the same coordinates as
+                        // the last move event, which may have been throttled
+                        // before the next 40 ms preview frame. Always flush
+                        // the final vector position before dropping the cache.
+                        if self.select_canvas_dirty && same_as_previous_event {
+                            self.render_selected_drag();
+                        }
                         self.drawing = false;
+                        self.select_render_cache = None;
                         if self.draw_gesture_changed { self.persist()?; }
                     }
                     return Ok(true);
@@ -907,7 +1047,7 @@ impl App {
                         note.touch();
                         id
                     };
-                    self.record_vector_edit(&before);
+                    self.record_vector_edit(before);
                     self.selected_draw_object = Some(id);
                     self.draw_origin = Some(point);
                     self.drawing = true;
@@ -1312,21 +1452,32 @@ fn note_row_subtitle(note: &Note, query: &str) -> String {
     }
 }
 
-fn update_rows(ui: &MainWindow, app: &App) {
+fn sidebar_rows(app: &App) -> Vec<NoteRow> {
     let query = app.query.trim().to_lowercase();
     let mut notes: Vec<&Note> = app.workspace.notes.iter().filter(|note| {
         (app.filter == "all" || app.filter == note.kind) &&
             (query.is_empty() || note.title.to_lowercase().contains(&query) || note.body.to_lowercase().contains(&query))
     }).collect();
     notes.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| b.updated.cmp(&a.updated)).then_with(|| a.title.cmp(&b.title)));
-    let rows = notes.into_iter().map(|note| NoteRow {
+    notes.into_iter().map(|note| NoteRow {
         id: note.id.clone().into(), title: note.title.clone().into(),
         subtitle: note_row_subtitle(note, &query).into(),
         kind: note.kind.clone().into(), active: note.id == app.workspace.active_id,
         pinned: note.pinned,
-    }).collect::<Vec<_>>();
-    ui.set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+    }).collect::<Vec<_>>()
+}
+
+fn update_rows(ui: &MainWindow, app: &App) {
+    ui.set_rows(ModelRc::from(Rc::new(VecModel::from(sidebar_rows(app)))));
     ui.set_note_count(app.workspace.notes.len() as i32);
+}
+
+/// A shape selection/translation only changes the note's update timestamp.
+/// If its second-resolution timestamp is unchanged, the sidebar filter,
+/// ordering, title, pin and sketch summary are all identical. Avoid sorting
+/// and rebuilding thousands of Slint rows after every such pointer gesture.
+fn drawing_needs_rows_refresh(tool: &str, previous_updated: Option<u64>, current_updated: Option<u64>) -> bool {
+    tool != "select" || previous_updated != current_updated
 }
 
 /// Generate a safe StyledText preview from validated attributed character
@@ -2476,6 +2627,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(ui) = weak.upgrade() else { return; };
             if app.borrow().pending_action.is_some() { return; }
             let previous_id = app.borrow().workspace.active_id.clone();
+            let previous_updated = app.borrow().active().map(|note| note.updated);
+            let previous_render = app.borrow().last_canvas_render;
             let result = app.borrow_mut().draw(x, y, phase);
             match result {
                 Ok(true) => {
@@ -2483,10 +2636,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if phase == 2 && previous_id != state.workspace.active_id {
                         update_all(&ui, &state);
                     } else {
-                        if let Some(board) = state.board.as_ref() { ui.set_canvas_image(board_image(board)); }
+                        // Vector dragging redraws at most every 40 ms. Reusing
+                        // the preceding frame on intervening pointer events
+                        // avoids a 3.08 MB Slint image upload per event.
+                        // Pen/eraser modify Board in place, so always upload.
+                        let vector_move = phase == 1 && state.draw_tool != "pen" && state.draw_tool != "eraser";
+                        if !vector_move || previous_render != state.last_canvas_render {
+                            if let Some(board) = state.board.as_ref() {
+                                ui.set_canvas_image(board_image(board));
+                            }
+                        }
                         update_drawing_ui(&ui, &state);
                         if phase == 2 {
-                            update_rows(&ui, &state);
+                            if drawing_needs_rows_refresh(&state.draw_tool, previous_updated,
+                                state.active().map(|note| note.updated)) {
+                                update_rows(&ui, &state);
+                            }
                             ui.set_save_status("All changes saved on this device".into());
                         }
                     }
@@ -2794,6 +2959,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn selected_drag_sidebar_refresh_preserves_sort_semantics() {
+        assert!(!drawing_needs_rows_refresh("select", Some(1700), Some(1700)),
+            "Repeated drags in the same update second cannot change sidebar order");
+        assert!(drawing_needs_rows_refresh("select", Some(1700), Some(1701)),
+            "New timestamps must update pinned/sorted note order");
+        assert!(drawing_needs_rows_refresh("select", None, Some(1701)),
+            "Switching the current note must refresh the sidebar");
+        for tool in ["pen", "eraser", "rectangle", "circle", "line", "ellipse"] {
+            assert!(drawing_needs_rows_refresh(tool, Some(1700), Some(1700)),
+                "New strokes and shapes affect the sidebar sketch summary");
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark: 2,200-note sidebar rebuild before skip"]
+    fn large_notebook_sidebar_model_benchmark() {
+        use std::hint::black_box;
+        let folder = std::env::temp_dir().join(format!("inkpad-sidebar-bench-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        app.workspace.notes.clear();
+        for index in 0..2200 {
+            let mut note = Note::create("note");
+            note.id = format!("sidebar-{index:05}");
+            note.title = format!("Synthetic title number {index}");
+            note.body = "Note body with synthetic Unicode 猫 line. ".repeat(60);
+            note.updated = 1800 - index as u64 / 50;
+            note.pinned = index % 11 == 0;
+            app.workspace.notes.push(note);
+        }
+        app.workspace.active_id = "sidebar-00000".into();
+        let mut timings = Vec::new();
+        for _ in 0..51 {
+            let start = Instant::now();
+            let rows = black_box(sidebar_rows(&app));
+            assert_eq!(rows.len(), 2200);
+            timings.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        timings.sort_by(f64::total_cmp);
+        println!("sidebar_rebuild notes=2200 p50_ms={:.4} p95_ms={:.4} samples=51 rows_skipped_if_same_second=1",
+            timings[25],timings[48]);
+        drop(app);
+        fs::remove_dir_all(folder).unwrap();
+    }
 
     #[test]
     fn search_sidebar_preview_shows_deep_body_hit_not_first_line() {
@@ -3370,8 +3581,15 @@ mod tests {
         app.draw_tool = "select".into();
         assert!(app.draw(150, 150, 0).unwrap());
         assert_eq!(app.selected_draw_object.as_deref(), Some(id.as_str()));
+        // Suppress the intermediate preview, then verify the release flush
+        // publishes the exact final image even without further pointer motion.
+        app.last_canvas_render = Instant::now();
         assert!(app.draw(170, 160, 1).unwrap());
+        assert!(app.select_canvas_dirty);
         assert!(app.draw(170, 160, 2).unwrap());
+        assert!(!app.select_canvas_dirty);
+        assert_eq!(app.board.as_ref().unwrap().bytes(),
+            Board::from_note(app.active().unwrap()).bytes());
         let moved = app.active().unwrap().drawing.object(&id).unwrap().transform.translation;
         assert_eq!(moved.x, original_position.x + 20.0);
         assert_eq!(moved.y, original_position.y + 10.0);
@@ -3387,6 +3605,106 @@ mod tests {
         assert_eq!(reopened.active().unwrap().drawing.objects.len(), 2);
         assert_eq!(reopened.active().unwrap().drawing.object(&id).unwrap().transform.translation, moved);
         fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn selected_drag_cache_matches_full_raster_and_invalidates_on_refresh() {
+        use store::drawing::{DrawShadow, GradientStop, Layer, Transform};
+        let folder = std::env::temp_dir().join(format!("inkpad-drag-cache-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(
+                std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::load(Store::in_folder(folder.clone()).unwrap()).unwrap();
+        let mut drawing = store::DrawingData::default();
+        for index in 0..8 {
+            drawing.layers.push(Layer {id:format!("layer-{index}"),name:format!("Layer {index}"),
+                visible:true,locked:false});
+        }
+        for index in 0..256 {
+            let mut style = store::DrawStyle::default();
+            style.stroke = None;
+            style.fill = Some(if index % 9 == 0 {
+                DrawFill::LinearGradient {start:Point::new(-20.0,0.0),
+                    end:Point::new(20.0,0.0),stops:vec![
+                    GradientStop {offset:0.0,color:[245,100,20,200]},
+                    GradientStop {offset:1.0,color:[25,80,190,255]}]}
+            } else { DrawFill::Solid {color:[100,55,170,170]} });
+            if index % 11 == 0 {
+                style.shadow = Some(DrawShadow {offset:Point::new(3.0,4.0),
+                    blur_radius:2.0,color:[50,25,35,80]});
+            }
+            drawing.objects.push(DrawObject {
+                id:format!("shape-{index}"),layer_id:format!("layer-{}",index%8),
+                shape:DrawShape::Ellipse {radius_x:12.0,radius_y:11.0},
+                clip_shape:(index%13==0).then_some(DrawShape::Rectangle {
+                    width:18.0,height:15.0}),style,
+                transform:Transform {translation:Point::new(15.0+(index%28) as f32*37.0,
+                    15.0+(index/28) as f32*64.0),..Default::default()},
+                visible:true,group_id:None,
+            });
+        }
+        drawing.validate().unwrap();
+        app.active_mut().unwrap().drawing = drawing;
+        app.draw_tool = "select".into();
+        app.drawing = true;
+        for target in ["shape-32", "shape-255"] {
+            app.selected_draw_object = Some(target.to_string());
+            for _ in 0..3 {
+                let previous_allocation = app.board.as_ref().unwrap().bytes().as_ptr();
+                app.active_mut().unwrap().drawing.move_object(target, 2.0,-1.0).unwrap();
+                app.render_selected_drag();
+                if target == "shape-32" {
+                    assert!(app.select_render_cache.is_none(),
+                        "Small paint prefix must use the original renderer");
+                    assert_eq!(app.board.as_ref().unwrap().bytes().as_ptr(), previous_allocation,
+                        "Even full redraws should reuse the fixed-size RGBA allocation");
+                } else {
+                    assert!(app.select_render_cache.is_some(),
+                        "Dense preceding layers must reuse the rendered prefix");
+                    assert_eq!(app.board.as_ref().unwrap().bytes().as_ptr(), previous_allocation,
+                        "Cached drag must reuse the previous full-frame pixel allocation");
+                }
+                let full = Board::from_note(app.active().unwrap());
+                assert_eq!(app.board.as_ref().unwrap().bytes(), full.bytes(),
+                    "Selection cache changed gradients, clipping, shadows or layer order");
+            }
+        }
+        assert!(app.select_render_cache.is_some());
+        app.refresh_drawing();
+        assert!(app.select_render_cache.is_none());
+        assert_eq!(app.board.as_ref().unwrap().bytes(),
+            Board::from_note(app.active().unwrap()).bytes());
+        app.reload_board();
+        assert!(app.select_render_cache.is_none());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    /// Quantifies the expensive whole-workspace snapshots formerly created
+    /// before every GUI save. Run explicitly with --release --ignored --nocapture.
+    #[test]
+    #[ignore = "synthetic 2,200-page allocation/clone benchmark"]
+    fn large_notebook_gui_snapshot_benchmark() {
+        use std::hint::black_box;
+        let mut workspace = Workspace::default();
+        workspace.notes.clear();
+        for index in 0..2200 {
+            let mut note = Note::create("note");
+            note.id = format!("snapshot-test-{index}");
+            note.title = format!("Synthetic note {index}");
+            note.body = "Long synthetic Unicode 猫 notebook text. ".repeat(70);
+            workspace.notes.push(note);
+        }
+        let bytes = serde_json::to_vec(&workspace).unwrap().len();
+        let mut clones = Vec::new();
+        for _ in 0..31 {
+            let start = Instant::now();
+            let local = black_box(workspace.clone());
+            let baseline = black_box(workspace.clone());
+            black_box((&local, &baseline));
+            clones.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        clones.sort_by(f64::total_cmp);
+        println!("large_notebook_gui_snapshot notes={} json_mib={:.3} removed_two_clone_p50_ms={:.3} p95_ms={:.3} samples=31",
+            workspace.notes.len(), bytes as f64 / 1048576.0, clones[15], clones[29]);
     }
 
     #[test]
